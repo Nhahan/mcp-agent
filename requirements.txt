@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+httpx
+onnxruntime
+tqdm
+pydantic-settings
+transformers
+tokenizers
+sentencepiece # Often needed for Gemma tokenizer
+
+# Testing
+pytest
+pytest-asyncio 
