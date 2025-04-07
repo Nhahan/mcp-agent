@@ -41,3 +41,9 @@ htmlcov/
 
 # ONNX
 *.onnx
+
+# Model files
+models/
+
+# Specific unused prompt file
+app/prompts/react_base_simple.md
