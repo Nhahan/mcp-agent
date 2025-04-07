@@ -1,115 +1,149 @@
-# OS-Agnostic AI Agent with MCP Integration
+# MCP Agent: AI 에이전트 웹 컨테이너
 
-This project implements an OS-agnostic AI agent that runs within a web container.
-It utilizes an ONNX model for inference and integrates with external tools and data sources via the Model Context Protocol (MCP).
+이 프로젝트는 OS에 종속되지 않는 AI 에이전트를 웹 컨테이너 환경에서 실행하는 시스템입니다. [Gemma 3 1B](https://huggingface.co/google/gemma-3-1b-it) 모델을 사용하여 자연어 처리와 도구 호출 기능을 제공합니다.
 
-## Features
+## 주요 기능
 
-- **ONNX Model Inference:** Uses the `gemma-3-1b-it-ONNX` model (quantized) for text generation.
-- **Runtime Model Download:** Downloads the ONNX model at runtime if not present locally, making the initial setup lightweight.
-- **MCP Integration:** Communicates with MCP servers defined in `mcp.json` to leverage external tools (e.g., terminal interaction via `iterm-mcp`).
-- **Web API:** Provides a FastAPI-based web interface for interacting with the agent.
-- **Async Architecture:** Built using `asyncio` for efficient handling of I/O operations (model download, MCP communication).
-- **E2E Tested:** Includes end-to-end tests to verify core functionalities like model inference and MCP tool calls.
+- 웹 API를 통한 자연어 처리
+- ReAct 패턴을 사용한 도구 호출 및 대화형 상호작용
+- MCP(Model Context Protocol) 서버와의 연동
+- 다국어 지원 (한국어 포함)
+- 대화 로그 저장 및 분석
 
-## Setup
+## 시스템 요구사항
 
-1.  **Clone the repository:**
-    ```bash
-    git clone <repository-url>
-    cd <repository-directory>
-    ```
-2.  **Create a Python virtual environment (Recommended):**
-    ```bash
-    python -m venv venv
-    source venv/bin/activate # On Windows use `venv\Scripts\activate`
-    ```
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-4.  **Configure MCP Servers (`mcp.json`):**
-    Create a `mcp.json` file in the project root. Add the MCP servers you want the agent to use. Example using `iterm-mcp` (requires iTerm2 on macOS and Node.js/npx):
-    ```json
-    {
-      "mcpServers": {
-        "iterm-mcp": {
-          "command": "npx",
-          "args": [
-            "-y",
-            "@smithery/cli@latest",
-            "run",
-            "iterm-mcp",
-            "--key",
-            "YOUR_ITREM_MCP_KEY" 
-          ]
-        }
-      }
-    }
-    ```
-    *Replace* `YOUR_ITREM_MCP_KEY` *with your actual key if required by your iterm-mcp setup.*
+- Python 3.10 이상
+- 메모리: 최소 4GB (8GB 이상 권장)
+- 디스크: 최소 2GB
+- (선택) CUDA 지원 GPU (GPU 가속 시)
 
-## Running the Agent
+## 설치 방법
+
+### 로컬 설치
+
+1. 저장소 클론
+   ```bash
+   git clone https://github.com/yourusername/mcp-agent.git
+   cd mcp-agent
+   ```
+
+2. 환경 설정
+   ```bash
+   cp .env.example .env
+   # .env 파일 내용을 적절히 수정
+   ```
+
+3. 종속성 설치
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. 모델 다운로드
+   ```bash
+   python download_model.py
+   ```
+
+### Docker 설치
+
+1. Docker 이미지 빌드
+   ```bash
+   docker-compose build
+   ```
+
+2. Docker 컨테이너 실행
+   ```bash
+   docker-compose up
+   ```
+
+## 사용 방법
+
+### API 서버 실행
 
 ```bash
-# Ensure your virtual environment is activated
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+python -m app.main
 ```
 
-- The agent will start, and if the model is not found in `./test_model_cache/`, it will begin downloading it (this may take some time).
-- Configured MCP servers will also be started in the background.
-- Access the API documentation at `http://localhost:8000/docs`.
+기본적으로 서버는 `http://localhost:8000`에서 실행됩니다.
 
-## Key API Endpoints
+### API 엔드포인트
 
-- **`POST /v1/inference`**: Sends text to the AI model for generation.
-  - **Body:** `{"text": "Your prompt here"}`
-- **`GET /v1/mcp/{server_name}/status`**: Checks the status of a running MCP server.
-- **`POST /v1/mcp/{server_name}/call`**: Calls a specific tool on an MCP server.
-  - **Body:** `{"tool_name": "tool_to_call", "arguments": {"arg1": "value1"}}`
-
-## Development & Testing
-
-- **Running Tests:**
+- `/api/v1/chat`: 대화형 채팅 엔드포인트
   ```bash
-  # Run all tests
-  pytest
-
-  # Run only unit tests
-  pytest -m unit
-
-  # Run only E2E tests (requires model download and MCP setup)
-  pytest -m e2e
+  curl -X POST http://localhost:8000/api/v1/chat \
+    -H "Content-Type: application/json" \
+    -d '{"text": "안녕하세요"}'
   ```
-- **Linting/Formatting:** (Configure tools like Flake8, Black, isort as needed)
 
-## Project Structure
+- `/api/v1/status`: 시스템 상태 확인 엔드포인트
+  ```bash
+  curl http://localhost:8000/api/v1/status
+  ```
 
+### MCP 설정
+
+MCP 서버를 추가하려면 `mcp.json` 파일을 편집하세요:
+
+```json
+{
+  "mcpServers": {
+    "iterm-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@smithery/cli@latest",
+        "run",
+        "iterm-mcp",
+        "--key",
+        "your-key-here"
+      ]
+    }
+  }
+}
 ```
-.gitignore
-mcp.json          # User-configured MCP servers
-README.md
-requirements.txt
-app/
-├── api/          # FastAPI routers and endpoints
-│   └── v1/
-├── core/         # Configuration, settings
-├── main.py       # FastAPI application entry point
-├── models/       # Pydantic models (request/response)
-├── mcp_client/   # Client for communicating with MCP servers
-│   └── client.py
-└── services/     # Business logic (inference, MCP management)
-    ├── inference_service.py
-    └── mcp_service.py
-tests/
-├── integration/  # Integration and E2E tests
-│   └── test_e2e.py
-└── unit/         # Unit tests
-    └── ...
-test_model_cache/ # (Ignored by Git) Downloaded ONNX model stored here
+
+## 테스트 실행
+
+### 모델 직접 테스트
+
+```bash
+python test_scripts/test_model_direct.py
 ```
 
-## Important Notes
+### 채팅 API 테스트
 
-- The agent currently performs single-step inference. It does not yet have complex reasoning or multi-step execution capabilities based on user prompts.
-- The `iterm-mcp` server specifically requires macOS with iTerm2 installed. 
+```bash
+python test_scripts/test_chat_api.py --prompt "안녕하세요"
+```
+
+### E2E 테스트
+
+```bash
+python test_scripts/test_e2e_completion.py
+```
+
+## 로그 및 디버깅
+
+로그 파일은 `logs` 디렉토리에 저장됩니다:
+
+- `logs/react_logs/`: ReAct 패턴 처리 로그
+- `logs/chat_tests/`: 채팅 테스트 로그
+- `logs/e2e_tests/`: E2E 테스트 로그
+
+## 문제해결
+
+**Q: 모델 다운로드가 실패합니다.**
+A: 네트워크 연결을 확인하고, 필요한 경우 Hugging Face 토큰을 설정하세요.
+
+**Q: 메모리 부족 오류가 발생합니다.**
+A: `max_tokens` 설정을 줄이거나 더 작은 모델로 전환하세요.
+
+**Q: MCP 서버 연결이 실패합니다.**
+A: `mcp.json` 파일의 설정을 확인하고 필요한 패키지가 설치되어 있는지 확인하세요.
+
+## 라이선스
+
+MIT
+
+## 기여
+
+버그 리포트, 기능 요청, 풀 리퀘스트를 환영합니다.
