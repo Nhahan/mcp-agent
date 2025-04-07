@@ -4,6 +4,7 @@ from pathlib import Path
 from functools import lru_cache
 from pydantic import Field, HttpUrl, AliasChoices, DirectoryPath
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -12,60 +13,72 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 class Settings(BaseSettings):
-    # Define fields and explicitly state how they map to env vars using validation_alias
-    model_url: HttpUrl = Field(
-        ...,
-        validation_alias=AliasChoices('model_url', 'MODEL_URL'),
-        description="URL to download the ONNX model"
-    )
-    model_path: Path = Field(
-        default=PROJECT_ROOT / "test_model_cache" / "model_q4f16.onnx",
-        validation_alias=AliasChoices('model_path', 'MODEL_PATH'),
-        description="Path to store/load the ONNX model"
-    )
-    mcp_config_path: Path = Field(
-        default=PROJECT_ROOT / "mcp.json",
-        validation_alias=AliasChoices('mcp_config_path', 'MCP_CONFIG_PATH'),
-        description="Path to the MCP configuration file"
-    )
-    log_level: str = Field(
-        "INFO",
-        validation_alias=AliasChoices('log_level', 'LOG_LEVEL'),
-        description="Logging level"
-    )
-
-    # pydantic-settings v2 configuration
-    model_config = SettingsConfigDict(
-        env_prefix='',
-        env_file='.env',
-        env_file_encoding='utf-8',
-        extra='ignore',
-        # case_sensitive=False # Alternatively, set case_sensitive globally
-    )
-
-    # Derived paths
-    @property
-    def model_path_str(self) -> str:
-        return str(self.model_path)
-
-    @property
-    def mcp_config_path_str(self) -> str:
-        return str(self.mcp_config_path)
-
-    @property
-    def MCP_CONFIG_PATH(self) -> Path:
-        # Ensure the path is resolved relative to the project root if it's relative
-        path = self.mcp_config_path
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
-        return path.resolve()
-
+    # API 구성
+    api_title: str = "MCP Agent"
+    api_description: str = "MCP Agent API"
+    api_version: str = "0.1.0"
+    
+    # 모델 구성
+    model_path: Path = Path("test_model_cache/gemma-3-1b-it-q4_0.gguf")
+    model_url: HttpUrl = "https://huggingface.co/google/gemma-3-1b-it-qat-q4_0-gguf/resolve/main/gemma-3-1b-it-q4_0.gguf?download=true"
+    model_repo_id: str = "google/gemma-3-1b-it-qat-q4_0-gguf"  # Hugging Face 리포지토리 ID
+    model_filename: str = "gemma-3-1b-it-q4_0.gguf"  # 파일 이름
+    
+    # 로깅 및 디버깅
+    log_level: str = "INFO"
+    
+    # MCP 구성
+    mcp_config_path: Path = Path("mcp.json")
+    
+    # Docker 환경 체크 
+    is_docker: bool = False  # Docker 환경인지 확인 (파일 경로에 영향)
+    
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        
+        @classmethod
+        def customise_sources(
+            cls,
+            init_settings,
+            env_settings,
+            file_secret_settings,
+        ):
+            return (
+                init_settings,
+                env_settings,
+                _docker_check,
+                file_secret_settings,
+            )
+    
+    # 유틸리티 속성들
     @property
     def MODEL_CACHE_DIR(self) -> Path:
-        # Ensure the parent directory exists
+        """모델 캐시 디렉토리 반환"""
         cache_dir = self.model_path.parent
         cache_dir.mkdir(parents=True, exist_ok=True)
         return cache_dir
+    
+    @property
+    def MCP_CONFIG_PATH(self) -> Path:
+        """MCP 설정 파일 경로 반환 (대문자 속성명 - 하위 호환성)"""
+        return self.mcp_config_path
+    
+    @property
+    def model_path_str(self) -> str:
+        """모델 경로를 문자열로 반환"""
+        return str(self.model_path)
+    
+    @property
+    def mcp_config_path_str(self) -> str:
+        """MCP 설정 경로를 문자열로 반환"""
+        return str(self.mcp_config_path)
+
+def _docker_check(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Docker 환경인지 확인합니다."""
+    # /.dockerenv 파일이 존재하는지 확인
+    settings["is_docker"] = Path("/.dockerenv").exists()
+    return settings
 
 # Function to get settings instance, cached for efficiency
 @lru_cache()
@@ -77,7 +90,7 @@ def get_settings() -> Settings:
         logger.debug(f"Model URL: {settings.model_url}")
         logger.debug(f"Model Path: {settings.model_path}")
         logger.debug(f"Model Cache Dir: {settings.MODEL_CACHE_DIR}")
-        logger.debug(f"MCP Config Path: {settings.MCP_CONFIG_PATH}")
+        logger.debug(f"MCP Config Path: {settings.mcp_config_path_str}")
         logger.debug(f"Log Level: {settings.log_level}") # Log the level
         return settings
     except Exception as e:

@@ -1,14 +1,22 @@
 import logging.config
 import logging
 import asyncio
+import os  # Add os module import
 from contextlib import asynccontextmanager
-
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 from app.api.v1.api import api_router
 from app.core.config import get_settings
 from app.services.mcp_service import MCPService
 from app.services.inference_service import InferenceService
+
+# React 응답 생성용 모델
+class ReactInferenceRequest(BaseModel):
+    text: str
+
+class ReactResponse(BaseModel):
+    generated_text: str
 
 # Configure logging
 logging.config.dictConfig({
@@ -103,8 +111,8 @@ app = FastAPI(
     lifespan=lifespan # Use the lifespan context manager
 )
 
-# Include the API router
-app.include_router(api_router, prefix="/v1")
+# Include the API router at /api/v1 prefix
+app.include_router(api_router, prefix="/api/v1")
 
 # Add dependency overrides to inject the singleton services
 def get_mcp_service_instance():
@@ -124,17 +132,25 @@ app.dependency_overrides[get_mcp_service] = get_mcp_service_instance
 
 @app.get("/")
 async def read_root():
-    return {"message": "AI Agent API is running."}
+    return {"message": "AI Agent API is running. Use /api/v1/chat for the chat endpoint."}
 
 # Keep the local run block if needed for development
 if __name__ == "__main__":
     import uvicorn
+    import argparse
+    
+    # 명령행 인수 파싱
+    parser = argparse.ArgumentParser(description="AI Agent API 서버")
+    parser.add_argument("--host", default="127.0.0.1", help="서버 호스트 (기본값: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8000, help="서버 포트 (기본값: 8000)")
+    args = parser.parse_args()
+    
     # Logging will be configured by lifespan when uvicorn starts the app
     logger.warning("Running in debug mode directly with uvicorn. Use Docker for production.")
 
     # Define default environment variables ONLY if they are not already set
-    os.environ.setdefault("MODEL_URL", "https://huggingface.co/onnx-community/gemma-3-1b-it-ONNX/resolve/main/onnx/model_q4f16.onnx?download=true")
-    os.environ.setdefault("MODEL_PATH", "model/model_q4f16.onnx")
+    os.environ.setdefault("MODEL_URL", "https://huggingface.co/google/gemma-3-1b-it-qat-q4_0-gguf/resolve/main/gemma-3-1b-it-q4_0.gguf?download=true")
+    os.environ.setdefault("MODEL_PATH", "model/gemma-3-1b-it-q4_0.gguf")
     os.environ.setdefault("MCP_CONFIG_PATH", "mcp.json")
     os.environ.setdefault("LOG_LEVEL", "DEBUG") # Example for local dev
 
@@ -142,5 +158,5 @@ if __name__ == "__main__":
 
     # Pass the app instance string for uvicorn's auto-reload feature
     # Uvicorn will call the lifespan manager upon startup
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("app.main:app", host=args.host, port=args.port, reload=True)
     # log_level is now controlled by the lifespan based on LOG_LEVEL env var 
