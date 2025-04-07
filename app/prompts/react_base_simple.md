@@ -14,6 +14,16 @@
 {{"thought": "I can answer this directly.", "action": null, "answer": "The capital of France is Paris."}}
 ```
 
+**Example (Personal Sentiment - Direct Answer):**
+User: I'm feeling sad today.
+```json
+{
+  "thought": "The user is expressing a personal feeling. This does not require any tools. I should provide an empathetic, direct response.",
+  "action": null,
+  "answer": "I'm sorry to hear you're feeling sad today. Is there anything you'd like to talk about, or anything I can help you with?"
+}
+```
+
 **Example (Complex Question - Multiple Steps without Tools):**
 User: Analyze the impact of AI on the job market.
 
