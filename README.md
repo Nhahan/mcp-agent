@@ -1,149 +1,162 @@
-# MCP Agent: AI 에이전트 웹 컨테이너
+# OS-Agnostic AI Agent with MCP Integration
 
-이 프로젝트는 OS에 종속되지 않는 AI 에이전트를 웹 컨테이너 환경에서 실행하는 시스템입니다. [Gemma 3 1B](https://huggingface.co/google/gemma-3-1b-it) 모델을 사용하여 자연어 처리와 도구 호출 기능을 제공합니다.
+[![License: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](http://unlicense.org/)
 
-## 주요 기능
+This project provides a web-based AI agent designed to be OS-agnostic. It leverages the Model Context Protocol (MCP) to interact with external tools and data sources, enabling flexible and extensible AI capabilities.
 
-- 웹 API를 통한 자연어 처리
-- ReAct 패턴을 사용한 도구 호출 및 대화형 상호작용
-- MCP(Model Context Protocol) 서버와의 연동
-- 다국어 지원 (한국어 포함)
-- 대화 로그 저장 및 분석
+## Project Structure
 
-## 시스템 요구사항
-
-- Python 3.10 이상
-- 메모리: 최소 4GB (8GB 이상 권장)
-- 디스크: 최소 2GB
-- (선택) CUDA 지원 GPU (GPU 가속 시)
-
-## 설치 방법
-
-### 로컬 설치
-
-1. 저장소 클론
-   ```bash
-   git clone https://github.com/yourusername/mcp-agent.git
-   cd mcp-agent
-   ```
-
-2. 환경 설정
-   ```bash
-   cp .env.example .env
-   # .env 파일 내용을 적절히 수정
-   ```
-
-3. 종속성 설치
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-4. 모델 다운로드
-   ```bash
-   python download_model.py
-   ```
-
-### Docker 설치
-
-1. Docker 이미지 빌드
-   ```bash
-   docker-compose build
-   ```
-
-2. Docker 컨테이너 실행
-   ```bash
-   docker-compose up
-   ```
-
-## 사용 방법
-
-### API 서버 실행
-
-```bash
-python -m app.main
+```
+.
+├── app/                  # Main application code
+│   ├── api/              # API endpoint definitions (FastAPI)
+│   ├── core/             # Core components (e.g., configuration)
+│   ├── mcp_client/       # MCP client implementation
+│   ├── prompts/          # Prompt templates for the LLM
+│   ├── services/         # Business logic (Inference, MCP communication)
+│   └── main.py           # FastAPI application entry point
+├── models/               # Directory for downloaded GGUF model
+├── logs/                 # Directory for application and ReAct logs
+├── .env                  # Environment variables (API keys, paths)
+├── requirements.txt      # Python dependencies
+├── mcp.json              # MCP server configurations
+├── Dockerfile            # (Optional) Dockerfile for containerization
+├── README.md             # This file
+├── GUIDE.md              # Detailed guide on MCP and development (Korean)
+├── LICENSE               # Apache 2.0 License for the project code
+├── LICENSE_GEMMA         # Gemma Model License
+├── NOTICE_GEMMA          # Gemma Model Notice
+└── TERMS_GEMMA           # Gemma Model Terms of Use
 ```
 
-기본적으로 서버는 `http://localhost:8000`에서 실행됩니다.
+## Getting Started
 
-### API 엔드포인트
+### Prerequisites
 
-- `/api/v1/chat`: 대화형 채팅 엔드포인트
-  ```bash
-  curl -X POST http://localhost:8000/api/v1/chat \
-    -H "Content-Type: application/json" \
-    -d '{"text": "안녕하세요"}'
-  ```
+*   Python 3.9+
+*   `pip` (Python package installer)
+*   (Optional) Docker and Docker Compose
 
-- `/api/v1/status`: 시스템 상태 확인 엔드포인트
-  ```bash
-  curl http://localhost:8000/api/v1/status
-  ```
+### Installation
 
-### MCP 설정
+1.  **Clone the repository:**
+    ```bash
+    git clone <repository-url>
+    cd <repository-directory>
+    ```
+2.  **Set up environment variables:**
+    *   Copy the example `.env.example` (if provided) to `.env`.
+    *   Update `.env` with your specific configurations, especially:
+        *   `MODEL_URL`: (Optional) URL to download the GGUF model if different from the default.
+        *   `MODEL_PATH`: (Optional) Path where the model file should be stored locally (relative to project root). Defaults to `./models/Gemma-3-4B-Fin-QA-Reasoning.Q4_K_M.gguf`.
+        *   `MCP_CONFIG_PATH`: (Optional) Path to the MCP configuration file. Defaults to `./mcp.json`.
+        *   `LOG_LEVEL`: (Optional) Desired log level (e.g., `DEBUG`, `INFO`, `WARNING`). Defaults to `INFO`.
+        *   `HUGGING_FACE_TOKEN`: (Optional) Your Hugging Face Hub token if needed for downloading private models or tokenizers.
+3.  **Install dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-MCP 서버를 추가하려면 `mcp.json` 파일을 편집하세요:
+### Running the Agent
 
-```json
-{
-  "mcpServers": {
-    "iterm-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@smithery/cli@latest",
-        "run",
-        "iterm-mcp",
-        "--key",
-        "your-key-here"
-      ]
+1.  **Configure MCP Servers:**
+    *   Edit `mcp.json` to define the MCP servers you want the agent to use. See the example below. The agent will automatically attempt to start and connect to these servers.
+    ```json
+    {
+      "mcpServers": {
+        "iterm-mcp": {
+          "command": "npx",
+          "args": [
+            "-y",
+            "@smithery/cli@latest",
+            "run",
+            "iterm-mcp",
+            "--key",
+            "<your-iterm-mcp-key>" // Replace with your actual key if needed
+          ]
+        },
+        "sequential-thinking": {
+          "command": "npx",
+          "args": [
+            "-y",
+            "@modelcontextprotocol/server-sequential-thinking"
+          ]
+        }
+      }
     }
-  }
-}
-```
+    ```
+    *   Ensure the specified commands (like `npx`) are available in your environment's PATH.
 
-## 테스트 실행
+2.  **Start the application:**
+    ```bash
+    python -m app.main
+    ```
+    *   The first time you run it, the agent will download the **GGUF model (approx. 4.1GB+)**, which might take some time.
+    *   The server will start, typically on `http://127.0.0.1:8000`.
 
-### 모델 직접 테스트
+### Using the API
 
-```bash
-python test_scripts/test_model_direct.py
-```
+Once the server is running, you can interact with the agent via its API endpoints:
 
-### 채팅 API 테스트
+*   **Health Check:** `GET /health`
+    *   Provides the status of the agent, including model loading status and connected MCP servers.
+*   **Chat Endpoint:** `POST /chat`
+    *   Send user queries or commands in the request body as JSON:
+        ```json
+        {
+          "text": "What files are in the current directory?"
+        }
+        ```
+    *   The agent will process the request, potentially using MCP tools via the ReAct pattern, and return a JSON response:
+        ```json
+        {
+          "response": "The command `ls -al` shows...",
+          "thoughts_and_actions": [
+            {
+              "thought": "I need to list the files. I'll use the iterm-mcp/write_to_terminal tool.",
+              "action": { "raw": "iterm-mcp/write_to_terminal(...)" },
+              "observation": "Okay, the command was sent..."
+            },
+            {
+              "thought": "Now I need to read the output.",
+              "action": { "raw": "iterm-mcp/read_terminal_output(...)" },
+              "observation": "total 4\n-rw-r--r-- 1 user user 0 Oct 28 10:00 file1.txt\n..."
+            }
+          ],
+          "full_response": "User: What files are in the current directory?\nAction: ...\nObservation: ...\nAction: ...\nObservation: ...\n",
+          "error": null,
+          "log_session_id": "174406...",
+          "log_path": "logs/react_logs/174406..."
+        }
+        ```
 
-```bash
-python test_scripts/test_chat_api.py --prompt "안녕하세요"
-```
+## Model Context Protocol (MCP)
 
-### E2E 테스트
+MCP standardizes communication between Large Language Models (LLMs) and external tools/data sources. This agent uses MCP to:
 
-```bash
-python test_scripts/test_e2e_completion.py
-```
+*   Discover available tools from connected MCP servers.
+*   Invoke tools with appropriate arguments based on the LLM's reasoning (ReAct pattern).
+*   Receive observations (results) from tool executions.
 
-## 로그 및 디버깅
+To add or modify capabilities, simply update the `mcp.json` file with the desired server configurations. The agent dynamically loads and interacts with these servers. Refer to [GUIDE.md](GUIDE.md) for a more detailed explanation of MCP (in Korean).
 
-로그 파일은 `logs` 디렉토리에 저장됩니다:
+## Logging
 
-- `logs/react_logs/`: ReAct 패턴 처리 로그
-- `logs/chat_tests/`: 채팅 테스트 로그
-- `logs/e2e_tests/`: E2E 테스트 로그
+*   **Application Logs:** Standard application logs are output to the console. The level can be controlled via the `LOG_LEVEL` environment variable.
+*   **ReAct Logs:** Detailed step-by-step logs for each `/chat` request (including thoughts, actions, observations, and LLM prompts/responses) are saved in the `logs/react_logs/<session_id>/` directory. This is invaluable for debugging the agent's reasoning process.
 
-## 문제해결
+## License
 
-**Q: 모델 다운로드가 실패합니다.**
-A: 네트워크 연결을 확인하고, 필요한 경우 Hugging Face 토큰을 설정하세요.
+This project's code is released into the public domain under The Unlicense. See the [LICENSE](LICENSE) file for details.
 
-**Q: 메모리 부족 오류가 발생합니다.**
-A: `max_tokens` 설정을 줄이거나 더 작은 모델로 전환하세요.
+The Gemma model used in this project is subject to its own license and terms. Please review the following files carefully:
 
-**Q: MCP 서버 연결이 실패합니다.**
-A: `mcp.json` 파일의 설정을 확인하고 필요한 패키지가 설치되어 있는지 확인하세요.
+*   **Gemma License:** [LICENSE_GEMMA](LICENSE_GEMMA)
+*   **Gemma Notice:** [NOTICE_GEMMA](NOTICE_GEMMA)
+*   **Gemma Terms of Use:** [TERMS_GEMMA](TERMS_GEMMA)
 
-## 라이선스
+By using this project, you agree to abide by both the project's license and the Gemma model's license and terms.
 
-MIT
+## Contributing
 
-## 기여
-
-버그 리포트, 기능 요청, 풀 리퀘스트를 환영합니다.
+Contributions are welcome! Please feel free to submit issues or pull requests.
