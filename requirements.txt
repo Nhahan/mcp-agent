@@ -1,12 +1,15 @@
 fastapi
 uvicorn[standard]
-httpx
-onnxruntime
-tqdm
-pydantic-settings
+httpx==0.26.0
+llama-cpp-python==0.2.38
+tqdm==4.66.1
+pydantic-settings==2.1.0
 transformers
 tokenizers
 sentencepiece # Often needed for Gemma tokenizer
+pydantic==2.5.2
+python-dotenv==1.0.0
+huggingface_hub==0.19.4
 
 # Testing
 pytest
