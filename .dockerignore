@@ -1,0 +1,45 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Local model cache
+test_model_cache/
+
+# Development and test files
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Git
+.git/
+.gitignore
+
+# Logs
+logs/
+
+# Docker
+.dockerignore
+Dockerfile
+docker-compose.yml
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Documentation
+docs/
+*.md
+
+# Local environment
+.env
+.env.local 
