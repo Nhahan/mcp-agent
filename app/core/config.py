@@ -22,9 +22,10 @@ class Settings(BaseSettings):
     api_description: str = "MCP Agent API"
     api_version: str = "0.1.0"
     
-    # 모델 구성 (Gemma-3-4B-Fin-QA-Reasoning Q4_K_M 으로 변경)
-    model_url: str = os.getenv("MODEL_URL", "https://huggingface.co/mradermacher/Gemma-3-4B-Fin-QA-Reasoning-GGUF/resolve/main/Gemma-3-4B-Fin-QA-Reasoning.Q4_K_M.gguf?download=true")
-    model_filename: str = "Gemma-3-4B-Fin-QA-Reasoning.Q4_K_M.gguf"
+    # 모델 구성 (정확한 모델 정보로 업데이트)
+    model_repo_id: str = os.getenv("MODEL_REPO_ID", "mradermacher/gemma3-4b-it-abliterated-GGUF")
+    model_filename: str = os.getenv("MODEL_FILENAME", "gemma3-4b-it-abliterated.Q8_0.gguf")
+    tokenizer_base_id: str = os.getenv("TOKENIZER_BASE_ID", "google/gemma-3-4b-it")
     model_dir: Path = Path('/app/models') if os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true" else Path('./models')
     
     # 로깅 및 디버깅
@@ -61,10 +62,15 @@ class Settings(BaseSettings):
             file_secret_settings,
         )
     
-    # 유틸리티 속성들
+    # 유틸리티 속성들 (URL 자동 생성)
     @property
     def model_path(self) -> Path:
         return self.model_dir / self.model_filename
+        
+    @property
+    def model_url(self) -> str:
+        """Constructs the model download URL from repo_id and filename."""
+        return f"https://huggingface.co/{self.model_repo_id}/resolve/main/{self.model_filename}"
 
     @property
     def MCP_CONFIG_PATH(self) -> Path:
@@ -96,8 +102,11 @@ if not settings.model_dir.exists():
     settings.model_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Created model directory: {settings.model_dir}")
 
-# 시작 시 주요 설정 로깅
-logger.info(f"Model URL set to: {settings.model_url}")
+# 시작 시 주요 설정 로깅 (model_url 속성 사용)
+logger.info(f"Model Repo ID set to: {settings.model_repo_id}")
+logger.info(f"Model Filename set to: {settings.model_filename}")
+logger.info(f"Tokenizer Base ID set to: {settings.tokenizer_base_id}")
+logger.info(f"Calculated Model URL: {settings.model_url}")
 logger.info(f"Model path set to: {settings.model_path}")
 logger.info(f"MCP config path: {settings.mcp_config_path}")
 logger.info(f"Running in Docker: {settings.is_docker}") 

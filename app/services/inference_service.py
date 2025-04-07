@@ -31,18 +31,13 @@ class InferenceService:
         self.settings = settings
         self.mcp_service = mcp_service
         
-        # --- 모델 정보 재확인 및 수정 (abliterated Q8_0) ---
-        self.new_model_repo = "mradermacher/gemma3-4b-it-abliterated-GGUF"
-        self.new_model_filename = "gemma3-4b-it-abliterated.Q8_0.gguf" # Q8_0 버전 재확인
-        self.new_tokenizer_base_id = "google/gemma-3-4b-it" # 베이스 토크나이저 유지
-        
-        # GGUF 관련 속성 (Q8_0 파일명 사용 확인)
-        self.model_path = Path('/app/models') / self.new_model_filename if settings.is_docker else Path('./models') / self.new_model_filename
-        self.model_url = f"https://huggingface.co/{self.new_model_repo}/resolve/main/{self.new_model_filename}"
-        
+        # --- 설정 객체(Settings)의 값을 직접 사용 --- 
+        self.model_path = settings.model_path
+        self.model_url = settings.model_url
+        # Tokenizer 경로는 config에 없으므로, Docker 환경 따라 결정 (기존 로직 유지)
         self.tokenizer_path = Path('/app/tokenizer') if settings.is_docker else Path('./tokenizer')
-        self.base_model_id_for_tokenizer = self.new_tokenizer_base_id 
-        # --- 모델 정보 수정 완료 ---
+        self.base_model_id_for_tokenizer = settings.tokenizer_base_id
+        # --- 설정 사용으로 변경 완료 ---
 
         # 모델 및 토크나이저 속성 초기화
         self.tokenizer: Optional[PreTrainedTokenizer] = None
@@ -60,77 +55,79 @@ class InferenceService:
         self.react_logs_dir.mkdir(parents=True, exist_ok=True)
         
         self.max_iterations = 10
-        self.lock = asyncio.Lock() # DEBUG -> 주석 해제
-        # self._download_task = None # DEBUG: 주석 처리 (다운로드 로직은 initialize 내에서 처리)
+        self.lock = asyncio.Lock()
         
-        # 즉시 초기화 실행 (로그 레벨 INFO로 변경)
+        # 즉시 초기화 실행 (기존 유지)
         loop = asyncio.get_event_loop()
         if not loop.is_running():
             loop.run_until_complete(self.initialize())
         else:
             asyncio.create_task(self.initialize())
-            # logger.info("Model initialization scheduled as async task") # INFO: 유지
 
         self.prompt_templates: Dict[str, str] = {}
         self._load_all_prompt_templates() 
 
     async def initialize(self):
-        # logger.debug(...) -> 주석 처리 또는 제거
-        async with self.lock: # lock은 유지
+        async with self.lock:
             if self.model and self.tokenizer:
-                logger.info("Model and tokenizer already initialized.") # INFO: 유지
+                logger.info("Model and tokenizer already initialized.")
                 return
 
             if not self.model_path.is_file():
-                logger.warning(f"GGUF 모델 파일을 찾을 수 없습니다: {self.model_path}. 다운로드를 시도합니다.") # WARNING: 유지
-                # ... (다운로드 로직, 내부 logger.info/warning/error 유지)
-            else:
-                logger.info(f"GGUF 모델 파일 확인됨: {self.model_path}") # INFO: 유지
+                logger.warning(f"GGUF 모델 파일을 찾을 수 없습니다: {self.model_path}. 다운로드를 시도합니다.")
+                try:
+                    await self._download_model() # <<<--- 여기서 self.model_url 사용
+                except Exception as download_e:
+                    logger.error(f"Model download failed: {download_e}", exc_info=True)
+                    raise RuntimeError(f"Failed to download model from {self.model_url}") from download_e
 
             try:
-                # 토크나이저 로드
+                # 토크나이저 로드 (self.base_model_id_for_tokenizer 사용)
                 try:
-                    logger.info(f"Loading tokenizer from HuggingFace Hub: {self.base_model_id_for_tokenizer}") # INFO: 유지
+                    logger.info(f"Loading tokenizer from HuggingFace Hub: {self.base_model_id_for_tokenizer}")
                     self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_id_for_tokenizer)
-                    logger.info("Tokenizer loaded successfully from Hub.") # INFO: 유지
+                    logger.info("Tokenizer loaded successfully from Hub.")
                 except Exception as hub_e:
-                    logger.warning(f"Hub에서 토크나이저 로드 실패: {hub_e}. 로컬 경로 시도: {self.tokenizer_path}") # WARNING: 유지
-                    # ... (로컬 로드 로직, 내부 logger.info/error 유지)
+                    logger.warning(f"Hub에서 토크나이저 로드 실패: {hub_e}. 로컬 경로 시도: {self.tokenizer_path}")
+                    try:
+                        self.tokenizer = AutoTokenizer.from_pretrained(str(self.tokenizer_path))
+                        logger.info("Tokenizer loaded successfully from local path.")
+                    except Exception as local_e:
+                         logger.error(f"로컬 경로에서도 토크나이저 로드 실패: {local_e}. GGUF 초기화 중단.", exc_info=True)
+                         raise RuntimeError("Failed to load tokenizer") from local_e
 
-                # GGUF 모델 로드
-                logger.info(f"Loading GGUF model: {self.model_path}") # INFO: 유지
+                # GGUF 모델 로드 (self.model_path 사용)
+                logger.info(f"Loading GGUF model: {self.model_path}")
                 start_time = time.time()
                 try:
-                    logger.info("Attempting to load model with GPU acceleration...") # INFO: 유지
+                    logger.info("Attempting to load model with GPU acceleration...")
                     self.model = Llama(
                         model_path=str(self.model_path),
                         n_ctx=8192,
                         n_gpu_layers=-1,  # 가능한 모든 레이어를 GPU로
                         verbose=False
                     )
-                    logger.info(f"GGUF model loaded with GPU acceleration. (Took {time.time() - start_time:.2f} seconds)") # INFO: 유지
+                    logger.info(f"GGUF model loaded with GPU acceleration. (Took {time.time() - start_time:.2f} seconds)")
                 except Exception as gpu_e:
-                    logger.warning(f"GPU 가속으로 모델 로드 실패: {gpu_e}. CPU로 전환합니다.") # WARNING: 유지
+                    logger.warning(f"GPU 가속으로 모델 로드 실패: {gpu_e}. CPU로 전환합니다.")
                     self.model = Llama(
                         model_path=str(self.model_path),
                         n_ctx=8192,
                         n_gpu_layers=0, # CPU 폴백
                         verbose=False
                     )
-                    logger.info(f"GGUF model loaded with CPU. (Took {time.time() - start_time:.2f} seconds)") # INFO: 유지
+                    logger.info(f"GGUF model loaded with CPU. (Took {time.time() - start_time:.2f} seconds)")
 
-                logger.info("Inference service (GGUF) initialized successfully.") # INFO: 유지
+                logger.info("Inference service (GGUF) initialized successfully.")
 
             except Exception as e:
-                logger.error(f"GGUF 초기화 실패: {e}", exc_info=True) # ERROR: 유지
+                logger.error(f"GGUF 초기화 실패: {e}", exc_info=True)
                 self.model = None
                 self.tokenizer = None # 토크나이저도 초기화
                 raise RuntimeError(f"GGUF 추론 서비스 초기화 실패: {e}") from e
 
     # GGUF 다운로드 함수 복원
     async def _download_model(self):
-        # 내부 logger.info/warning/error 유지
-        # logger.debug(...) -> 제거 또는 주석 처리
         try:
             self.model_path.parent.mkdir(parents=True, exist_ok=True)
             model_url_str = str(self.model_url)

@@ -5,10 +5,8 @@ import os  # Add os module import
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pydantic import BaseModel
-import json
 from pathlib import Path
 import sys
-import signal
 
 from app.api.api import api_router
 from app.core.config import get_settings
@@ -178,24 +176,15 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8000, help="서버 포트 (기본값: 8000)")
     args = parser.parse_args()
     
-    # Logging will be configured by lifespan when uvicorn starts the app
     logger.warning("Running in debug mode directly with uvicorn. Use Docker for production.")
 
-    # Define default environment variables ONLY if they are not already set
-    os.environ.setdefault("MODEL_URL", "https://huggingface.co/google/gemma-3-1b-it-qat-q4_0-gguf/resolve/main/gemma-3-1b-it-q4_0.gguf?download=true")
-    os.environ.setdefault("MODEL_PATH", "model/gemma-3-1b-it-q4_0.gguf")
-    os.environ.setdefault("MCP_CONFIG_PATH", "mcp.json")
-    os.environ.setdefault("LOG_LEVEL", "INFO")
+    # <<<--- 불필요한 setdefault 제거 --- >>>
+    # 설정은 config.py와 lifespan에서 처리됨
 
-    # No need to reload settings here, lifespan will handle it.
-
-    # <<<--- 명시적으로 watchfiles 로거 레벨 설정 (리로드 시 영향 줄 수 있도록)
+    # 명시적으로 watchfiles 로거 레벨 설정 (리로드 시 영향 줄 수 있도록)
     watchfiles_logger = logging.getLogger("watchfiles")
     watchfiles_logger.setLevel(logging.WARNING)
     logger.info(f"Explicitly setting watchfiles logger level to WARNING before uvicorn.run")
-    # --->>>
 
     # Pass the app instance string for uvicorn's auto-reload feature
-    # Uvicorn will call the lifespan manager upon startup
-    uvicorn.run("app.main:app", host=args.host, port=args.port, reload=True)
-    # log_level is now controlled by the lifespan based on LOG_LEVEL env var 
+    uvicorn.run("app.main:app", host=args.host, port=args.port, reload=True) 
