@@ -1,16 +1,38 @@
+# 기본 웹 프레임워크 및 설정
 fastapi
 uvicorn[standard]
-httpx==0.26.0
-llama-cpp-python==0.2.38
-tqdm==4.66.1
-pydantic-settings==2.1.0
-transformers
-tokenizers
-sentencepiece # Often needed for Gemma tokenizer
-pydantic==2.5.2
-python-dotenv==1.0.0
-huggingface_hub==0.19.4
+pydantic
+pydantic-settings
 
-# Testing
+# HTTP 클라이언트
+httpx
+
+# MCP 관련
+# @modelcontextprotocol/sdk 관련 의존성은 Node.js/npm 이므로 여기서는 제외
+# MCP 서버 실행에 필요한 의존성은 mcp.json의 command/args를 통해 실행 시점에 설치됨 (예: npx)
+
+# 로깅
+loguru
+
+# LLM 추론 (기존 GGUF 방식)
+llama-cpp-python
+
+# LLM 추론 (HuggingFace Transformers, PEFT - 현재 문제 발생으로 주석 처리 또는 제거)
+# torch --index-url https://download.pytorch.org/whl/cpu # 또는 CUDA 버전에 맞는 URL
+# transformers[torch]
+# accelerate # 모델 로딩 최적화 (선택 사항)
+# bitsandbytes # 4비트/8비트 양자화 (선택 사항)
+# peft # PEFT 어댑터 사용 시 필수
+
+# 기타 유틸리티
+python-dotenv
+requests # 일부 라이브러리 의존성 또는 간단한 동기 요청 시 사용될 수 있음
+
+huggingface-hub # 모델/토크나이저 다운로드용
+
+# Watchdog (소스 변경 감지용, uvicorn[standard]에 포함될 수도 있음)
+watchfiles
+
+# Development/Testing
 pytest
 pytest-asyncio 

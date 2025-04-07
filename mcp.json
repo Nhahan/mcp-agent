@@ -1,1 +1,15 @@
-{"mcpServers": {"iterm-mcp": {"command": "npx", "args": ["-y", "@smithery/cli@latest", "run", "iterm-mcp", "--key", "8b7ed912-9139-4ef0-b62b-e1a1b3977f63"]}}}
+{
+    "mcpServers": {
+        "iterm-mcp": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@smithery/cli@latest",
+                "run",
+                "iterm-mcp",
+                "--key",
+                "8b7ed912-9139-4ef0-b62b-e1a1b3977f63"
+            ]
+        }
+    }
+}

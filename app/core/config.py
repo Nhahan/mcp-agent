@@ -5,6 +5,7 @@ from functools import lru_cache
 from pydantic import Field, HttpUrl, AliasChoices, DirectoryPath
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Dict, Any
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
 
@@ -12,67 +13,63 @@ logger = logging.getLogger(__name__)
 # This assumes config.py is in app/core/
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
+# .env 파일 로딩 시도 (선택적)
+load_dotenv()
+
 class Settings(BaseSettings):
     # API 구성
     api_title: str = "MCP Agent"
     api_description: str = "MCP Agent API"
     api_version: str = "0.1.0"
     
-    # 모델 구성
-    model_path: Path = Path("test_model_cache/gemma-3-1b-it-q4_0.gguf")
-    model_url: HttpUrl = "https://huggingface.co/google/gemma-3-1b-it-qat-q4_0-gguf/resolve/main/gemma-3-1b-it-q4_0.gguf?download=true"
-    model_repo_id: str = "google/gemma-3-1b-it-qat-q4_0-gguf"  # Hugging Face 리포지토리 ID
-    model_filename: str = "gemma-3-1b-it-q4_0.gguf"  # 파일 이름
+    # 모델 구성 (Gemma-3-4B-Fin-QA-Reasoning Q4_K_M 으로 변경)
+    model_url: str = os.getenv("MODEL_URL", "https://huggingface.co/mradermacher/Gemma-3-4B-Fin-QA-Reasoning-GGUF/resolve/main/Gemma-3-4B-Fin-QA-Reasoning.Q4_K_M.gguf?download=true")
+    model_filename: str = "Gemma-3-4B-Fin-QA-Reasoning.Q4_K_M.gguf"
+    model_dir: Path = Path('/app/models') if os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true" else Path('./models')
     
     # 로깅 및 디버깅
     log_level: str = "INFO"
     
     # MCP 구성
-    mcp_config_path: Path = Path("mcp.json")
+    mcp_config_path: Path = Path('/app/mcp.json') if os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true" else Path('./mcp.json')
+    
+    # Hugging Face 토큰
+    hugging_face_token: str = ""
     
     # Docker 환경 체크 
-    is_docker: bool = False  # Docker 환경인지 확인 (파일 경로에 영향)
+    is_docker: bool = os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true"
     
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    # Pydantic v2 경고 해결: protected_namespaces 설정 추가
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        protected_namespaces=('settings_',), # 'model_' 네임스페이스 충돌 방지
+        extra='ignore' # 명시적으로 정의되지 않은 필드는 무시 (기본값)
+    )
         
-        @classmethod
-        def customise_sources(
-            cls,
+    @classmethod
+    def customise_sources(
+        cls,
+        init_settings,
+        env_settings,
+        file_secret_settings,
+    ):
+        return (
             init_settings,
             env_settings,
+            _docker_check,
             file_secret_settings,
-        ):
-            return (
-                init_settings,
-                env_settings,
-                _docker_check,
-                file_secret_settings,
-            )
+        )
     
     # 유틸리티 속성들
     @property
-    def MODEL_CACHE_DIR(self) -> Path:
-        """모델 캐시 디렉토리 반환"""
-        cache_dir = self.model_path.parent
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        return cache_dir
-    
+    def model_path(self) -> Path:
+        return self.model_dir / self.model_filename
+
     @property
     def MCP_CONFIG_PATH(self) -> Path:
-        """MCP 설정 파일 경로 반환 (대문자 속성명 - 하위 호환성)"""
+        """MCP 설정 파일 경로 반환"""
         return self.mcp_config_path
-    
-    @property
-    def model_path_str(self) -> str:
-        """모델 경로를 문자열로 반환"""
-        return str(self.model_path)
-    
-    @property
-    def mcp_config_path_str(self) -> str:
-        """MCP 설정 경로를 문자열로 반환"""
-        return str(self.mcp_config_path)
 
 def _docker_check(settings: Dict[str, Any]) -> Dict[str, Any]:
     """Docker 환경인지 확인합니다."""
@@ -86,16 +83,21 @@ def get_settings() -> Settings:
     logger.debug("Loading application settings...")
     try:
         settings = Settings()
-        # Log crucial paths after loading
-        logger.debug(f"Model URL: {settings.model_url}")
-        logger.debug(f"Model Path: {settings.model_path}")
-        logger.debug(f"Model Cache Dir: {settings.MODEL_CACHE_DIR}")
-        logger.debug(f"MCP Config Path: {settings.mcp_config_path_str}")
-        logger.debug(f"Log Level: {settings.log_level}") # Log the level
         return settings
     except Exception as e:
         logger.error(f"Error loading settings: {e}", exc_info=True)
         raise
 
-# Remove the direct instantiation at module level
-# settings = Settings() 
+# settings 인스턴스를 여기서 생성합니다.
+settings = get_settings()
+
+# 애플리케이션 시작 시 모델 디렉토리 생성
+if not settings.model_dir.exists():
+    settings.model_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created model directory: {settings.model_dir}")
+
+# 시작 시 주요 설정 로깅
+logger.info(f"Model URL set to: {settings.model_url}")
+logger.info(f"Model path set to: {settings.model_path}")
+logger.info(f"MCP config path: {settings.mcp_config_path}")
+logger.info(f"Running in Docker: {settings.is_docker}") 
