@@ -1,0 +1,4 @@
+**REQUIRED JSON STRUCTURE:**
+- `thought`: string (Your reasoning. If using a tool, MUST mention the exact tool name from `Available Tools` here.)
+- `action`: string (Tool call like `server/tool({{\"key\":\"value\"}})` from `Available Tools`) OR `null` 
+- `answer`: string (Final answer if `action` is `null`) OR `null` 

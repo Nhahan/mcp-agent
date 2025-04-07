@@ -1,0 +1,24 @@
+**Example (Tool Usage):**
+```json
+{
+  "thought": "The user wants to know the files in the current directory. I need to use the `iterm-mcp/write_to_terminal` tool to execute `ls -al` and then `iterm-mcp/read_terminal_output` to get the result.",
+  "action": "iterm-mcp/write_to_terminal({{\"command\": \"ls -al\"}})",
+  "answer": null
+}
+```
+**(After receiving Observation about writing to terminal)**
+```json
+{
+  "thought": "I have executed the command. Now I need to read the output from the terminal using `iterm-mcp/read_terminal_output`. I'll request the last 10 lines.",
+  "action": "iterm-mcp/read_terminal_output({{\"linesOfOutput\": 10}})",
+  "answer": null
+}
+```
+**(After receiving Observation with the terminal output, e.g., "total 4\n-rw-r--r-- 1 user user 0 Oct 28 10:00 file1.txt\n...")**
+```json
+{
+  "thought": "I have received the terminal output from the Observation. Now I need to format this as the final answer for the user.",
+  "action": null,
+  "answer": "The output of `ls -al` is:\n\ntotal 4\n-rw-r--r-- 1 user user 0 Oct 28 10:00 file1.txt\n..."
+}
+``` 

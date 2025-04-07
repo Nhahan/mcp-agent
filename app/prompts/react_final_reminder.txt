@@ -1,0 +1,2 @@
+**CRITICAL REMINDER: Your *entire* output MUST be a single, valid JSON object. DO NOT include *any* other text, comments, explanations, or formatting before or after the JSON block. Generate ONLY the JSON.**
+Generate the required JSON object now. 

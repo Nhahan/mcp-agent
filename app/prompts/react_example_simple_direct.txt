@@ -1,0 +1,4 @@
+**Example (Direct Answer):**
+```json
+{{"thought": "I can answer this directly.", "action": null, "answer": "The capital of France is Paris."}}
+``` 
