@@ -3,10 +3,14 @@ import logging
 import asyncio
 import os  # Add os module import
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
+import json
+from pathlib import Path
+import sys
+import signal
 
-from app.api.v1.api import api_router
+from app.api.api import api_router
 from app.core.config import get_settings
 from app.services.mcp_service import MCPService
 from app.services.inference_service import InferenceService
@@ -61,6 +65,15 @@ logger = logging.getLogger(__name__)
 # Application state to hold service instances
 app_state = {}
 
+# watchfiles 로거 가져오기 및 레벨 설정
+watchfiles_logger = logging.getLogger("watchfiles")
+watchfiles_logger.setLevel(logging.WARNING)
+
+# 프로젝트 루트를 sys.path에 추가
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting application lifespan...")
@@ -80,17 +93,39 @@ async def lifespan(app: FastAPI):
     app_state["inference_service"] = inference_service
 
     # Start services in the background
-    mcp_task = asyncio.create_task(mcp_service.start_servers())
     init_task = asyncio.create_task(inference_service.initialize()) # Initialize inference service (includes model download check)
     
     # Optionally, wait for initialization or handle errors
     try:
-        # Wait for essential initializations if needed, or just let them run
-        # await init_task # Uncomment if you need model download before serving requests
-        logger.info("Services started in background.")
+        # MCP 서버 시작 및 도구 정보 초기화
+        logger.info("MCP 서버 시작 중...")
+        await mcp_service.start_servers()
+        
+        # 서버 연결 상태 확인 및 도구 정보 확인
+        available_servers = mcp_service.get_available_server_names()
+        running_servers = mcp_service.get_running_servers()
+        
+        logger.info(f"설정에 정의된 MCP 서버: {available_servers}")
+        logger.info(f"실제 실행 중인 MCP 서버: {running_servers}")
+        
+        # 도구 정보 초기화 시도 (더 간결하게 로깅)
+        tools_fetched = False
+        for name in running_servers:
+            # 서버별 연결 시도 및 도구 fetch는 MCPService 내부에서 로깅되므로 여기서는 반복 로깅 최소화
+            if mcp_service.is_server_connected(name):
+                 tools = mcp_service.get_server_tools(name) # 캐시된 정보 확인
+                 if tools: # 캐시된 정보가 있으면 성공으로 간주
+                      tools_fetched = True
+                 else: # 캐시가 없으면 fetch 시도 (MCPService 내부에서 로그 남김)
+                      fetched_tools = await mcp_service._fetch_server_tools(name)
+                      if fetched_tools:
+                           tools_fetched = True # fetch 성공
+                           # 이미 _fetch_server_tools에서 로그 남김
+                      # else: # fetch 실패 로그는 _fetch_server_tools 에서 남김
+        
+        logger.info("서비스 시작 완료")
     except Exception as e:
-        logger.error(f"Error during service initialization: {e}", exc_info=True)
-        # Decide how to handle startup errors (e.g., exit, retry)
+        logger.error(f"서비스 초기화 중 오류 발생: {e}", exc_info=True)
 
     yield # Application runs here
 
@@ -98,8 +133,6 @@ async def lifespan(app: FastAPI):
     # Stop MCP servers
     await mcp_service.stop_servers()
     # Cancel any pending tasks if necessary
-    if not mcp_task.done():
-        mcp_task.cancel()
     if init_task and not init_task.done(): # Check if init_task exists
         init_task.cancel()
     logger.info("Application shutdown complete.")
@@ -112,7 +145,7 @@ app = FastAPI(
 )
 
 # Include the API router at /api/v1 prefix
-app.include_router(api_router, prefix="/api/v1")
+app.include_router(api_router)
 
 # Add dependency overrides to inject the singleton services
 def get_mcp_service_instance():
@@ -132,7 +165,7 @@ app.dependency_overrides[get_mcp_service] = get_mcp_service_instance
 
 @app.get("/")
 async def read_root():
-    return {"message": "AI Agent API is running. Use /api/v1/chat for the chat endpoint."}
+    return {"message": "AI Agent API is running."}
 
 # Keep the local run block if needed for development
 if __name__ == "__main__":
@@ -152,9 +185,15 @@ if __name__ == "__main__":
     os.environ.setdefault("MODEL_URL", "https://huggingface.co/google/gemma-3-1b-it-qat-q4_0-gguf/resolve/main/gemma-3-1b-it-q4_0.gguf?download=true")
     os.environ.setdefault("MODEL_PATH", "model/gemma-3-1b-it-q4_0.gguf")
     os.environ.setdefault("MCP_CONFIG_PATH", "mcp.json")
-    os.environ.setdefault("LOG_LEVEL", "DEBUG") # Example for local dev
+    os.environ.setdefault("LOG_LEVEL", "INFO")
 
     # No need to reload settings here, lifespan will handle it.
+
+    # <<<--- 명시적으로 watchfiles 로거 레벨 설정 (리로드 시 영향 줄 수 있도록)
+    watchfiles_logger = logging.getLogger("watchfiles")
+    watchfiles_logger.setLevel(logging.WARNING)
+    logger.info(f"Explicitly setting watchfiles logger level to WARNING before uvicorn.run")
+    # --->>>
 
     # Pass the app instance string for uvicorn's auto-reload feature
     # Uvicorn will call the lifespan manager upon startup
