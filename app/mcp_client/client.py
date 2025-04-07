@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
+import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -20,6 +21,19 @@ class MCPClient:
             raise ValueError(f"Process for MCP server '{self.name}' must have stdin and stdout piped.")
 
         self._start_reader()
+
+        # 응답 추적을 위한 변수들
+        self._responses = {}
+        self._response_event = asyncio.Event()
+        self._next_id = 1
+        
+        # 서버 상태 관련 속성
+        self._connected = False
+        self._capabilities = {}
+        self._cached_tools = None
+        
+        # 로깅 설정
+        self.logger = logging.getLogger(f"app.mcp_client.{name}")
 
     def _start_reader(self):
         """Starts the background task to read and process messages from stdout."""
@@ -165,6 +179,95 @@ class MCPClient:
             except asyncio.CancelledError:
                 logger.debug(f"Reader task for '{self.name}' cancellation confirmed.")
         # Note: Process closing (stdin/terminate) should be handled by mcp_service.stop_mcp_servers
+
+    @property
+    def is_connected(self) -> bool:
+        """클라이언트가 MCP 서버에 연결되어 있는지 여부를 반환합니다."""
+        return self._connected and (
+            # 프로세스 기반 연결인 경우 프로세스가 살아있는지 확인
+            (self.process is None or self.process.poll() is None) and
+            # 리더 태스크가 실행 중인지 확인
+            (self._reader_task is not None and not self._reader_task.done())
+        )
+
+    @property
+    def cached_tools(self) -> Optional[dict]:
+        """서버 도구 목록의 캐시를 반환합니다."""
+        return self._cached_tools
+
+    @cached_tools.setter
+    def cached_tools(self, value: dict):
+        """서버 도구 목록의 캐시를 설정합니다."""
+        self._cached_tools = value
+
+    async def get_tools(self) -> dict:
+        """MCP 서버의 도구 목록과 메타데이터를 가져옵니다.
+        
+        Returns:
+            도구 이름을 키로 하고 도구 메타데이터를 값으로 하는 딕셔너리
+        """
+        # 서버 연결이 없으면 빈 딕셔너리 반환
+        if not self.is_connected:
+            self.logger.warning("서버와 연결되지 않은 상태에서 도구 목록 요청됨, 빈 목록 반환")
+            return {}
+        
+        try:
+            # 캐시된 도구 정보가 있으면 반환 (캐싱은 선택 사항)
+            # if self._cached_tools:
+            #     return self._cached_tools
+            
+            # MCP에서 지원하는 capabilities/list 메서드 호출
+            result = await self.call("capabilities/list", timeout=5.0) # Use the existing call method
+            
+            # 응답 처리
+            if isinstance(result, dict) and "tools" in result:
+                tools = result["tools"]
+                if isinstance(tools, dict):
+                    # 캐시에 저장 (선택 사항)
+                    # self._cached_tools = tools
+                    self.logger.info(f"서버 '{self.name}'에서 {len(tools)}개의 도구 정보 수신")
+                    return tools
+                else:
+                    self.logger.warning(f"서버 '{self.name}'의 capabilities/list 응답에 유효한 'tools' 딕셔너리가 없습니다: {result}")
+                    return {}
+            else:
+                self.logger.warning(f"서버 '{self.name}'의 capabilities/list 응답 형식이 유효하지 않거나 'tools' 키가 없습니다: {result}")
+                return {}
+
+        except asyncio.TimeoutError:
+            self.logger.error(f"서버 '{self.name}'의 capabilities/list 요청 시간 초과")
+            return {} # 시간 초과 시 빈 딕셔너리 반환
+        except MCPError as e:
+            self.logger.error(f"서버 '{self.name}'의 capabilities/list 요청 중 MCP 오류 발생: {e}")
+            return {} # MCP 오류 시 빈 딕셔너리 반환
+        except ConnectionError as e:
+            self.logger.error(f"서버 '{self.name}'의 capabilities/list 요청 중 연결 오류 발생: {e}")
+            self._connected = False # 연결 오류 시 상태 업데이트
+            return {} # 연결 오류 시 빈 딕셔너리 반환
+        except Exception as e:
+            self.logger.error(f"서버 '{self.name}'의 capabilities/list 요청 중 알 수 없는 오류 발생: {e}", exc_info=True)
+            return {} # 기타 오류 시 빈 딕셔너리 반환
+
+    async def start_reader_task(self):
+        """서버 출력을 비동기적으로 읽는 태스크를 시작합니다."""
+        if self._reader_task is None or self._reader_task.done():
+            self._reader_task = asyncio.create_task(self._read_output())
+            self.logger.info(f"MCP 서버 '{self.name}'의 출력 리더 태스크를 시작했습니다.")
+            # 연결 상태를 True로 설정
+            self._connected = True
+
+    async def close(self):
+        """클라이언트 리소스를 정리합니다."""
+        if self._reader_task and not self._reader_task.done():
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                self.logger.info(f"MCP 서버 '{self.name}'의 리더 태스크가 취소되었습니다.")
+        
+        # 연결 상태를 False로 설정
+        self._connected = False
+        self.logger.info(f"MCP 서버 '{self.name}'의 클라이언트를 닫았습니다.")
 
 class MCPError(Exception):
     """Represents an error received from an MCP server."""

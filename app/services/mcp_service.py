@@ -2,7 +2,7 @@ import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 import asyncio
 
 from app.core.config import Settings, get_settings # Import Settings
@@ -28,32 +28,43 @@ class MCPService:
         self._mcp_processes: Dict[str, asyncio.subprocess.Process] = {}
         self._mcp_clients: Dict[str, MCPClient] = {}
         self._start_stop_lock = asyncio.Lock()
+        self._mcp_config: Dict[str, Any] = {} # Store loaded config
+        self._load_config() # Load config during initialization
+
+    def _load_config(self):
+        """Loads the MCP configuration file."""
+        if not self.config_path.exists():
+            logger.warning(f"MCP configuration file not found at {self.config_path}. No MCP servers available.")
+            self._mcp_config = {"mcpServers": {}}
+            return
+        try:
+            with open(self.config_path, 'r') as f:
+                self._mcp_config = json.load(f)
+            logger.info(f"MCP configuration loaded from {self.config_path}.")
+        except Exception as e:
+            logger.error(f"Failed to read or parse MCP config: {e}")
+            self._mcp_config = {"mcpServers": {}}
+
+    def get_available_server_names(self) -> List[str]:
+        """Returns a list of all server names defined in the MCP config."""
+        # Ensure config is loaded if not already
+        if not self._mcp_config: 
+            self._load_config()
+        return list(self._mcp_config.get("mcpServers", {}).keys())
 
     async def start_servers(self):
-        """Starts MCP servers based on the configuration file."""
+        """Starts MCP servers based on the loaded configuration."""
         async with self._start_stop_lock:
             if self._mcp_processes: # Prevent starting if already running
                 logger.warning("MCP servers seem to be already running or starting.")
                 return
-                
-            logger.info(f"Loading MCP configuration from {self.config_path}...")
-            if not self.config_path.exists():
-                logger.warning(f"MCP configuration file not found at {self.config_path}. Skipping MCP server startup.")
-                return
-
-            try:
-                with open(self.config_path, 'r') as f:
-                    mcp_config = json.load(f)
-            except Exception as e:
-                logger.error(f"Failed to read or parse MCP config: {e}")
-                return
-
-            mcp_servers = mcp_config.get("mcpServers", {})
+            
+            mcp_servers = self._mcp_config.get("mcpServers", {})
             if not mcp_servers:
                 logger.info("No MCP servers defined in the configuration.")
                 return
 
-            logger.info(f"Found {len(mcp_servers)} MCP server(s) to start.")
+            logger.info(f"Attempting to start {len(mcp_servers)} configured MCP server(s)...")
             start_tasks = []
             for name, config in mcp_servers.items():
                 command = config.get("command")
@@ -61,12 +72,10 @@ class MCPService:
                 if not command:
                     logger.warning(f"Skipping MCP server '{name}': 'command' not specified.")
                     continue
-                # Create a task for each server start
                 start_tasks.append(asyncio.create_task(self._start_single_server(name, command, args)))
 
-            # Wait for all startup tasks to complete
             if start_tasks:
-                await asyncio.gather(*start_tasks, return_exceptions=True) # Handle exceptions during startup
+                await asyncio.gather(*start_tasks, return_exceptions=True)
             logger.info("MCP server startup process completed.")
 
     async def _start_single_server(self, name: str, command: str, args: list):
@@ -84,19 +93,16 @@ class MCPService:
             try:
                 self._mcp_clients[name] = MCPClient(name, process)
                 logger.info(f"MCP server '{name}' started (PID {process.pid}) and client created.")
-                # Start logging stderr in the background
                 if process.stderr:
                     asyncio.create_task(log_stderr(process.stderr, f"{name}-stderr"))
             except ValueError as e:
                 logger.error(f"Failed to create MCPClient for '{name}': {e}. Process terminated.")
                 if process.returncode is None: process.terminate()
                 del self._mcp_processes[name]
-
         except FileNotFoundError:
             logger.error(f"Failed to start MCP server '{name}': Command '{command}' not found.")
         except Exception as e:
             logger.error(f"Failed to start MCP server '{name}': {e}", exc_info=True)
-        # Ensure process is removed if client creation failed or other exceptions occurred
         if name in self._mcp_processes and name not in self._mcp_clients:
              del self._mcp_processes[name]
 
@@ -106,18 +112,16 @@ class MCPService:
             if not self._mcp_processes and not self._mcp_clients:
                  logger.info("No MCP servers or clients to stop.")
                  return
-                 
             logger.info("Shutting down MCP clients...")
             close_tasks = [asyncio.create_task(client.close()) for client in self._mcp_clients.values()]
             if close_tasks: await asyncio.gather(*close_tasks, return_exceptions=True)
-            self._mcp_clients.clear() # Clear clients after closing
+            self._mcp_clients.clear()
             logger.info("MCP clients closed.")
-
             logger.info("Stopping MCP server processes...")
             stop_tasks = [asyncio.create_task(self._stop_single_server(name, process)) 
                           for name, process in self._mcp_processes.items()]
             if stop_tasks: await asyncio.gather(*stop_tasks, return_exceptions=True)
-            self._mcp_processes.clear() # Clear processes after stopping
+            self._mcp_processes.clear()
             logger.info("MCP server processes stopped.")
 
     async def _stop_single_server(self, name: str, process: asyncio.subprocess.Process):
@@ -147,7 +151,7 @@ class MCPService:
          """Checks the status of a specific MCP server process."""
          process = self._mcp_processes.get(server_name)
          client = self._mcp_clients.get(server_name)
-         status = {"server_name": server_name, "status": "not_found", "pid": None, "return_code": None, "client_active": False}
+         status = {"server_name": server_name, "status": "not_found", "pid": None, "return_code": None}
          if process:
              if process.returncode is None:
                  status["status"] = "running"
@@ -162,38 +166,124 @@ class MCPService:
          """Returns a list of names of currently running MCP servers."""
          return [name for name, process in self._mcp_processes.items() if process.returncode is None]
 
-    async def call_mcp_tool(self, server_name: str, tool_name: str, arguments: Optional[Dict[str, Any]] = None, timeout: float = 10.0) -> Any:
-        """Calls a specific tool on a managed MCP server."""
-        client = self._mcp_clients.get(server_name)
-        if client is None:
-            # Check process status for more context
-            proc_status = self.get_process_status(server_name)
-            raise ValueError(f"No active MCP client or running process found for server '{server_name}' (Status: {proc_status['status']}).")
-
+    async def call_tool(self, server_name: str, tool_name: str, args: dict) -> Any:
+        """
+        특정 서버의 도구를 호출합니다.
+        서버 이름, 도구 이름, 인자를 받아서 MCP 클라이언트를 통해 도구를 실행합니다.
+        """
+        logger.info(f"MCP 도구 호출: {server_name}/{tool_name} 인자: {args}")
         try:
-            logger.info(f"Calling tool '{tool_name}' on MCP server '{server_name}' with args: {arguments}")
-            result = await client.call_tool(tool_name, arguments, timeout=timeout)
-            logger.info(f"Received result from '{server_name}' tool '{tool_name}'.")
-            return result
-        except ConnectionError as e:
-            logger.error(f"Connection error calling tool '{tool_name}' on '{server_name}': {e}")
-            raise
-        except TimeoutError as e:
-            logger.error(f"Timeout calling tool '{tool_name}' on '{server_name}': {e}")
-            raise
+            # 서버 확인
+            if not self.is_server_available(server_name):
+                available_servers = self.get_available_server_names()
+                error_msg = f"MCP 서버 '{server_name}'이(가) 사용 가능하지 않습니다. 사용 가능한 서버: {', '.join(available_servers) if available_servers else '없음'}"
+                logger.error(error_msg)
+                raise MCPError(error_msg)
+            
+            # 클라이언트 가져오기
+            client = self._mcp_clients.get(server_name)
+            if not client:
+                # 항상 여기에 도달하면 안 됨 (위에서 확인함)
+                error_msg = f"MCP 클라이언트 '{server_name}'이(가) 존재하지 않습니다."
+                logger.error(error_msg)
+                raise MCPError(error_msg)
+            
+            # MCP 도구 호출
+            try:
+                # 모든 서버를 동일하게 처리 - 서버 유형 구분 없음
+                logger.info(f"MCP 도구 호출: {server_name}/{tool_name}")
+                
+                # 필수 인자 유효성 검사
+                if tool_name.lower().endswith("write_to_terminal") and "command" not in args:
+                    raise ValueError("command 인자가 필요합니다.")
+                elif tool_name.lower().endswith("send_control_character") and "letter" not in args:
+                    raise ValueError("letter 인자가 필요합니다.")
+                
+                # 도구 호출
+                response = await client.call_tool(tool_name, args)
+                return response
+                
+            except Exception as e:
+                if isinstance(e, MCPError):
+                    logger.error(f"MCP 오류: {str(e)}")
+                    raise
+                else:
+                    error_msg = f"MCP 도구 호출 중 오류 발생: {type(e).__name__}: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    raise MCPError(error_msg) from e
+        
         except MCPError as e:
-            logger.error(f"MCP error calling tool '{tool_name}' on '{server_name}': {e}")
+            # MCP 관련 오류 그대로 전달
+            logger.error(f"MCP 오류 발생: {str(e)}")
             raise
         except Exception as e:
-            logger.error(f"Unexpected error calling tool '{tool_name}' on '{server_name}': {e}", exc_info=True)
-            raise
+            # 기타 오류는 MCPError로 변환
+            error_msg = f"도구 호출 중 예상치 못한 오류 발생: {type(e).__name__}: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            raise MCPError(error_msg) from e
 
-# Dependency function (optional, but can be useful for clarity or testing)
+    def _format_tool_name(self, tool_name: str) -> str:
+        """
+        도구 이름을 MCP 규약에 맞게 포맷팅합니다.
+        """
+        # 도구 이름에 접두사가 없을 경우 추가
+        if not tool_name.startswith("mcp_"):
+            # iterm-mcp의 경우 접두사 붙이기
+            return tool_name
+        return tool_name
+
+    def is_server_available(self, server_name: str) -> bool:
+        """주어진 이름의 MCP 서버가 등록되어 있는지 확인합니다."""
+        return server_name in self._mcp_clients
+    
+    def is_server_connected(self, server_name: str) -> bool:
+        """주어진 이름의 MCP 서버가 연결되어 있는지 확인합니다."""
+        if server_name not in self._mcp_clients:
+            return False
+            
+        client = self._mcp_clients[server_name]
+        return hasattr(client, 'is_connected') and client.is_connected
+
+    def get_server_tools(self, server_name: str) -> dict:
+        """특정 MCP 서버에서 제공하는 도구 정보를 가져옵니다.
+        
+        Args:
+            server_name: 도구 정보를 가져올 MCP 서버 이름
+            
+        Returns:
+            도구 이름과 정보를 포함하는 딕셔너리
+            예: {"tool_name": {"description": "...", "parameters": {...}}}
+        """
+        if server_name not in self._mcp_clients:
+            logger.warning(f"MCP 서버 '{server_name}'가 등록되지 않았습니다.")
+            return {}
+        
+        client = self._mcp_clients[server_name]
+        
+        try:
+            # 도구 목록 캐시 확인
+            if hasattr(client, 'cached_tools') and client.cached_tools:
+                return client.cached_tools
+            
+            # 서버가 응답하지 않거나 초기화가 필요한 경우
+            if not client.is_connected:
+                logger.warning(f"MCP 서버 '{server_name}'에 연결되지 않았습니다.")
+                return {}
+            
+            # MCP 클라이언트를 통해 실제 도구 정보 가져오기
+            # 구현에 따라 다를 수 있으므로 예외 처리
+            try:
+                tools = client.get_tools()
+                # 도구 정보 캐싱
+                client.cached_tools = tools
+                return tools
+            except (NotImplementedError, AttributeError):
+                logger.warning(f"MCP 서버 '{server_name}'에서 도구 정보를 가져오는 메서드를 지원하지 않습니다.")
+                return {}
+        except Exception as e:
+            logger.error(f"도구 정보 가져오기 실패 '{server_name}': {e}")
+            return {}
+
+# Dependency function
 def get_mcp_service(settings: Settings = Depends(get_settings)) -> MCPService:
-     # This could potentially return a singleton managed elsewhere,
-     # but for now, it relies on FastAPI's handling or overrides.
-     # Creating it directly here might lead to multiple instances if not overridden.
-     # The lifespan manager in main.py is the primary way to manage the singleton.
-     # This function signature matches what FastAPI expects for dependency injection.
-     # We will override this in main.py to return the instance from app_state.
      raise NotImplementedError("This function should be overridden in main.py to provide the singleton MCPService instance.") 
