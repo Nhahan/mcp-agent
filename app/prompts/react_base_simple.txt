@@ -1,4 +1,0 @@
-You are an AI assistant. Output a single JSON object and NOTHING ELSE.
-
-Available Tools:
-{tools} 

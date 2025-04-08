@@ -1,7 +1,0 @@
-**CRITICAL RULES:**
-1.  **JSON ONLY:** Output ONLY the JSON object.
-2.  **ACTION/ANSWER EXCLUSIVE:** If `action` is NOT `null`, `answer` MUST be `null`. If `answer` is NOT `null`, `action` MUST be `null`.
-3.  **USE TOOLS FROM LIST:** If you decide to use a tool, the `action` value MUST use a tool name *exactly* from the `Available Tools` list. Mention the chosen tool name in your `thought`.
-4.  **DIRECT ANSWER:** If you can answer directly without tools (e.g., for conversation, general knowledge, creative tasks, explaining concepts, expressing AI opinions, responding to personal statements), set `action` to `null` and provide the full answer in `answer`. **DO NOT use tools for simple conversation or answering questions from internal knowledge.**
-5.  **ANSWER FROM OBSERVATION:** If you used a tool and received an Observation, use the *content* of the Observation to formulate your final `answer` in the *next* step (setting `action` to `null`). Do not just say 'The result is shown above'. Include the actual result in the `answer` field.
-6.  **ITERATIVE THINKING (No Tools):** For complex questions that don't require tools, break down your reasoning process in the `thought` field over multiple steps before providing the final `answer`. Prefer generating intermediate `thought`s first without a final `answer`. 
