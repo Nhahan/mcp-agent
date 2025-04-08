@@ -323,6 +323,76 @@ class MCPService:
         # 오류 핸들러가 종료될 때까지 기다리지 않고 백그라운드에서 실행
         asyncio.create_task(read_stderr(), name=f"{server_name}_stderr_reader")
 
+    def get_all_tools(self) -> Dict[str, Dict]:
+        """
+        모든 MCP 서버의 도구 목록을 가져옵니다.
+        
+        Returns:
+            Dict[str, Dict]: 서버 이름을 키로, 도구 정보를 값으로 가지는 딕셔너리
+        """
+        all_tools = {}
+        for server_name in self._mcp_clients.keys():
+            tools = self.get_server_tools(server_name)
+            if tools:
+                all_tools[server_name] = tools
+        return all_tools
+    
+    def get_all_tool_details(self) -> Dict[str, Dict]:
+        """
+        모든 MCP 서버의 도구 세부 정보를 가져옵니다.
+        
+        Returns:
+            Dict[str, Dict]: 서버 이름을 키로, 도구 세부 정보를 값으로 가지는 딕셔너리
+        """
+        tool_details = {}
+        for server_name in self._mcp_clients.keys():
+            tools = self.get_server_tools(server_name)
+            if tools:
+                tool_details[server_name] = {}
+                for tool_name, tool_info in tools.items():
+                    tool_details[server_name][tool_name] = {
+                        'description': tool_info.get('description', 'No description available')
+                    }
+        return tool_details
+    
+    def get_tool_details(self, server_name: str, tool_name: str) -> Dict:
+        """
+        특정 MCP 서버의 특정 도구 세부 정보를 가져옵니다.
+        
+        Args:
+            server_name: MCP 서버 이름
+            tool_name: 도구 이름
+            
+        Returns:
+            Dict: 도구 세부 정보 (설명 등을 포함)
+        """
+        tools = self.get_server_tools(server_name)
+        if not tools or tool_name not in tools:
+            logger.warning(f"Tool '{tool_name}' not found in server '{server_name}' or server not available")
+            return {'description': 'Tool not found or server not available'}
+        
+        tool_info = tools.get(tool_name, {})
+        return {
+            'description': tool_info.get('description', 'No description available'),
+            # 추가적인 도구 메타데이터가 있다면 여기에 포함
+            'parameters': tool_info.get('parameters', {}),
+            'returnType': tool_info.get('returnType', {})
+        }
+    
+    async def execute_tool(self, server_name: str, tool_name: str, arguments: Dict) -> Any:
+        """
+        MCP 서버의 도구를 실행합니다.
+        
+        Args:
+            server_name: MCP 서버 이름
+            tool_name: 실행할 도구 이름
+            arguments: 도구에 전달할 인수
+            
+        Returns:
+            Any: 도구 실행 결과
+        """
+        return await self.call_mcp_tool(server_name, tool_name, arguments)
+
 # Dependency function
 def get_mcp_service(settings: Settings = Depends(get_settings)) -> MCPService:
      raise NotImplementedError("This function should be overridden in main.py to provide the singleton MCPService instance.") 

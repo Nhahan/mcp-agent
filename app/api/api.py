@@ -9,6 +9,7 @@ from datetime import datetime
 # 서비스 임포트 - 양쪽 파일에서 공통적으로 사용
 from app.services.inference_service import InferenceService, get_inference_service
 from app.services.mcp_service import MCPService, get_mcp_service # status.py에서 가져옴
+from app.core.config import Settings, get_settings
 
 api_router = APIRouter()
 
@@ -78,10 +79,11 @@ async def get_health(
     )
 
 # --- Chat Endpoint (from api.py) --- 
-@api_router.post("/chat", response_model=ChatResponse, tags=["Chat"])
+@api_router.post("/chat", response_model=ChatResponse, tags=["Chat"], response_model_exclude_none=True)
 async def chat_endpoint(
     request: ChatRequest,
-    inference_service: InferenceService = Depends(get_inference_service)
+    inference_service: InferenceService = Depends(get_inference_service),
+    settings: Settings = Depends(get_settings) # Settings 주입
 ):
     """
     질문이나 명령을 받아 AI가 응답하는 단일 엔드포인트
@@ -94,46 +96,57 @@ async def chat_endpoint(
     
     try:
         # ReAct 패턴을 사용하여 응답 생성 (session_id 전달)
-        # process_react_pattern 호출 결과를 튜플 언패킹으로 받음
         response_str, thoughts_data, full_response_str, error_msg = await inference_service.process_react_pattern(
             initial_prompt=request.text, 
             session_id=session_id
         )
         
-        # ThoughtAction 객체로 변환 (thoughts_data 사용)
-        thoughts_and_actions = []
-        if thoughts_data: # thoughts_data가 None이 아닐 때 처리
-            for item in thoughts_data:
-                action_data = item.get("action", {})
-                # action_data가 None일 경우 빈 dict로 처리 (안전 장치)
-                if action_data is None: action_data = {}
-                elif not isinstance(action_data, dict): 
-                    action_data = {"raw": str(action_data)}
-                
-                thoughts_and_actions.append(
-                    ThoughtAction(
-                        thought=item.get("thought", ""),
-                        action=action_data,
-                        observation=item.get("observation", "")
-                    )
-                )
+        # 로그 레벨 확인
+        is_debug = settings.log_level.upper() == "DEBUG"
+        logger.debug(f"Log level check: {settings.log_level.upper()}, is_debug={is_debug}")
 
-        # 로그 위치 정보 생성 (API에서 생성한 session_id 사용, 반환값에는 log_session_id가 없음)
-        log_path = None
-        if session_id: # API에서 생성한 ID 사용
+        if is_debug:
+            # DEBUG 레벨일 경우: 상세 응답 반환
+            thoughts_and_actions = []
+            if thoughts_data:
+                for item in thoughts_data:
+                    action_data = item.get("action", {})
+                    if action_data is None: action_data = {}
+                    elif not isinstance(action_data, dict):
+                        action_data = {"raw": str(action_data)}
+                    
+                    thoughts_and_actions.append(
+                        ThoughtAction(
+                            thought=item.get("thought", ""),
+                            action=action_data,
+                            observation=item.get("observation", "")
+                        )
+                    )
+
             log_path = f"logs/react_logs/{session_id}"
-        
-        return ChatResponse(
-            response=response_str, # 튜플에서 받은 변수 사용
-            thoughts_and_actions=thoughts_and_actions,
-            full_response=full_response_str, # 튜플에서 받은 변수 사용
-            error=error_msg, # 튜플에서 받은 변수 사용
-            log_session_id=session_id, # API에서 생성한 ID 반환
-            log_path=log_path
-        )
+            
+            logger.debug(f"Returning detailed response for DEBUG level. Session ID: {session_id}")
+            return ChatResponse(
+                response=response_str,
+                thoughts_and_actions=thoughts_and_actions,
+                full_response=full_response_str,
+                error=error_msg,
+                log_session_id=session_id,
+                log_path=log_path
+            )
+        else:
+            # DEBUG 레벨이 아닐 경우: response 필드만 반환
+            logger.debug(f"Returning simplified response (response only) for non-DEBUG level. Session ID: {session_id}")
+            # ChatResponse 모델을 사용하되, 필요한 필드만 채움
+            return ChatResponse(
+                response=response_str,
+                log_session_id=session_id
+            )
+            
     except Exception as e:
         logger.error(f"Error in /chat endpoint for session_id {session_id}: {e}", exc_info=True)
         # 오류 발생 시에도 session_id를 포함하여 반환 시도
+        # 로그 레벨과 관계없이 오류 시에는 상세 정보 반환
         return ChatResponse(
             response=f"처리 중 오류가 발생했습니다: {str(e)}",
             error=str(e),
