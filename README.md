@@ -31,68 +31,38 @@ This project provides a web-based AI agent designed to be OS-agnostic. It levera
 
 ## Getting Started
 
-### Prerequisites
+### Running with Docker
 
-*   Python 3.9+
-*   `pip` (Python package installer)
-*   (Optional) Docker and Docker Compose
+Using Docker provides a consistent environment across different operating systems.
 
-### Installation
+1.  **Prepare `mcp.json`:**
+    *   Create or modify an `mcp.json` file **on your host machine** (outside the container) with the desired MCP server configurations.
 
-1.  **Clone the repository:**
+2.  **Build the Docker image:**
+    From the project root directory (where the `Dockerfile` is located), run:
     ```bash
-    git clone <repository-url>
-    cd <repository-directory>
+    docker build -t mcp-agent .
     ```
-2.  **Set up environment variables:**
-    *   Copy the example `.env.example` (if provided) to `.env`.
-    *   Update `.env` with your specific configurations, especially:
-        *   `MODEL_URL`: (Optional) URL to download the GGUF model if different from the default.
-        *   `MODEL_PATH`: (Optional) Path where the model file should be stored locally (relative to project root). Defaults to `./models/Gemma-3-4B-Fin-QA-Reasoning.Q4_K_M.gguf`.
-        *   `MCP_CONFIG_PATH`: (Optional) Path to the MCP configuration file. Defaults to `./mcp.json`.
-        *   `LOG_LEVEL`: (Optional) Desired log level (e.g., `DEBUG`, `INFO`, `WARNING`). Defaults to `INFO`.
-        *   `HUGGING_FACE_TOKEN`: (Optional) Your Hugging Face Hub token if needed for downloading private models or tokenizers.
-3.  **Install dependencies:**
+    This might take some time, especially the first time, as it downloads the base image and installs dependencies.
+
+3.  **Run the Docker container:**
     ```bash
-    pip install -r requirements.txt
+    docker run --rm -it -p 8000:8000 \
+      -v $(pwd)/mcp.json:/app/mcp.json:ro \
+      -v $(pwd)/logs:/app/logs \
+      -v model_data:/app/models \
+      mcp-agent
     ```
+    *   `--rm`: Removes the container when it stops.
+    *   `-it`: Runs in interactive mode with a pseudo-TTY.
+    *   `-p 8000:8000`: Maps port 8000 on your host to port 8000 in the container.
+    *   `-v $(pwd)/mcp.json:/app/mcp.json:ro`: Mounts your local `mcp.json` file into the container (read-only).
+    *   `-v $(pwd)/logs:/app/logs`: Mounts a local `logs` directory into the container to persist logs.
+    *   `-v model_data:/app/models`: Uses a Docker named volume (`model_data`) to store the downloaded model persistently across container runs. This prevents re-downloading the large model file every time.
+    *   `mcp-agent`: The name of the image you built.
 
-### Running the Agent
-
-1.  **Configure MCP Servers:**
-    *   Edit `mcp.json` to define the MCP servers you want the agent to use. See the example below. The agent will automatically attempt to start and connect to these servers.
-    ```json
-    {
-      "mcpServers": {
-        "iterm-mcp": {
-          "command": "npx",
-          "args": [
-            "-y",
-            "@smithery/cli@latest",
-            "run",
-            "iterm-mcp",
-            "--key",
-            "<your-iterm-mcp-key>" // Replace with your actual key if needed
-          ]
-        },
-        "sequential-thinking": {
-          "command": "npx",
-          "args": [
-            "-y",
-            "@modelcontextprotocol/server-sequential-thinking"
-          ]
-        }
-      }
-    }
-    ```
-    *   Ensure the specified commands (like `npx`) are available in your environment's PATH.
-
-2.  **Start the application:**
-    ```bash
-    python -m app.main
-    ```
-    *   The first time you run it, the agent will download the **GGUF model (approx. 4.1GB+)**, which might take some time.
-    *   The server will start, typically on `http://127.0.0.1:8000`.
+    *   The first time you run the container, it will download the model into the `model_data` volume.
+    *   The agent will be accessible at `http://localhost:8000` on your host machine.
 
 ### Using the API
 
@@ -129,21 +99,6 @@ Once the server is running, you can interact with the agent via its API endpoint
           "log_path": "logs/react_logs/174406..."
         }
         ```
-
-## Model Context Protocol (MCP)
-
-MCP standardizes communication between Large Language Models (LLMs) and external tools/data sources. This agent uses MCP to:
-
-*   Discover available tools from connected MCP servers.
-*   Invoke tools with appropriate arguments based on the LLM's reasoning (ReAct pattern).
-*   Receive observations (results) from tool executions.
-
-To add or modify capabilities, simply update the `mcp.json` file with the desired server configurations. The agent dynamically loads and interacts with these servers. Refer to [GUIDE.md](GUIDE.md) for a more detailed explanation of MCP (in Korean).
-
-## Logging
-
-*   **Application Logs:** Standard application logs are output to the console. The level can be controlled via the `LOG_LEVEL` environment variable.
-*   **ReAct Logs:** Detailed step-by-step logs for each `/chat` request (including thoughts, actions, observations, and LLM prompts/responses) are saved in the `logs/react_logs/<session_id>/` directory. This is invaluable for debugging the agent's reasoning process.
 
 ## License
 
