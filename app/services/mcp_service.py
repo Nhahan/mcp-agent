@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class MCPService:
     def __init__(self, settings: Settings = Depends(get_settings)):
         self.settings = settings
-        self.config_path = Path(settings.MCP_CONFIG_PATH)
+        self.config_path = Path(settings.mcp_config_path)
         self._mcp_processes: Dict[str, asyncio.subprocess.Process] = {}
         self._mcp_clients: Dict[str, MCPClient] = {}
         self._start_stop_lock = asyncio.Lock()
