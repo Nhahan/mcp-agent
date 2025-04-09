@@ -2,33 +2,16 @@ import logging
 import re
 import json
 import asyncio
-import time
 import os
-from typing import List, Dict, Any, Tuple, Optional, Pattern, Union
+import random
+from typing import List, Dict, Any, Tuple, Optional, Union
 from pathlib import Path
 from datetime import datetime
-from app.utils.log_utils import save_meta_log # Import path corrected
 
-# LLM inference libraries
-try:
-    from llama_cpp import Llama # Using llama-cpp-python
-except ImportError:
-    Llama = None
-    logging.error("llama-cpp-python library not found. Please install it for LLM features.")
-
-# Actual dependencies import
-from app.services.mcp_service import MCPService # MCPService import
-# from app.services.sequential_thinking import SequentialThinking # If needed
+from app.services.mcp_service import MCPService
+from app.services.model_service import ModelService, ModelError
 
 logger = logging.getLogger(__name__)
-
-# Extract JSON blocks from LLM output (assuming ```json ... ``` format)
-JSON_BLOCK_PATTERN: Pattern[str] = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
-# Add Final Answer pattern
-FINAL_ANSWER_PATTERN: Pattern[str] = re.compile(r"Final Answer:(.*)", re.DOTALL | re.IGNORECASE)
-
-MAX_REACT_ITERATIONS: int = 10 # Consider increasing iteration count
-MAX_OBSERVATION_LENGTH: int = 1500 # Maximum length for observation results
 
 class InferenceError(Exception):
     """Specific errors occurring during inference process"""
@@ -45,26 +28,29 @@ class ParsingError(InferenceError):
 class InferenceService:
     def __init__(
         self,
-        mcp_service: 'MCPService',  # Inter-dependency type hint 
-        model_path: Optional[Union[Path, str]] = None,
-        model_params: Optional[Dict[str, Any]] = None,
-        log_dir: Optional[Path] = None,
+        mcp_manager: MCPService,
+        model_path: str,
+        model_params: Dict[str, Any] = None,
     ):
-        self.mcp_service = mcp_service
-        # If a string is passed, convert it to a Path object
-        self.model_path = Path(model_path) if model_path else None
-        self.model_params = model_params or {}
-        self.model: Optional[Llama] = None
+        self.mcp_manager = mcp_manager  # MCP manager instance
+        
+        # ModelService initialization
+        self.model_service = ModelService(
+            model_path=model_path,
+            model_params=model_params
+        )
+        
+        # Model load status flag for checking
         self.model_loaded = False
-        self.log_dir = log_dir if log_dir else Path("logs")
-        # Session-specific conversation history store (use session ID as key)
-        self.conversation_histories: Dict[str, List[Dict[str, str]]] = {}
-        # Conversation history size limit (remove old messages if too long)
-        self.max_history_length = 20
-
-        if Llama is None:
-             logger.error("llama-cpp-python is not installed. LLM features will be disabled.")
-
+        
+        # Conversation management attributes
+        self.conversation_histories = {}  # Conversation history by session
+        self.max_history_length = 50  # Maximum conversation history length
+            
+        # Logging directory setting
+        self.log_dir = None
+        self._tools_schema_cache = {}  # Tool schema cache
+        
         logger.info("InferenceService initialized with MCPService")
 
         # Regular expression patterns for parsing
@@ -80,135 +66,51 @@ class InferenceService:
         if not self.log_dir.exists():
             self.log_dir.mkdir(parents=True, exist_ok=True)
 
-    async def initialize_model(self):
-        """Load the LLM model from the specified path."""
-        if self.model_loaded or Llama is None:
-            logger.info("Model already loaded or llama-cpp-python is not available.")
-            return
-
-        # Check if model_path is None or does not exist
-        if not self.model_path:
-            logger.error("Model path is not set")
-            self.model_loaded = False
-            return
-            
-        # If model_path is a string, convert it to a Path object
-        if isinstance(self.model_path, str):
-            self.model_path = Path(self.model_path)
-            
-        if not self.model_path.exists():
-            logger.error(f"Model path does not exist: {self.model_path}")
-            self.model_loaded = False
-            return
-
-        logger.info(f"Loading LLM model from: {self.model_path}")
+    async def init_model(self):
+        """Initialize the model."""
         try:
-            n_ctx = 32768  # Qwen model's maximum context size (32K)
-            n_gpu_layers = self.model_params.get("n_gpu_layers", -1) # GPU layers (-1 means as many as possible)
-            n_batch = self.model_params.get("n_batch", 512) # Batch size
-            # Check the effective level of the application's logging to determine verbose
-            verbose = logging.getLogger().getEffectiveLevel() <= logging.DEBUG
+            result = await self.model_service.load_model()
+            self.model_loaded = result
+            return result
+        except ModelError as e:
+            logger.critical(f"Model initialization failed: {e}")
+            raise InferenceError(str(e)) from e
 
-            # Load llama-cpp-python model (I/O operations, so process asynchronously)
-            self.model = await asyncio.to_thread(
-                 Llama,
-                 model_path=str(self.model_path),
-                 n_ctx=n_ctx,
-                 n_gpu_layers=n_gpu_layers,
-                 n_batch=n_batch,
-                 verbose=verbose,
-                 chat_format="qwen",
-            )
-
-            self.model_loaded = True
-            logger.info(f"LLM model loaded successfully from {self.model_path}")
-        except Exception as e:
-            logger.error(f"Failed to load LLM model: {e}", exc_info=True)
-            self.model = None
-            self.model_loaded = False
+    async def initialize_model(self):
+        """
+        init_model method wrapper.
+        External API called from main.py and other places.
+        """
+        return await self.init_model()
 
     async def generate_chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
         """Generate text using chat-style messages."""
-        if not self.model_loaded or self.model is None:
+        if not self.model_loaded:
             logger.error("LLM model is not loaded. Cannot generate text.")
             return "Error: LLM model is not available."
 
         try:
-            # Set generation parameters
-            temperature = kwargs.get("temperature", 0.2)
-            max_tokens = kwargs.get("max_tokens", 4096)  # Default to 8K (1/4 of 32K)
-            top_p = kwargs.get("top_p", 0.9)
-            top_k = kwargs.get("top_k", 40)
-            repeat_penalty = kwargs.get("repeat_penalty", 1.1)
-            
-            # Log messages (sensitive information may be present, so log only a part)
-            logger.debug(f"Generating chat completion for {len(messages)} messages")
-            if messages:
-                last_message = messages[-1].get('content', '')
-                logger.debug(f"Last message (first 100 chars): {last_message[:100]}...")
-            
-            # Use chat-style API to generate text
-            start_time = time.time()
-            
-            try:
-                completion_result = await asyncio.to_thread(
-                    self.model.create_chat_completion,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    repeat_penalty=repeat_penalty,
-                    stream=False
-                )
-                
-                end_time = time.time()
-                generation_time = end_time - start_time
-                
-                # Extract response
-                if "choices" in completion_result and completion_result["choices"]:
-                    response_text = completion_result["choices"][0]["message"]["content"]
-                    logger.debug(f"Generated text in {generation_time:.2f}s: {response_text[:512]}...")
-                    return response_text.strip()
-                else:
-                    logger.error(f"Unexpected response format from llama-cpp: {completion_result}")
-                    return "Error: Unexpected response format from LLM."
-                    
-            except ValueError as e:
-                if "exceed context window" in str(e):
-                    logger.error(f"Context window exceeded: {e}")
-                    # Handle case where context window size of 32K is also exceeded
-                    return "Final Answer: Sorry, I cannot generate a response due to the length of the conversation. Please refer to previous results."
-                raise
-                
+            return await self.model_service.generate_chat(messages, **kwargs)
         except Exception as e:
             logger.error(f"Error during chat generation: {e}", exc_info=True)
             return "Error: Could not generate chat response from LLM."
 
     async def shutdown_model(self):
-         """Release LLM resources."""
-         logger.info("Shutting down LLMInterface...") # Restore class name
-         if self.model is not None:
-             # llama-cpp-python may not have an explicit unload function
-              # Let Python GC handle it, or use del if needed
-              try:
-                  del self.model
-              except Exception as e:
-                  logger.error(f"Error trying to delete model object: {e}")
-              self.model = None
-              self.model_loaded = False
-              # Force memory cleanup (optional)
-              # import gc
-              # gc.collect()
-              # if torch.cuda.is_available():
-              #      torch.cuda.empty_cache()
-              logger.info("LLM model resources released.")
-         await asyncio.sleep(0)
+        """Release LLM resources."""
+        logger.info("Shutting down LLMInterface...")
+        try:
+            await self.model_service.shutdown()
+            self.model_loaded = False
+            logger.info("LLM model resources released successfully.")
+        except Exception as e:
+            logger.error(f"Error during model shutdown: {e}", exc_info=True)
+            
+        await asyncio.sleep(0)
 
     async def _cache_tool_schemas(self):
         """Pre-fetch and cache schema for all available tools."""
         logger.info("Caching tool schemas...")
-        all_tools = self.mcp_service.get_all_tools()
+        all_tools = self.mcp_manager.get_all_tools()
         self._tool_schemas = {}
         for server_name, tools in all_tools.items():
             for tool_info in tools:
@@ -218,8 +120,8 @@ class InferenceService:
 
     async def _format_tools_for_prompt(self) -> Dict[str, Any]:
         """Simplify and return available tool list."""
-        # Get tools directly from MCPService
-        full_tools = self.mcp_service.get_all_tools() # Full tool information
+        # Get tools directly from MCP service
+        full_tools = self.mcp_manager.get_all_tools() # Full tool information
         if not full_tools:
             logger.warning("No tools available from MCP service.")
             return {} # Return empty dictionary
@@ -241,14 +143,14 @@ class InferenceService:
     
     async def _get_tool_details(self, server_name: str, tool_name: str) -> Dict[str, Any]:
         """Return detailed information about a specific tool."""
-        full_tools = self.mcp_service.get_all_tools()
+        full_tools = self.mcp_manager.get_all_tools()
         if not full_tools or server_name not in full_tools or tool_name not in full_tools.get(server_name, {}):
             return {"error": f"Tool {server_name}.{tool_name} not found"}
         
         # Return detailed information about the tool
         return full_tools[server_name][tool_name]
 
-    def _parse_llm_action_json(self, llm_output: str, session_id: str = None) -> Optional[Dict[str, Any]]:
+    def _parse_llm_action_json(self, llm_output: str, session_id: str = None, iteration: int = None) -> Optional[Dict[str, Any]]:
         """
         Extract and parse JSON-formatted actions from LLM output.
         Handle various incorrect formats as much as possible.
@@ -256,74 +158,199 @@ class InferenceService:
         Args:
             llm_output: LLM output text
             session_id: Session ID for logging
+            iteration: Current iteration number (to handle first iteration differently)
             
         Returns:
             Parsed action dictionary or None if parsing fails
         """
         try:
-            # Extract JSON block (regular expression)
-            json_match = self.json_regex.search(llm_output)
-            if not json_match:
+            # Extract all JSON blocks (regular expression)
+            json_blocks = self.json_regex.findall(llm_output)
+            
+            if not json_blocks:
                 if session_id:
-                    logger.warning(f"[{session_id}] Could not find JSON block")
+                    logger.warning(f"[{session_id}] Could not find any JSON blocks")
                 return None
+            
+            # Error handling when multiple JSON blocks are found - only one JSON block is allowed
+            if len(json_blocks) > 1:
+                if session_id:
+                    logger.warning(f"[{session_id}] Multiple JSON blocks found ({len(json_blocks)})")
                 
-            # Try parsing JSON
-            json_str = json_match.group(1).strip()
+                # Handle first iteration specially - use the first JSON block with a warning
+                if iteration is not None and iteration == 0:
+                    first_json_str = json_blocks[0].strip()
+                    try:
+                        action_json = json.loads(first_json_str)
+                        # Add warning flag to the parsed JSON
+                        action_json["_multiple_blocks_warning"] = True
+                        logger.info(f"[{session_id}] Using first JSON block for first iteration, with warning")
+                        return action_json
+                    except json.JSONDecodeError:
+                        # If the first block can't be parsed, proceed to standard error handling
+                        pass
+                        
+                # Return an error dictionary when there are multiple blocks
+                return {
+                    "action_type": "error",
+                    "error": f"Multiple JSON blocks found ({len(json_blocks)}). Please provide exactly ONE JSON block.",
+                    "original_response": llm_output[:300] + "..." if len(llm_output) > 300 else llm_output
+                }
+            
+            # Process single JSON block
+            json_str = json_blocks[0].strip()
+            
+            # 향상된 JSON 정리 과정
+            # 1. 일반적인 이스케이프 문제 처리
+            cleaned_json_str = json_str
+            
+            if r'\$' in cleaned_json_str:
+                cleaned_json_str = cleaned_json_str.replace(r'\$', '$')
+            
+            # 2. 속성 이름이 따옴표로 둘러싸여 있지 않은 경우 수정
             try:
-                action_json = json.loads(json_str)
-            except json.JSONDecodeError as e:
-                if session_id:
-                    logger.warning(f"[{session_id}] Invalid JSON format: {e}")
-                return None
+                # 속성 이름 뒤에 콜론이 오는 패턴을 찾아 따옴표로 감싸기
+                # 예: thought: -> "thought":
+                property_regex = re.compile(r'(\n\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)')
+                cleaned_json_str = property_regex.sub(r'\1"\2"\3', cleaned_json_str)
                 
-            # Basic validation
-            if not isinstance(action_json, dict):
-                if session_id:
-                    logger.warning(f"[{session_id}] JSON is not an object: {action_json}")
-                return None
+                # JSON 문자열 처음에 있는 속성도 처리
+                start_property_regex = re.compile(r'^{\s*([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)')
+                cleaned_json_str = start_property_regex.sub(r'{ "\1"\2', cleaned_json_str)
                 
-            # Check if LLM follows the correct format and modify if necessary
-            action_type = action_json.get("action_type")
-            tool_name = action_json.get("tool_name")
-            
-            # If action_type field is missing
-            if action_type is None:
-                # If tool_name exists, set action_type to "tool_call"
-                if tool_name:
-                    action_json["action_type"] = "tool_call"
-                    if session_id:
-                        logger.warning(f"[{session_id}] Missing action_type field, setting to 'tool_call'")
-                else:
-                    # Check if direct tool name and arguments are present in action_json
-                    potential_tools = [k for k in action_json.keys() if k not in ["action_type", "tool_name", "arguments"]]
-                    if len(potential_tools) == 1 and isinstance(action_json[potential_tools[0]], dict):
-                        tool_name = potential_tools[0]
-                        arguments = action_json[tool_name]
-                        action_json = {
-                            "action_type": "tool_call",
-                            "tool_name": tool_name,
-                            "arguments": arguments
-                        }
-                        if session_id:
-                            logger.warning(f"[{session_id}] Reconstructed JSON format for: {tool_name}")
-                    else:
-                        if session_id:
-                            logger.warning(f"[{session_id}] Both action_type and tool_name are missing")
-                        return None
-            
-            # Handle case where action_type is tool name
-            elif action_type != "tool_call" and action_type != "final_answer":
-                if tool_name is None:  # tool_name is missing and action_type looks like tool name
-                    # Set tool_name as action_type and change action_type to "tool_call"
-                    tool_name = action_type
-                    action_json["tool_name"] = tool_name
-                    action_json["action_type"] = "tool_call"
+                if cleaned_json_str != json_str:
+                    logger.info(f"[{session_id}] Fixed unquoted property names in JSON")
+            except Exception as e:
+                logger.warning(f"[{session_id}] Error while fixing property names: {str(e)}")
+                # 실패해도 계속 진행
+                
+            # 3. answer 필드에서 줄바꿈 및 특수 문자 처리
+            try:
+                # 정규 표현식으로 answer 필드 찾기
+                answer_regex = re.compile(r'"answer"\s*:\s*"(.*?)(?<!\\)"(?=,|\s*})', re.DOTALL)
+                answer_match = answer_regex.search(cleaned_json_str)
+                
+                if answer_match:
+                    # answer 필드 내용 가져오기
+                    answer_content = answer_match.group(1)
                     
-                    # If arguments field is missing, treat all additional keys as arguments
-                    if "arguments" not in action_json:
-                        arguments = {k: v for k, v in action_json.items() 
-                                     if k not in ["action_type", "tool_name"]}
+                    # 개행 문자를 공백으로 변환
+                    sanitized_answer = answer_content.replace('\n', ' ').replace('\r', ' ')
+                    
+                    # 연속된 공백을 하나로 합치기
+                    sanitized_answer = re.sub(r'\s+', ' ', sanitized_answer)
+                    
+                    # JSON에서 문제가 될 수 있는 문자 이스케이프 처리
+                    sanitized_answer = sanitized_answer.replace('"', '\\"')
+                    
+                    # 정리된 answer로 교체
+                    cleaned_json_str = cleaned_json_str[:answer_match.start(1)] + sanitized_answer + cleaned_json_str[answer_match.end(1):]
+                    
+                    if sanitized_answer != answer_content:
+                        logger.info(f"[{session_id}] Sanitized answer field content for better JSON parsing")
+            except Exception as e:
+                logger.warning(f"[{session_id}] Error during answer field sanitization: {str(e)}")
+                # 실패해도 계속 진행
+            
+            try:
+                # 먼저 원본 문자열로 시도
+                try:
+                    action_json = json.loads(json_str)
+                except json.JSONDecodeError:
+                    # 원본 파싱 실패 시, 수정된 문자열로 시도
+                    try:
+                        action_json = json.loads(cleaned_json_str)
+                        if session_id:
+                            logger.info(f"[{session_id}] Successfully parsed JSON after cleaning")
+                    except json.JSONDecodeError as e:
+                        # 여전히 실패하면 마지막 시도로 따옴표가 없는 속성 이름 처리를 더 강력하게 시도
+                        # 인용부호 없는 모든 키를 찾아서 수정하는 더 강력한 접근법
+                        try:
+                            # 모든 키-값 쌍을 찾아서 키에 따옴표가 없으면 추가
+                            stronger_regex = re.compile(r'([\{\,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', re.MULTILINE)
+                            final_attempt = stronger_regex.sub(r'\1"\2":', cleaned_json_str)
+                            action_json = json.loads(final_attempt)
+                            if session_id:
+                                logger.info(f"[{session_id}] Successfully parsed JSON after aggressive property name fixing")
+                        except Exception:
+                            # 모든 시도가 실패했으면 원래 오류 다시 발생
+                            raise e
+                    
+                    # answer 필드가 지나치게 길면 잘라내기
+                    if "answer" in action_json and isinstance(action_json["answer"], str) and len(action_json["answer"]) > 1000:
+                        action_json["answer"] = action_json["answer"][:997] + "..."
+                        logger.info(f"[{session_id}] Truncated overly long answer field to 1000 characters")
+                
+                # Basic validation
+                if not isinstance(action_json, dict):
+                    if session_id:
+                        logger.warning(f"[{session_id}] JSON is not an object")
+                    return None
+                
+                # Check if LLM follows the correct format and modify if necessary
+                action_type = action_json.get("action_type")
+                tool_name = action_json.get("tool_name")
+                
+                # If action_type field is missing
+                if action_type is None:
+                    # If tool_name exists, set action_type to "tool_call"
+                    if tool_name:
+                        action_json["action_type"] = "tool_call"
+                        if session_id:
+                            logger.warning(f"[{session_id}] Missing action_type field, setting to 'tool_call'")
+                    else:
+                        # Check if direct tool name and arguments are present in action_json
+                        potential_tools = [k for k in action_json.keys() if k not in ["action_type", "tool_name", "arguments", "thought"]]
+                        if len(potential_tools) == 1 and isinstance(action_json[potential_tools[0]], dict):
+                            tool_name = potential_tools[0]
+                            arguments = action_json[tool_name]
+                            action_json = {
+                                "action_type": "tool_call",
+                                "tool_name": tool_name,
+                                "arguments": arguments
+                            }
+                            if session_id:
+                                logger.warning(f"[{session_id}] Reconstructed JSON format for: {tool_name}")
+                        else:
+                            if session_id:
+                                logger.warning(f"[{session_id}] Both action_type and tool_name are missing")
+                            return None
+                
+                # Handle case where action_type is tool name
+                elif action_type != "tool_call" and action_type != "final_answer":
+                    if tool_name is None:  # tool_name is missing and action_type looks like tool name
+                        # Set tool_name as action_type and change action_type to "tool_call"
+                        tool_name = action_type
+                        action_json["tool_name"] = tool_name
+                        action_json["action_type"] = "tool_call"
+                        
+                        # If arguments field is missing, treat all additional keys as arguments
+                        if "arguments" not in action_json:
+                            arguments = {k: v for k, v in action_json.items() 
+                                        if k not in ["action_type", "tool_name", "thought"]}
+                            action_json["arguments"] = arguments
+                            
+                            # Remove original keys
+                            for k in list(arguments.keys()):
+                                if k in action_json:
+                                    del action_json[k]
+                                    
+                        if session_id:
+                            logger.warning(f"[{session_id}] Fixed tool call format: Set '{action_type}' as tool_name")
+                
+                # Handle case where action_type is "tool_call" but tool_name is missing
+                elif action_type == "tool_call" and tool_name is None:
+                    if session_id:
+                        logger.warning(f"[{session_id}] 'tool_call' action missing tool_name")
+                    return None
+                    
+                # Handle case where arguments are not object form
+                if action_type == "tool_call" and "arguments" not in action_json:
+                    # Treat all additional keys as arguments
+                    arguments = {k: v for k, v in action_json.items() 
+                                if k not in ["action_type", "tool_name", "thought"]}
+                    
+                    if arguments:
                         action_json["arguments"] = arguments
                         
                         # Remove original keys
@@ -331,35 +358,63 @@ class InferenceService:
                             if k in action_json:
                                 del action_json[k]
                                 
-                    if session_id:
-                        logger.warning(f"[{session_id}] Fixed tool call format: Set '{action_type}' as tool_name")
-            
-            # Handle case where action_type is "tool_call" but tool_name is missing
-            elif action_type == "tool_call" and tool_name is None:
+                        if session_id:
+                            logger.warning(f"[{session_id}] Created missing arguments object")
+                    else:
+                        action_json["arguments"] = {}
+                
+                # Validate other fields specific to the action type
+                if action_type == "tool_call":
+                    # Check for tool_name
+                    if not tool_name:
+                        logger.warning(f"[{session_id}] Missing tool_name in tool_call")
+                        action_json["tool_name"] = ""
+                        
+                    # Ensure arguments exists and is an object
+                    if "arguments" not in action_json or not isinstance(action_json["arguments"], dict):
+                        logger.warning(f"[{session_id}] Missing or invalid arguments in tool_call")
+                        action_json["arguments"] = {}
+                
+                return action_json
+                
+            except json.JSONDecodeError as e:
                 if session_id:
-                    logger.warning(f"[{session_id}] 'tool_call' action missing tool_name")
-                return None
-                
-            # Handle case where arguments are not object form
-            if action_type == "tool_call" and "arguments" not in action_json:
-                # Treat all additional keys as arguments
-                arguments = {k: v for k, v in action_json.items() 
-                             if k not in ["action_type", "tool_name"]}
-                
-                if arguments:
-                    action_json["arguments"] = arguments
+                    error_detail = str(e)
+                    # 구체적인 오류 메시지 기록
+                    logger.warning(f"[{session_id}] Invalid JSON format: {error_detail}")
                     
-                    # Remove original keys
-                    for k in list(arguments.keys()):
-                        if k in action_json:
-                            del action_json[k]
-                            
-                    if session_id:
-                        logger.warning(f"[{session_id}] Created missing arguments object")
-                else:
-                    action_json["arguments"] = {}
-            
-            return action_json
+                    # 문제가 될 수 있는 이스케이프 문자 파악
+                    problematic_chars = []
+                    if r'\$' in json_str:
+                        problematic_chars.append(r'\$')
+                    if r'\'' in json_str or r'\"' in json_str:
+                        problematic_chars.append("escaped quotes")
+                    if '\n' in json_str:
+                        problematic_chars.append("newlines")
+                    
+                    # 오류의 위치 파악
+                    error_pos = getattr(e, 'pos', -1)
+                    
+                    error_location = ""
+                    if error_pos >= 0:
+                        context_start = max(0, error_pos - 20)
+                        context_end = min(len(json_str), error_pos + 20)
+                        error_context = json_str[context_start:context_end]
+                        error_location = f"Error context: '...{error_context}...'"
+                        
+                    error_info = {
+                        "action_type": "error",
+                        "error": f"JSON parsing error: {error_detail}",
+                        "details": {
+                            "problematic_chars": problematic_chars,
+                            "error_location": error_location,
+                            "hint": "Keep answers short and simple. Avoid newlines, special characters, and quotation marks inside JSON values."
+                        },
+                        "original_response": json_str
+                    }
+                    
+                    return error_info
+                return None
             
         except Exception as e:
             if session_id:
@@ -375,30 +430,58 @@ class InferenceService:
                 error_message = error_message.split(":", 1)[1].strip()
             
             return (
-                "ERROR: Tool execution failed. Please analyze this error and try a different approach.\n"
-                f"Error details: {error_message}\n\n"
-                "To proceed, you should:\n"
-                "1. CAREFULLY review the error message above\n"
-                "2. Consider an alternative tool or different parameters\n"
-                "3. If the tool doesn't exist or parameters are incorrect, check your available tools list\n"
-                "4. Provide a new Thought that acknowledges this error and explains your new approach"
+                "The tool execution resulted in an exception.\n"
+                f"Details: {error_message}\n\n"
+                "Analyze this message to determine what went wrong and how to proceed."
             )
 
         if isinstance(result, dict):
             # Prettify JSON for better readability
             try:
-                return f"Tool successfully executed. Result:\n```json\n{json.dumps(result, indent=2, ensure_ascii=False)}\n```\n\nAnalyze this result carefully for your next step."
+                # Format the result as JSON string
+                json_str = json.dumps(result, indent=2, ensure_ascii=False)
+                
+                # Return the result without making assumptions about success/failure
+                return f"Tool execution completed. Result:\n```json\n{json_str}\n```\n\nAnalyze this result carefully to determine your next step."
             except Exception as e:
-                return f"Tool successfully executed but result couldn't be formatted as JSON. Raw result: {str(result)}"
+                return f"Tool execution completed but result couldn't be formatted as JSON. Raw result: {str(result)}"
         
         if isinstance(result, str):
-            # Format output based on length
-            if len(result) > 2000:
-                truncated_result = result[:2000] + "...[TRUNCATED due to length]"
-                return f"Tool successfully executed. Result (truncated):\n{truncated_result}\n\nAnalyze this result carefully for your next step."
-            return f"Tool successfully executed. Result:\n{result}\n\nAnalyze this result carefully for your next step."
-        
-        return f"Tool successfully executed. Result: {str(result)}\n\nAnalyze this result for your next step."
+            # 파일 내용이나 코드 같은 텍스트는 코드 블록 안에 표시
+            # 파일 내용 패턴 감지 (일반적인 파일 내용은 여러 줄 텍스트이거나 특정 패턴을 가짐)
+            is_file_content = '\n' in result or result.strip().startswith('<!DOCTYPE') or result.strip().startswith('<?xml')
+            
+            # 코드로 보이는 패턴 감지
+            is_code = any(pattern in result for pattern in ['function', 'class', 'def ', 'import ', '<html', '<?php', '// ', '/* ', '#include'])
+            
+            # 파일 내용이나 코드로 판단되면 코드 블록으로 표시
+            if is_file_content or is_code:
+                # 코드 언어 추측
+                lang = ""
+                if result.strip().startswith('<!DOCTYPE') or '<html' in result:
+                    lang = "html"
+                elif result.strip().startswith('<?xml'):
+                    lang = "xml"
+                elif any(pattern in result for pattern in ['function', 'const ', 'var ', '// ']):
+                    lang = "javascript"
+                elif any(pattern in result for pattern in ['def ', 'import ', '# ']):
+                    lang = "python"
+                elif any(pattern in result for pattern in ['<?php']):
+                    lang = "php"
+                elif any(pattern in result for pattern in ['#include', 'int main']):
+                    lang = "cpp"
+                
+                # Format output based on length
+                if len(result) > 2000:
+                    truncated_result = result[:2000] + "...[TRUNCATED due to length]"
+                    return f"Tool execution completed. Result (truncated):\n```{lang}\n{truncated_result}\n```\n\nAnalyze this result carefully for your next step."
+                return f"Tool execution completed. Result:\n```{lang}\n{result}\n```\n\nAnalyze this result carefully for your next step."
+            else:
+                # 일반 텍스트는 기존 방식대로 처리
+                if len(result) > 2000:
+                    truncated_result = result[:2000] + "...[TRUNCATED due to length]"
+                    return f"Tool execution completed. Result (truncated):\n{truncated_result}\n\nAnalyze this result carefully for your next step."
+                return f"Tool execution completed. Result:\n{result}\n\nAnalyze this result carefully for your next step."
 
     # Conversation history management methods
     def get_conversation_history(self, session_id: str) -> List[Dict[str, str]]:
@@ -407,50 +490,24 @@ class InferenceService:
             # Initialize new conversation history (include system message)
             self.conversation_histories[session_id] = [
                 {"role": "system", "content": (
-                    "You are an AI assistant that follows the ReAct pattern to solve tasks step by step. "
-                    "Your role is to act as an intelligent agent that carefully maintains context across multiple interactions. "
-                    "Follow these steps exactly:\n\n"
-                    "1. **Thought:** Analyze the query, available tools, and PREVIOUS OBSERVATIONS. Plan your approach concisely.\n"
-                    "2. **Action:** Choose ONE of the following formats:\n"
-                    "   - Tool Call: If a tool would help, output a properly formatted JSON block:\n"
-                    "     ```json\n"
-                    '     {"action_type": "tool_call", "tool_name": "server-name.tool-name", "arguments": {"param1": "value1", "param2": "value2"}}\n'
-                    "     ```\n"
-                    "   - Final Answer: If you know the answer or no tool is needed:\n"
-                    "     ```json\n"
-                    '     {"action_type": "final_answer", "answer": "Your final answer to the user question"}\n'
-                    "     ```\n"
-                    "3. When shown an Observation, LEARN from it and adapt your next Thought accordingly.\n\n"
-                    "Available tools:\n{tools_section}\n\n"
-                    "IMPORTANT RULES:\n"
-                    "- MAINTAIN CONTEXT: Each response should build on previous observations and thoughts\n"
-                    "- LEARN FROM FAILURES: If a previous approach failed, try something different\n"
-                    "- NEVER provide more than one action per response\n"
-                    "- ALWAYS use exact format: Thought: [reasoning], then either JSON block or Final Answer: [answer]\n"
-                    "- NEVER skip providing a Thought before your Action\n"
-                    "- ALWAYS output complete JSON blocks between ```json and ``` tags\n"
-                    "- DO NOT repeat the same text multiple times in your response\n\n"
-                    "TOOL FORMAT REQUIREMENTS:\n"
-                    '- ALWAYS use "action_type": "tool_call" for tool calls\n'
-                    '- ALWAYS include "tool_name" with the full server and tool name (example: "server-name.tool-name")\n'
-                    '- ALWAYS put parameters inside the "arguments" object, not at the root level\n\n'
-                    "CORRECT EXAMPLES:\n"
-                    "```json\n"
-                    '{"action_type": "tool_call", "tool_name": "server-name.tool-name", "arguments": {"path": "/example/path"}}\n'
-                    "```\n\n"
-                    "```json\n"
-                    '{"action_type": "tool_call", "tool_name": "another-server.execute-command", "arguments": {"command": "ls -la", "timeout_ms": 5000}}\n'
-                    "```\n\n"
-                    "```json\n"
-                    '{"action_type": "final_answer", "answer": "Based on my investigation using the tools, I found that..."}\n'
-                    "```\n\n"
-                    "INCORRECT EXAMPLES (DO NOT USE THESE FORMATS):\n"
-                    "```json\n"
-                    '{"action_type": "sample-tool", "path": "/example/path"}\n'
-                    "```\n\n"
-                    "```json\n"
-                    '{"tool_name": "server-name.tool-name", "arguments": {"path": "/example/path"}}\n'
-                    "```"
+                    "You are a highly intelligent AI assistant with the ability to think step-by-step. Before giving your final answer, carefully analyze the question, break it down into logical steps, and consider multiple perspectives. Then, present your final, concise answer. by answering questions and using tools."
+                    "\n\nFORMATS - Always use exactly ONE of these:"
+                    "\n\n1. Tool Call (when you need a tool):"
+                    "\n```json"
+                    '\n{\n  "action_type": "tool_call",\n  "thought": "Why I need this tool",\n  "tool_name": "tool-name-with-server-prefix",\n  "arguments": { "param1": "value1" }\n}'
+                    "\n```"
+                    "\n\n2. Final Answer (only when task is complete):"
+                    "\n```json"
+                    '\n{\n  "action_type": "final_answer",\n  "thought": "My reasoning based on all information",\n  "answer": "Complete answer to user\'s question"\n}'
+                    "\n```"
+                    "\n\nCRITICAL RULES:"
+                    "\n• ONE JSON BLOCK PER RESPONSE - never multiple blocks"
+                    "\n• ONE STEP AT A TIME - wait for each tool result before proceeding"
+                    "\n• NEVER assume previous steps were completed without confirmation"
+                    "\n• NEVER skip steps or provide final answer until all necessary tools are used"
+                    "\n• AVOID SPECIAL CHARACTERS in JSON values - no shell commands like $(date), no backslashes"
+                    "\n• AVOID USING QUOTES WITHIN VALUES - use simple text for arguments"
+                    "\n• USE BASIC TOOLS for file operations instead of executing shell commands"
                 )}
             ]
         return self.conversation_histories[session_id]
@@ -470,70 +527,20 @@ class InferenceService:
         # Update saved history
         self.conversation_histories[session_id] = history
 
-    def update_system_message(self, session_id: str, tools_section: str) -> None:
-        """Update the system message with tool information for the session."""
-        history = self.get_conversation_history(session_id)
-        
-        # Update system message (include tool information)
-        system_content = (
-            "You are an AI assistant that follows the ReAct pattern to solve tasks step by step. "
-            "Your role is to act as an intelligent agent that carefully maintains context across multiple interactions. "
-            "Follow these steps exactly:\n\n"
-            "1. **Thought:** Analyze the query, available tools, and PREVIOUS OBSERVATIONS. Plan your approach concisely.\n"
-            "2. **Action:** Choose ONE of the following formats:\n"
-            "   - Tool Call: If a tool would help, output a properly formatted JSON block:\n"
-            "     ```json\n"
-            '     {"action_type": "tool_call", "tool_name": "server-name.tool-name", "arguments": {"param1": "value1", "param2": "value2"}}\n'
-            "     ```\n"
-            "   - Final Answer: If you know the answer or no tool is needed:\n"
-            "     ```json\n"
-            '     {"action_type": "final_answer", "answer": "Your final answer to the user question"}\n'
-            "     ```\n"
-            "3. When shown an Observation, LEARN from it and adapt your next Thought accordingly.\n\n"
-            f"Available tools:\n{tools_section}\n\n"
-            "IMPORTANT RULES:\n"
-            "- MAINTAIN CONTEXT: Each response should build on previous observations and thoughts\n"
-            "- LEARN FROM FAILURES: If a previous approach failed, try something different\n"
-            "- NEVER provide more than one action per response\n"
-            "- ALWAYS use exact format: Thought: [reasoning], then either JSON block or Final Answer: [answer]\n"
-            "- NEVER skip providing a Thought before your Action\n"
-            "- ALWAYS output complete JSON blocks between ```json and ``` tags\n"
-            "- DO NOT repeat the same text multiple times in your response\n\n"
-            "TOOL FORMAT REQUIREMENTS:\n"
-            '- ALWAYS use "action_type": "tool_call" for tool calls\n'
-            '- ALWAYS include "tool_name" with the full server and tool name (example: "server-name.tool-name")\n'
-            '- ALWAYS put parameters inside the "arguments" object, not at the root level\n\n'
-            "CORRECT EXAMPLES:\n"
-            "```json\n"
-            '{"action_type": "tool_call", "tool_name": "server-name.tool-name", "arguments": {"path": "/example/path"}}\n'
-            "```\n\n"
-            "```json\n"
-            '{"action_type": "tool_call", "tool_name": "another-server.execute-command", "arguments": {"command": "ls -la", "timeout_ms": 5000}}\n'
-            "```\n\n"
-            "```json\n"
-            '{"action_type": "final_answer", "answer": "Based on my investigation using the tools, I found that..."}\n'
-            "```\n\n"
-            "INCORRECT EXAMPLES (DO NOT USE THESE FORMATS):\n"
-            "```json\n"
-            '{"action_type": "sample-tool", "path": "/example/path"}\n'
-            "```\n\n"
-            "```json\n"
-            '{"tool_name": "server-name.tool-name", "arguments": {"path": "/example/path"}}\n'
-            "```"
-        )
-        
-        # Check if the first message is system message and update
-        if history and history[0]["role"] == "system":
-            history[0]["content"] = system_content
-        else:
-            # If system message does not exist, add new
-            history.insert(0, {"role": "system", "content": system_content})
+    def update_system_message(self, role_intro=None, language=None, errors=None):
+        """Update system message with optional role intro and errors."""
+        if role_intro is None:
+            role_intro = "You are an AI assistant that helps with any task. You answer questions and use tools to complete tasks."
+            if language != "ko":
+                role_intro = "You are an AI assistant that helps with any task. You answer questions and use tools to complete tasks."
+                
+        # ... existing code ...
 
     async def process_react_pattern(
         self,
         initial_prompt: str,
         session_id: str,
-        max_iterations: int = 3,
+        max_iterations: int = 10,
         log_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -548,7 +555,7 @@ class InferenceService:
         Returns:
             A dictionary containing the final response and metadata.
         """
-        if not self.model_loaded or self.model is None:
+        if not self.model_loaded:
             await self.initialize_model()
             
         # Setup logging directory - 단일 세션 ID로 통합
@@ -585,10 +592,7 @@ class InferenceService:
         }
         
         # Get available tools and format them for the prompt
-        mcp_tools = self.mcp_service.get_all_tools()
-        
-        # Log available tools for debugging
-        logger.info(f"[ReAct] Available MCP tools: {json.dumps(mcp_tools, indent=2, ensure_ascii=False)}")
+        mcp_tools = self.mcp_manager.get_all_tools()
         
         # Generate a formatted tools section for the prompt
         tools_section = "Available Tools:\n"
@@ -606,42 +610,71 @@ class InferenceService:
         logger.info(f"[ReAct] Simplified tools section for prompt: \n{tools_section}")
         
         # Initialize ReAct format with tools section
-        system_message = f"""You are an AI assistant that helps users by answering questions and using tools when necessary.
+        system_message = f"""You are an AI assistant that helps users by answering questions and using tools.
 
-When responding, ALWAYS use one of these TWO formats:
+FORMATS - Always use exactly ONE of these:
 
-1. When you need to use a tool:
+1. Tool Call (when you need a tool):
 ```json
 {{
   "action_type": "tool_call",
-  "thought": "Here I analyze the query and explain why I need to use a tool",
-  "tool_name": "server-name.tool-name",
-  "arguments": {{
-    "param1": "value1",
-    "param2": "value2"
-  }}
+  "thought": "Your detailed step-by-step reasoning including ALL your analysis and plans",
+  "tool_name": "server-name.tool-name", 
+  "arguments": {{ "param1": "value1" }}
 }}
 ```
 
-2. When you can answer directly:
+2. Final Answer (only when task is complete):
 ```json
 {{
   "action_type": "final_answer",
-  "thought": "Here I analyze the query and explain why I can answer directly",
-  "answer": "My answer to the user's question"
+  "thought": "Your detailed reasoning including what you tried and what you learned",
+  "answer": "Complete answer to user's question"
 }}
 ```
 
-Important rules:
-1. Always include a detailed "thought" field explaining your reasoning
-2. Remember and use information from previous observations
-3. Never use tools or parameters that don't exist
-4. If a tool fails, analyze the error and try a different approach
-5. Respond in the same language the user initially used
+CRITICAL RULES:
+• ONLY ONE JSON BLOCK IN YOUR ENTIRE RESPONSE - If you have multiple thoughts or plans, put them all in the single "thought" field
+• NEVER USE PHRASES LIKE "I'll try this tool", "Let me try", "Next, I'll try" - Just put ALL reasoning in the "thought" field and call ONE tool
+• DO NOT WRITE MULTIPLE TOOL CALLS OR ALTERNATIVE APPROACHES - Choose the best approach and implement it in ONE JSON block
+• WAIT for each tool result before proceeding - do not assume the result
+• Use tools with correct parameters - check the required parameters carefully
+• CAREFULLY ANALYZE TOOL RESULTS in context - words like "error" or "failed" might appear in successful results too
+• If you keep getting the same error with a tool, CHANGE YOUR APPROACH instead of repeating the same thing
+• PAY ATTENTION TO ERROR MESSAGES - they often tell you exactly what's wrong with your parameters
+
+CRITICAL JSON FORMATTING RULES:
+• STRICT JSON FORMAT IS REQUIRED - Your entire response MUST be valid parseable JSON
+• ALL PROPERTY NAMES MUST BE IN DOUBLE QUOTES - e.g., "property": not property:
+• NEVER use single quotes for property names - only double quotes allowed for keys
+• ALWAYS use double quotes around ALL keys in the JSON, including "thought" and "answer"
+• Keep your "answer" field SHORT and CONCISE - Maximum 500 characters recommended
+• AVOID numbered lists (1., 2., 3.) in JSON values - use commas or bullet points instead
+• DO NOT use NEWLINES (\\n) in the "answer" field - provide a continuous paragraph
+• AVOID special characters in JSON - no quotes within quotes, no backslashes
+• ESCAPE any necessary quotes in values with a backslash: \\"
+• For long responses, put brief conclusion in "answer" field and details in "thought" field
+• If you need to provide a structured response, use simple markdown without complex formatting
+
+TOOL RESULT ANALYSIS:
+• READ THE ENTIRE RESULT carefully before determining if it indicates success or failure
+• CONSIDER THE CONTEXT - words like "error" or "invalid" might be part of normal content
+• Words like "error", "invalid", or "failed" don't always indicate actual errors - check the full context
+• Look for specific error patterns like "isError: true" or clear error messages from the tool
+• Use your judgment to determine the next steps based on the complete response
+• If the same tool fails 3 times in a row, TRY A COMPLETELY DIFFERENT APPROACH
+
+PARAMETER VALIDATION:
+• Always check if you're using the correct parameter NAMES for the tool you're calling
+• Make sure all REQUIRED parameters are provided
+• Use appropriate VALUE TYPES for each parameter (string, number, boolean)
+• For file paths, ensure the directory exists before writing files
+• WHEN A TOOL REPORTS MISSING PARAMETERS, carefully read the error to identify which ones to add
 
 {tools_section}
 
-When using tools, always use the server-name.tool-name format and include all parameters in the arguments object."""
+Always use server prefix for tool names (e.g., "server-name.tool-name")
+Carefully analyze tool results in context to determine your next steps."""
         
         # Initialize or update the conversation history for ReAct
         if session_id in self.conversation_histories:
@@ -686,9 +719,16 @@ When using tools, always use the server-name.tool-name format and include all pa
                 "error": None,
             }
             
+            # 연속 같은 도구 사용 실패 감지
+            repeated_tool_failures = {}
+            if 'repeated_tool_failures' in metadata:
+                repeated_tool_failures = metadata['repeated_tool_failures']
+            else:
+                metadata['repeated_tool_failures'] = repeated_tool_failures
+            
             # Generate chat response
             try:
-                llm_response = await self.generate_chat(conversation_history)
+                llm_response = await self.model_service.generate_chat(conversation_history)
                 logger.info(f"[ReAct] Iteration {iteration+1} LLM Response: {llm_response}")
                 iteration_data["response"] = llm_response
             except Exception as e:
@@ -697,10 +737,8 @@ When using tools, always use the server-name.tool-name format and include all pa
                 iteration_data["error"] = error_msg
                 metadata["iterations"].append(iteration_data)
                 
-                # meta.json에 현재 상태 저장
-                meta_data.append(metadata)
-                with open(meta_log_path, "w", encoding="utf-8") as f:
-                    json.dump(meta_data, f, indent=2, ensure_ascii=False)
+                # Save current state to meta.json
+                self._save_metadata_to_log(meta_data, metadata, meta_log_path)
                 
                 return {
                     "response": "I'm sorry, AI couldn't generate a response. Please try again later.",
@@ -716,25 +754,46 @@ When using tools, always use the server-name.tool-name format and include all pa
             # Parse the LLM's response to identify the action
             action = None
             try:
-                action = self._parse_llm_action_json(llm_response, session_id)
+                action = self._parse_llm_action_json(llm_response, session_id, iteration)
                 if not action:
                     # If we failed to parse action, create error message about format
                     raise ParsingError("JSON format is incorrect. Please provide a valid JSON.")
                     
                 iteration_data["action"] = action
                 logger.info(f"[ReAct] Parsed action: {action}")
+                
+                # Check if this is the first iteration with multiple JSON blocks warning
+                if "_multiple_blocks_warning" in action and iteration == 0:
+                    # Remove the warning flag before proceeding
+                    del action["_multiple_blocks_warning"]
+                    
+                    # Add warning message to the conversation
+                    warning_message = (
+                        "WARNING: I noticed you provided multiple JSON blocks in your response. "
+                        "It's good to plan ahead, but you can only execute ONE action at a time. "
+                        "For this time, I'll use just the first JSON block you provided. "
+                        "Going forward, please include EXACTLY ONE JSON block per response.\n\n"
+                        "Remember to put all your thoughts and reasoning inside the 'thought' field of a single JSON block."
+                    )
+                    conversation_history.append({"role": "user", "content": warning_message})
+                    logger.info(f"[ReAct] Added multiple blocks warning for first iteration")
             except Exception as e:
                 error_msg = f"Failed to parse action: {str(e)}"
                 logger.error(error_msg)
                 
                 # Add error message to the history to guide model
                 error_feedback = (
-                    f"ERROR: {str(e)}\n\n"
-                    f"I couldn't parse your response correctly. Please respond ONLY in the format specified:\n\n"
-                    f"For tool calls:\n```json\n{{\"action_type\": \"tool_call\", \"tool_name\": \"server-name.tool-name\", \"arguments\": {{...}}}}\n```\n\n"
-                    f"For final answers:\n```json\n{{\"action_type\": \"final_answer\", \"answer\": \"...\"}}\n```\n\n"
-                    f"Previous response: {llm_response}\n\n"
-                    f"Please try again with the correct format."
+                    f"ERROR: {error_msg}\n\n"
+                    f"I noticed you provided multiple JSON blocks or invalid JSON format. Please remember:\n\n"
+                    f"1. Your ENTIRE response should contain EXACTLY ONE JSON block\n"
+                    f"2. Put ALL your reasoning in the 'thought' field - do not write separate thoughts outside the JSON\n"
+                    f"3. Choose ONE tool to use - do not suggest multiple alternatives\n\n"
+                    f"Example of correct format:\n```json\n"
+                    f'{{"action_type": "tool_call", "thought": "I need to do X because of Y. First I\'ll try this approach. If that fails, I might need to try another approach later.", "tool_name": "server-name.tool-name", "arguments": {{"param1": "value1"}} }}\n'
+                    f"```\n\n"
+                    f"OR\n\n```json\n"
+                    f'{{"action_type": "final_answer", "thought": "Based on all the steps I\'ve taken and the results I\'ve seen, I\'ve determined that...", "answer": "The answer to your question is..."}}\n'
+                    f"```"
                 )
                 
                 conversation_history.append({"role": "user", "content": error_feedback})
@@ -742,10 +801,8 @@ When using tools, always use the server-name.tool-name format and include all pa
                 metadata["iterations"].append(iteration_data)
                 error_count += 1
                 
-                # 중간 상태 저장
-                meta_data.append(metadata)
-                with open(meta_log_path, "w", encoding="utf-8") as f:
-                    json.dump(meta_data, f, indent=2, ensure_ascii=False)
+                # Save current state to meta.json
+                self._save_metadata_to_log(meta_data, metadata, meta_log_path)
                 
                 # Skip to next iteration
                 continue
@@ -765,6 +822,72 @@ When using tools, always use the server-name.tool-name format and include all pa
                     server_name = parts[0]
                     actual_tool_name = parts[1]
                     
+                    # 도구 실행 전에 도구의 정확한 파라미터 정보를 가져와 제공
+                    tool_details = self._get_detailed_tool_info(server_name, actual_tool_name)
+                    tool_schema = await self._get_tool_schema(server_name, actual_tool_name)
+                    
+                    # 해당 도구의 연속 실패 횟수 확인
+                    tool_key = f"{server_name}.{actual_tool_name}"
+                    if tool_key in repeated_tool_failures:
+                        repeated_tool_failures[tool_key] += 1
+                    else:
+                        repeated_tool_failures[tool_key] = 1
+                    
+                    # 연속 실패가 3회 이상인 경우 AI에게 다른 접근 방식 제안
+                    if repeated_tool_failures.get(tool_key, 0) >= 3:
+                        logger.warning(f"[ReAct] Tool '{tool_key}' has failed repeatedly ({repeated_tool_failures[tool_key]} times)")
+                        reset_message = (
+                            f"I notice you've tried using '{tool_key}' multiple times with the same parameters, but it's not working.\n\n"
+                            f"Required parameters for this tool: {self._format_required_params(tool_schema)}\n\n"
+                            f"Current parameters you're using: {json.dumps(arguments, indent=2)}\n\n"
+                            f"Consider one of these approaches:\n"
+                            f"1. Try a completely different tool\n"
+                            f"2. Provide a final answer based on what you know so far\n"
+                            f"3. Use the correct parameter names as shown above\n\n"
+                            f"If you continue using this tool, please make significant changes to your approach."
+                        )
+                        conversation_history.append({"role": "user", "content": reset_message})
+                        iteration_data["error"] = f"Repeated tool failure: {tool_key}"
+                        metadata["iterations"].append(iteration_data)
+                        
+                        # 실패 카운터 리셋
+                        repeated_tool_failures[tool_key] = 0
+                        
+                        # Save current state to meta.json
+                        self._save_metadata_to_log(meta_data, metadata, meta_log_path)
+                        continue
+                    
+                    if tool_schema:
+                        # 파라미터 불일치 감지 및 자동 수정
+                        fixed_arguments = arguments.copy()  # 원본 인수 복사만 하고 수정 없이 사용
+                        
+                        # 파라미터가 수정되었다면 AI에게 알림
+                        if fixed_arguments != arguments:
+                            param_diff = []
+                            for k in set(list(arguments.keys()) + list(fixed_arguments.keys())):
+                                if k not in arguments:
+                                    param_diff.append(f"Added '{k}'")
+                                elif k not in fixed_arguments:
+                                    param_diff.append(f"Removed '{k}'")
+                                elif arguments[k] != fixed_arguments[k]:
+                                    param_diff.append(f"Changed '{k}'")
+                            
+                            param_changes = ", ".join(param_diff)
+                            logger.info(f"[ReAct] Fixed tool arguments: {param_changes}")
+                            
+                            # 변경 내용을 AI에게 알림
+                            info_message = (
+                                f"NOTE: I've adjusted the parameters for '{server_name}.{actual_tool_name}' based on its schema.\n"
+                                f"Changes: {param_changes}\n\n"
+                                f"Required parameters for this tool: {self._format_required_params(tool_schema)}\n\n"
+                                f"Proceeding with corrected parameters."
+                            )
+                            conversation_history.append({"role": "user", "content": info_message})
+                            arguments = fixed_arguments
+                    
+                    # Validate and fix tool arguments
+                    is_valid, validation_message, fixed_arguments = await self._validate_tool_arguments(server_name, actual_tool_name, arguments)
+                    
                     # Check for same tool repeated with error
                     if f"{server_name}.{actual_tool_name}" == last_tool_name and last_error is not None:
                         consecutive_same_tool_error += 1
@@ -773,17 +896,15 @@ When using tools, always use the server-name.tool-name format and include all pa
                         last_tool_name = f"{server_name}.{actual_tool_name}"
                 else:
                     error_feedback = (
-                        f"ERROR: Invalid tool name format: {tool_name}. Must be in format 'server-name.tool-name'\n\n"
+                        f"ERROR: Invalid tool name format: {tool_name}. Must include server name.\n\n"
                         f"Please use the correct format for tool calls with server name included."
                     )
                     conversation_history.append({"role": "user", "content": error_feedback})
                     iteration_data["error"] = "Invalid tool name format"
                     metadata["iterations"].append(iteration_data)
                     
-                    # 중간 상태 저장
-                    meta_data.append(metadata)
-                    with open(meta_log_path, "w", encoding="utf-8") as f:
-                        json.dump(meta_data, f, indent=2, ensure_ascii=False)
+                    # Save current state to meta.json
+                    self._save_metadata_to_log(meta_data, metadata, meta_log_path)
                     
                     continue
                 
@@ -798,10 +919,8 @@ When using tools, always use the server-name.tool-name format and include all pa
                     iteration_data["error"] = error_feedback
                     metadata["iterations"].append(iteration_data)
                     
-                    # 중간 상태 저장
-                    meta_data.append(metadata)
-                    with open(meta_log_path, "w", encoding="utf-8") as f:
-                        json.dump(meta_data, f, indent=2, ensure_ascii=False)
+                    # Save current state to meta.json
+                    self._save_metadata_to_log(meta_data, metadata, meta_log_path)
                     
                     # Reset counter and skip to next iteration
                     consecutive_same_tool_error = 0
@@ -815,27 +934,33 @@ When using tools, always use the server-name.tool-name format and include all pa
                     
                     # Get detailed tool information first to help the model understand how to use it
                     tool_details = self._get_detailed_tool_info(server_name, actual_tool_name)
-                    tool_details_message = f"Detailed information about this tool before execution:\n\n{tool_details}"
+                    tool_details_message = (
+                        f"Before executing tool '{server_name}.{actual_tool_name}', here's important information about it:\n\n"
+                        f"{tool_details}\n\n"
+                        f"Required parameters: {self._format_required_params(tool_schema)}"
+                    )
                     conversation_history.append({"role": "user", "content": tool_details_message})
                     
                     # Execute tool via MCP service
-                    tool_result = await self.mcp_service.execute_tool(server_name, actual_tool_name, arguments)
+                    tool_result = await self.mcp_manager.execute_tool(server_name, actual_tool_name, arguments)
                     observation = self._format_observation(tool_result)
-                    last_error = None  # Reset error state on success
+                    
+                    # 도구 성공 시 연속 실패 카운터 리셋
+                    if tool_key in repeated_tool_failures:
+                        repeated_tool_failures[tool_key] = 0
                     
                     logger.info(f"[ReAct] Tool execution result: {observation[:200]}...")
                 except Exception as e:
                     logger.error(f"[ReAct] Tool execution error: {str(e)}")
                     observation = self._format_observation(e)
-                    last_error = str(e)
                     error_count += 1
                 
                 # Add observation to conversation history
                 if observation:
                     observation_message = (
-                        f"Observation from tool call {server_name}.{actual_tool_name}:\n"
+                        f"Result from tool call {server_name}.{actual_tool_name}:\n"
                         f"{observation}\n\n"
-                        "Based on this observation, continue your reasoning and decide on the next action."
+                        "Carefully analyze this complete result to determine if the tool executed successfully and what information you can extract from it."
                     )
                     conversation_history.append({"role": "user", "content": observation_message})
                     iteration_data["observation"] = observation
@@ -844,53 +969,63 @@ When using tools, always use the server-name.tool-name format and include all pa
                 final_answer = action.get("answer", "")
                 thought = action.get("thought", "")
                 
-                # Check if the answer or thought mentions using a tool but didn't actually call it
-                tool_references = []
-                for server_name, tools in mcp_tools.items():
-                    for tool_name in tools.keys():
-                        # Look for tool mentions in thought or answer
-                        if (isinstance(thought, str) and tool_name.lower() in thought.lower()) or \
-                           (isinstance(final_answer, str) and tool_name.lower() in final_answer.lower()):
-                            tool_references.append(f"{server_name}.{tool_name}")
+                # Add debug logging
+                logger.info(f"[ReAct] Final answer detected: {final_answer[:100]}...")
                 
-                # If the AI referenced tools without using them properly, provide feedback
-                if tool_references and not isinstance(final_answer, dict):
-                    error_feedback = (
-                        f"It seems you mentioned using the following tools: {', '.join(tool_references)}, "
-                        f"but you provided a final answer without using them. "
-                        f"If you need to use a tool, please use the 'tool_call' action format instead of 'final_answer'."
-                    )
-                    conversation_history.append({"role": "user", "content": error_feedback})
-                    iteration_data["error"] = "Tool mentioned but not used properly"
-                    metadata["iterations"].append(iteration_data)
-                    continue
-                    
-                # Check if the final answer contains a data structure that should have come from a tool call
-                if isinstance(final_answer, dict) and len(final_answer) > 0:
-                    # This looks like structured data that should have come from a tool
-                    # Check if any tool was actually called in this session
-                    tool_was_used = False
-                    for iter_data in metadata["iterations"]:
-                        if iter_data.get("observation") is not None:
-                            tool_was_used = True
-                            break
-                    
-                    if not tool_was_used:
-                        logger.warning("[ReAct] Detected potential hallucinated data in final answer without tool usage")
-                        error_feedback = (
-                            "I notice you're providing structured data in your answer, but you haven't used any tools to retrieve this information. "
-                            "If you need to get real data about files, directories, or other system information, please use the appropriate tool first, "
-                            "then provide your answer based on the tool's response."
-                        )
-                        conversation_history.append({"role": "user", "content": error_feedback})
-                        iteration_data["error"] = "Hallucinated structured data detected"
-                        metadata["iterations"].append(iteration_data)
-                        continue
-                    
-                logger.info(f"[ReAct] Final answer: {final_answer}")
+                # Return final answer immediately
                 metadata["final_response"] = final_answer
                 metadata["iterations"].append(iteration_data)
                 break
+                
+            elif action.get("action_type") == "error":
+                # Handle parsing errors like multiple JSON blocks
+                error_msg = action.get("error", "Unknown error during JSON parsing")
+                original_response = action.get("original_response", "")
+                details = action.get("details", {})
+                
+                # More specific and helpful error messages
+                if "JSON parsing error" in error_msg:
+                    # Specialized message for JSON parsing errors
+                    problematic_chars = details.get("problematic_chars", [])
+                    error_location = details.get("error_location", "")
+                    hint = details.get("hint", "")
+                    
+                    error_feedback = (
+                        f"ERROR: {error_msg}\n\n"
+                        f"There was a problem with JSON parsing. Please check the following issues:\n"
+                        + (f"- Problematic characters: {', '.join(problematic_chars)}\n" if problematic_chars else "")
+                        + (f"- {error_location}\n\n" if error_location else "\n")
+                        + f"How to fix it:\n"
+                        + f"1. Start with simple tools for file operations\n"
+                        + f"2. Avoid special characters (backslash, dollar sign, quotes) in your command\n"
+                        + f"3. Use simple arguments only\n\n"
+                        + f"Example:\n```json\n"
+                        + f'{{"action_type": "tool_call", "tool_name": "server_name.tool_name", "arguments": {{"path": "/Users/user/document.txt", "content": "Content to write"}} }}\n'
+                        + f"```\n\n"
+                        + f"OR\n\n```json\n"
+                        + f'{{"action_type": "final_answer", "answer": "After completing all necessary tool usage, the result is..."}}\n'
+                        + f"```"
+                    )
+                else:
+                    # General error message
+                    error_feedback = (
+                        f"ERROR: {error_msg}\n\n"
+                        f"CRITICAL: Submit EXACTLY ONE JSON block using proper format for tool calls. Do not use curly braces {{}}.\n\n"
+                        f"To make a tool call, your response should contain EXACTLY ONE block in this format:\n"
+                        + f"```json\n"
+                        + f'{{"action_type": "tool_call", "tool_name": "server_name.tool_name", "arguments": {{"arg1": "value1", "arg2": "value2"}} }}\n'
+                        + f"```\n\n"
+                        + f"OR\n\n```json\n"
+                        + f'{{"action_type": "final_answer", "answer": "After completing all necessary tool usage, the result is..."}}\n'
+                        + f"```"
+                    )
+                
+                conversation_history.append({"role": "user", "content": error_feedback})
+                iteration_data["error"] = error_msg
+                metadata["iterations"].append(iteration_data)
+                logger.warning(f"[ReAct] Action parsing error: {error_msg}")
+                continue
+                
             else:
                 # Unknown action type
                 error_feedback = (
@@ -905,10 +1040,8 @@ When using tools, always use the server-name.tool-name format and include all pa
             # Add iteration data to the list
             metadata["iterations"].append(iteration_data)
             
-            # 각 반복 후 중간 상태 저장
-            meta_data.append(metadata)
-            with open(meta_log_path, "w", encoding="utf-8") as f:
-                json.dump(meta_data, f, indent=2, ensure_ascii=False)
+            # Save intermediate state after each iteration
+            self._save_metadata_to_log(meta_data, metadata, meta_log_path)
             
             # Trim conversation history if it gets too long
             if len(conversation_history) > self.max_history_length:
@@ -921,10 +1054,8 @@ When using tools, always use the server-name.tool-name format and include all pa
             logger.warning("[ReAct] Reached max iterations without final answer")
             metadata["final_response"] = final_answer
         
-        # 최종 상태 저장
-        meta_data.append(metadata)
-        with open(meta_log_path, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2, ensure_ascii=False)
+        # Save final state
+        self._save_metadata_to_log(meta_data, metadata, meta_log_path)
         
         # Return the final result
         return {
@@ -948,22 +1079,15 @@ When using tools, always use the server-name.tool-name format and include all pa
 
     async def generate(self, prompt: str, **kwargs) -> str:
         """Generate text using LLM. (Text prompt style)"""
-        if not self.model_loaded or self.model is None:
+        if not self.model_loaded:
             logger.error("LLM model is not loaded. Cannot generate text.")
             return "Error: LLM model is not available."
 
         logger.debug(f"Generating text for prompt (last 500 chars): ...{prompt[-500:]}")
-        start_time = time.time()
-
-        # Use chat-style API to generate text (convert single user message)
-        messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt}
-        ]
         
         try:
-            # Use chat-style API
-            return await self.generate_chat(messages, **kwargs)
+            # ModelService의 generate_text 메서드 사용
+            return await self.model_service.generate_text(prompt, **kwargs)
         except Exception as e:
             logger.error(f"Error during text generation: {e}", exc_info=True)
             return "Error: Could not generate text from LLM."
@@ -971,7 +1095,7 @@ When using tools, always use the server-name.tool-name format and include all pa
     # More detailed tool information for when a tool is selected
     def _get_detailed_tool_info(self, server_name: str, tool_name: str) -> str:
         """Get detailed information about a specific tool including schema and examples."""
-        all_tools = self.mcp_service.get_all_tools()
+        all_tools = self.mcp_manager.get_all_tools()
         
         if not all_tools or server_name not in all_tools or tool_name not in all_tools.get(server_name, {}):
             return f"Tool information not found: {server_name}.{tool_name}"
@@ -1030,3 +1154,173 @@ When using tools, always use the server-name.tool-name format and include all pa
         except Exception as e:
             logger.warning(f"[ReAct] Error providing tool details: {str(e)}")
             # Continue without providing details 
+
+    async def _validate_tool_arguments(self, server_name: str, tool_name: str, arguments: Dict) -> Tuple[bool, Optional[str], Optional[Dict]]:
+        """Validate tool arguments against schema."""
+        try:
+            # 1. 도구 스키마 가져오기
+            schema = await self._get_tool_schema(server_name, tool_name)
+            if not schema:
+                return False, None, f"Schema not found for tool '{server_name}.{tool_name}'"
+                
+            # 2. 스키마 검증 전에 인수 수정 시도
+            fixed_args = arguments.copy()  # 원본 인수 복사만 하고 수정 없이 사용
+                
+            # 3. 필수 파라미터 확인
+            missing_params = []
+            required_params = schema.get("required", [])
+            properties = schema.get("properties", {})
+            
+            for param in required_params:
+                if param not in fixed_args or fixed_args[param] is None:
+                    missing_params.append(param)
+                    
+            if missing_params:
+                # 오류 메시지 생성
+                error_msg = f"Missing required parameter(s) for '{server_name}.{tool_name}': {', '.join(missing_params)}\n\n"
+                error_msg += "Required parameters:\n"
+                for param in required_params:
+                    param_info = properties.get(param, {})
+                    param_type = param_info.get("type", "string")
+                    param_desc = param_info.get("description", "No description available")
+                    error_msg += f"- {param}: {param_type} - {param_desc}\n"
+                
+                return False, error_msg, None
+                
+            # 4. 타입 검증 (간단한 검증)
+            # TODO: 더 상세한 JSON 스키마 검증 구현
+            
+            return True, None, fixed_args
+            
+        except Exception as e:
+            logger.error(f"Error validating tool arguments: {str(e)}")
+            return False, f"Error validating arguments: {str(e)}", None
+
+    def _process_tool_validation_error(
+        self, 
+        server_name: str, 
+        tool_name: str, 
+        error_msg: str, 
+        conversation: List[Dict],
+        metadata: Dict
+    ) -> None:
+        """Process tool validation error and add helpful feedback."""
+        logger.warning(f"Tool validation error for {server_name}.{tool_name}: {error_msg}")
+        
+        # 도구 상세 설명 가져오기
+        tool_details = self._get_detailed_tool_info(server_name, tool_name)
+        
+        # JSON 파싱 에러 처리
+        if "Expecting property name" in error_msg or "Invalid JSON" in error_msg:
+            feedback = (
+                f"Invalid JSON format was used for tool call. "
+                f"All property names and string values within the JSON block must be wrapped in double quotes (\")."
+            )
+            
+        # 요구되는 파라미터 누락 처리
+        elif "Missing required parameter" in error_msg:
+            feedback = error_msg  # 이미 상세한 메시지가 생성됨
+            
+        # 기타 검증 오류
+        else:
+            feedback = error_msg
+        
+        # 도구 설명을 피드백에 추가
+        feedback += f"\n\n{tool_details}\n\n"
+        feedback += "위 도구 정보를 참고하여 올바른 매개변수로 다시 시도해보세요."
+        
+        # 피드백을 관찰 결과로 대화에 추가
+        self._add_observation_to_conversation(feedback, conversation)
+        
+        # 메타데이터 업데이트
+        if "errors" not in metadata:
+            metadata["errors"] = []
+        metadata["errors"].append({
+            "error_type": "tool_validation",
+            "tool": f"{server_name}.{tool_name}",
+            "message": error_msg
+        })
+
+    def _save_metadata_to_log(self, meta_data, metadata, meta_log_path):
+        """
+        메타데이터를 로그 파일에 저장합니다. 중복 저장을 방지합니다.
+        
+        Args:
+            meta_data (list): 메타데이터 목록
+            metadata (dict): 현재 저장할 메타데이터
+            meta_log_path (str): 로그 파일 경로
+        """
+        # 중복 저장 방지: 같은 세션 ID, 동일한 이벤트 타입의 기존 데이터가 있는지 확인
+        is_duplicate = False
+        for i, existing_data in enumerate(meta_data):
+            if (existing_data.get("session_id") == metadata["session_id"] and 
+                existing_data.get("event_type") == metadata["event_type"] and
+                existing_data.get("timestamp") == metadata["timestamp"]):
+                # 중복 발견: 기존 데이터 업데이트
+                meta_data[i] = metadata
+                is_duplicate = True
+                break
+                
+        # 중복이 없으면 새로 추가
+        if not is_duplicate:
+            meta_data.append(metadata)
+            
+        # 파일에 저장
+        with open(meta_log_path, "w", encoding="utf-8") as f:
+            json.dump(meta_data, f, indent=2, ensure_ascii=False) 
+
+    async def _get_tool_schema(self, server_name: str, tool_name: str) -> Optional[Dict]:
+        """Get the schema for a specific tool."""
+        try:
+            # 모든 도구 가져오기
+            all_tools = self.mcp_manager.get_all_tools()
+            logger.debug(f"Getting tool schema for '{server_name}.{tool_name}'. Available servers: {list(all_tools.keys())}")
+            
+            # 서버 및 도구 존재 여부 확인
+            if server_name not in all_tools:
+                logger.warning(f"Server '{server_name}' not found in available tools")
+                return None
+                
+            if tool_name not in all_tools[server_name]:
+                logger.warning(f"Tool '{tool_name}' not found in server '{server_name}'")
+                return None
+                
+            # 도구 정보 가져오기
+            tool_info = all_tools[server_name][tool_name]
+            logger.debug(f"Tool info keys for '{server_name}.{tool_name}': {list(tool_info.keys())}")
+            
+            # 입력 스키마 가져오기 (inputSchema 필드)
+            schema = tool_info.get("inputSchema", {})
+            if not schema:
+                logger.warning(f"No inputSchema found for '{server_name}.{tool_name}'. Available keys: {list(tool_info.keys())}")
+            else:
+                logger.debug(f"Found schema for '{server_name}.{tool_name}' with properties: {list(schema.get('properties', {}).keys())}")
+            return schema
+            
+        except Exception as e:
+            logger.error(f"Error getting tool schema: {str(e)}", exc_info=True)
+            return None
+            
+    def _format_required_params(self, schema: Dict) -> str:
+        """Format required parameters from schema."""
+        if not schema or not isinstance(schema, dict):
+            return "Schema information not available"
+        
+        properties = schema.get('properties', {})
+        required = schema.get('required', [])
+        
+        param_info = []
+        for param in required:
+            param_type = properties.get(param, {}).get('type', 'unknown')
+            param_desc = properties.get(param, {}).get('description', '')
+            param_info.append(f"'{param}' ({param_type}){': ' + param_desc if param_desc else ''}")
+        
+        return ", ".join(param_info) if param_info else "No required parameters"
+    
+    def _add_observation_to_conversation(self, observation: str, conversation: List[Dict]) -> None:
+        """Add an observation as an assistant message to the conversation."""
+        observation_msg = {
+            "role": "assistant",
+            "content": f"Observation: {observation}"
+        }
+        conversation.append(observation_msg) 
