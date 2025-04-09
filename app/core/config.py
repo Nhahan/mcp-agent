@@ -4,7 +4,7 @@ from pathlib import Path
 from functools import lru_cache
 from pydantic import Field, HttpUrl, AliasChoices, DirectoryPath
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -22,23 +22,20 @@ class Settings(BaseSettings):
     api_description: str = "MCP Agent API"
     api_version: str = "0.1.0"
     
-    # 모델 구성 (정확한 모델 정보로 업데이트)
-    model_repo_id: str = os.getenv("MODEL_REPO_ID", "mradermacher/gemma3-4b-it-abliterated-GGUF")
-    model_filename: str = os.getenv("MODEL_FILENAME", "gemma3-4b-it-abliterated.Q8_0.gguf")
-    tokenizer_base_id: str = os.getenv("TOKENIZER_BASE_ID", "google/gemma-3-4b-it")
+    # 모델 구성
+    model_filename: str = os.getenv("MODEL_FILENAME", "")
     model_dir: Path = Path('/app/models') if os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true" else Path('./models')
     
     # 로깅 및 디버깅
     log_level: str = "INFO"
+    log_dir: str = "logs"
     
     # MCP 구성
-    mcp_config_path: Path = Path('/app/mcp.json') if os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true" else Path('./mcp.json')
+    mcp_config_path: str = "mcp.json"
     
-    # Hugging Face 토큰
-    hugging_face_token: str = ""
-    
-    # Docker 환경 체크 
-    is_docker: bool = os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true"
+    model_path: Optional[str] = None # .env 에서 읽어올 모델 파일 경로
+    n_ctx: int = 32768 # 모델 컨텍스트 길이
+    gpu_layers: int = -1 # GPU에 오프로드할 레이어 수 (0이면 CPU만 사용)
     
     # Pydantic v2 경고 해결: protected_namespaces 설정 추가
     model_config = SettingsConfigDict(
@@ -48,48 +45,52 @@ class Settings(BaseSettings):
         extra='ignore' # 명시적으로 정의되지 않은 필드는 무시 (기본값)
     )
         
-    @classmethod
-    def customise_sources(
-        cls,
-        init_settings,
-        env_settings,
-        file_secret_settings,
-    ):
-        return (
-            init_settings,
-            env_settings,
-            _docker_check,
-            file_secret_settings,
-        )
-    
-    # 유틸리티 속성들 (URL 자동 생성)
     @property
-    def model_path(self) -> Path:
+    def calculated_model_path(self) -> Path:
+        """모델 디렉토리와 파일 이름을 조합하여 전체 모델 경로를 반환합니다."""
+        # 모델 디렉토리가 존재하지 않으면 생성
+        if not self.model_dir.exists():
+            try:
+                self.model_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.error(f"Failed to create model directory {self.model_dir}: {e}")
+                # 디렉토리 생성 실패 시 기본 경로 반환 또는 예외 발생 선택
+                # 여기서는 일단 파일 이름만 있는 Path 객체 반환 (오류 유발 가능성 있음)
+                return Path(self.model_filename)
         return self.model_dir / self.model_filename
-        
-    @property
-    def model_url(self) -> str:
-        """Constructs the model download URL from repo_id and filename."""
-        return f"https://huggingface.co/{self.model_repo_id}/resolve/main/{self.model_filename}"
-
-    @property
-    def MCP_CONFIG_PATH(self) -> Path:
-        """MCP 설정 파일 경로 반환"""
-        return self.mcp_config_path
-
-def _docker_check(settings: Dict[str, Any]) -> Dict[str, Any]:
-    """Docker 환경인지 확인합니다."""
-    # /.dockerenv 파일이 존재하는지 확인
-    settings["is_docker"] = Path("/.dockerenv").exists()
-    return settings
 
 # Function to get settings instance, cached for efficiency
 @lru_cache()
 def get_settings() -> Settings:
     logger.debug("Loading application settings...")
     try:
-        settings = Settings()
-        return settings
+        settings_instance = Settings()
+        
+        # model_path가 .env에 명시적으로 설정되었는지 확인
+        model_path_from_env = os.getenv("MODEL_PATH")
+        if model_path_from_env:
+             settings_instance.model_path = model_path_from_env # .env 값 사용
+             logger.info(f"Using MODEL_PATH from environment: {settings_instance.model_path}")
+             # 파일 존재 여부 체크 (다운로드 전일 수 있음)
+             if not Path(settings_instance.model_path).exists():
+                   logger.error(f"MODEL_PATH file ({settings_instance.model_path}) does not exist yet.")
+                   raise FileNotFoundError(f"모델 파일이 존재하지 않습니다: {settings_instance.model_path}. 애플리케이션을 실행하기 전에 모델 파일을 다운로드하세요.")
+        else:
+             # .env에 없으면 계산된 경로를 사용하도록 설정 (None 유지 시 문제 발생 가능)
+             calculated = settings_instance.calculated_model_path
+             settings_instance.model_path = str(calculated)
+             logger.info(f"MODEL_PATH not set in environment. Using calculated path: {settings_instance.model_path}")
+             # 계산된 경로의 파일 존재 여부 체크
+             if not calculated.exists():
+                   logger.error(f"Calculated model path file ({calculated}) does not exist yet.")
+                   raise FileNotFoundError(f"모델 파일이 존재하지 않습니다: {calculated}. 애플리케이션을 실행하기 전에 모델 파일을 다운로드하세요.")
+                   
+                   
+        # mcp_config_path도 Path 객체로 변환 (필요시)
+        if isinstance(settings_instance.mcp_config_path, str):
+             settings_instance.mcp_config_path = Path(settings_instance.mcp_config_path)
+
+        return settings_instance
     except Exception as e:
         logger.error(f"Error loading settings: {e}", exc_info=True)
         raise
@@ -102,11 +103,7 @@ if not settings.model_dir.exists():
     settings.model_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Created model directory: {settings.model_dir}")
 
-# 시작 시 주요 설정 로깅 (model_url 속성 사용)
-logger.info(f"Model Repo ID set to: {settings.model_repo_id}")
+# 시작 시 주요 설정 로깅
 logger.info(f"Model Filename set to: {settings.model_filename}")
-logger.info(f"Tokenizer Base ID set to: {settings.tokenizer_base_id}")
-logger.info(f"Calculated Model URL: {settings.model_url}")
 logger.info(f"Model path set to: {settings.model_path}")
 logger.info(f"MCP config path: {settings.mcp_config_path}")
-logger.info(f"Running in Docker: {settings.is_docker}") 
