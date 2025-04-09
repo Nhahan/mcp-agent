@@ -6,7 +6,7 @@ This guide provides an overview of the AI agent's architecture, focusing on how 
 
 The primary goal of this agent is to understand user instructions in natural language and fulfill them by combining its internal knowledge (from the LLM) with capabilities provided by external tools through MCP.
 
-**Key Idea:** The user interacts *only* with the agent (via the `/v1/inference` API). The agent, upon receiving a request, *decides* whether to:
+**Key Idea:** The user interacts *only* with the agent (via the `/chat` API). The agent, upon receiving a request, *decides* whether to:
     a) Respond directly using its language model.
     b) Utilize an external tool via an MCP server to gather information or perform an action, and then use that result to formulate the final response.
 
@@ -118,7 +118,7 @@ All of this JSON-RPC communication is abstracted by the SDK, allowing developers
 
 Let's trace a user request that involves an MCP tool:
 
-1.  **User Request:** The user sends a POST request to `/v1/inference` with the prompt: `"터미널에서 pwd 실행해줘"` (Run `pwd` in the terminal).
+1.  **User Request:** The user sends a POST request to `/v1/chat` with the prompt: `"터미널에서 pwd 실행해줘"` (Run `pwd` in the terminal).
 2.  **Agent Analysis (Inference Service):**
     - The `InferenceService` receives the prompt.
     - It analyzes the prompt using predefined patterns (or potentially more advanced LLM-based reasoning in the future).

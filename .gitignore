@@ -39,5 +39,5 @@ htmlcov/
 # Logs
 /logs/ 
 
-# ONNX
-*.onnx
+# models
+/models/

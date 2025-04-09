@@ -77,28 +77,6 @@ Once the server is running, you can interact with the agent via its API endpoint
           "text": "What files are in the current directory?"
         }
         ```
-    *   The agent will process the request, potentially using MCP tools via the ReAct pattern, and return a JSON response:
-        ```json
-        {
-          "response": "The command `ls -al` shows...",
-          "thoughts_and_actions": [
-            {
-              "thought": "I need to list the files. I'll use the iterm-mcp/write_to_terminal tool.",
-              "action": { "raw": "iterm-mcp/write_to_terminal(...)" },
-              "observation": "Okay, the command was sent..."
-            },
-            {
-              "thought": "Now I need to read the output.",
-              "action": { "raw": "iterm-mcp/read_terminal_output(...)" },
-              "observation": "total 4\n-rw-r--r-- 1 user user 0 Oct 28 10:00 file1.txt\n..."
-            }
-          ],
-          "full_response": "User: What files are in the current directory?\nAction: ...\nObservation: ...\nAction: ...\nObservation: ...\n",
-          "error": null,
-          "log_session_id": "174406...",
-          "log_path": "logs/react_logs/174406..."
-        }
-        ```
 
 ## License
 
