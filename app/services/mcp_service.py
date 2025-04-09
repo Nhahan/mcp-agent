@@ -1,8 +1,7 @@
 import json
 import logging
-import subprocess
 from pathlib import Path
-from typing import Dict, Optional, Any, List
+from typing import Dict, Any, List
 import asyncio
 
 from app.core.config import Settings, get_settings # Import Settings
