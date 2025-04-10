@@ -10,6 +10,7 @@ from datetime import datetime
 
 from app.services.mcp_service import MCPService
 from app.services.model_service import ModelService, ModelError
+from app.utils.log_utils import async_save_meta_log
 
 logger = logging.getLogger(__name__)
 
@@ -164,9 +165,40 @@ class InferenceService:
             Parsed action dictionary or None if parsing fails
         """
         try:
-            # Extract all JSON blocks (regular expression)
-            json_blocks = self.json_regex.findall(llm_output)
+            # 디버깅을 위한 원본 출력 로깅
+            if session_id:
+                logger.debug(f"[{session_id}] Raw LLM output for parsing: {llm_output[:200]}...")
             
+            # JSON 직접 추출 시도 - 가장 간단한 방법부터 시도
+            try:
+                # 전체 텍스트가 직접 JSON인지 확인
+                action_json = json.loads(llm_output.strip())
+                if isinstance(action_json, dict):
+                    if session_id:
+                        logger.info(f"[{session_id}] Successfully parsed direct JSON format")
+                    return action_json
+            except json.JSONDecodeError:
+                # 직접 파싱 실패, 계속 진행
+                pass
+                
+            # JSON 블록 추출 (정규식 개선)
+            # 1. ```json ... ``` 형식 우선 시도
+            json_blocks = re.findall(r'```(?:json)?\s*\n?(.*?)\n?```', llm_output, re.DOTALL)
+            
+            # 2. 마커 없는 JSON 객체 추출 시도
+            if not json_blocks:
+                # 중괄호로 감싸진 텍스트 블록 찾기
+                json_blocks = re.findall(r'(\{.*?\})', llm_output, re.DOTALL)
+                if session_id and json_blocks:
+                    logger.info(f"[{session_id}] Found JSON blocks without markers: {len(json_blocks)}")
+            
+            if not json_blocks:
+                if session_id:
+                    logger.warning(f"[{session_id}] Could not find any JSON blocks. Trying to extract from full text.")
+                # 전체 텍스트에서 중괄호 패턴을 한 번 더 찾아봄
+                json_pattern = r'(\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\})'
+                json_blocks = re.findall(json_pattern, llm_output, re.DOTALL)
+                
             if not json_blocks:
                 if session_id:
                     logger.warning(f"[{session_id}] Could not find any JSON blocks")
@@ -177,20 +209,29 @@ class InferenceService:
                 if session_id:
                     logger.warning(f"[{session_id}] Multiple JSON blocks found ({len(json_blocks)})")
                 
-                # Handle first iteration specially - use the first JSON block with a warning
-                if iteration is not None and iteration == 0:
-                    first_json_str = json_blocks[0].strip()
+                # 첫 번째 블록을 시도
+                first_json_str = json_blocks[0].strip()
+                try:
+                    action_json = json.loads(first_json_str)
+                    if session_id:
+                        logger.info(f"[{session_id}] Using first JSON block from multiple blocks")
+                    return action_json
+                except json.JSONDecodeError:
+                    pass
+                    
+                # 모든 블록을 시도해보고 파싱되는 첫 번째 블록 사용
+                for i, block in enumerate(json_blocks):
                     try:
-                        action_json = json.loads(first_json_str)
-                        # Add warning flag to the parsed JSON
-                        action_json["_multiple_blocks_warning"] = True
-                        logger.info(f"[{session_id}] Using first JSON block for first iteration, with warning")
-                        return action_json
-                    except json.JSONDecodeError:
-                        # If the first block can't be parsed, proceed to standard error handling
-                        pass
-                        
-                # Return an error dictionary when there are multiple blocks
+                        json_str = block.strip()
+                        action_json = json.loads(json_str)
+                        if isinstance(action_json, dict):
+                            if session_id:
+                                logger.info(f"[{session_id}] Successfully parsed JSON block {i+1} of {len(json_blocks)}")
+                            return action_json
+                    except:
+                        continue
+                
+                # 모든 블록이 파싱 실패하면 오류 반환
                 return {
                     "action_type": "error",
                     "error": f"Multiple JSON blocks found ({len(json_blocks)}). Please provide exactly ONE JSON block.",
@@ -253,33 +294,38 @@ class InferenceService:
                 # 실패해도 계속 진행
             
             try:
-                # 먼저 원본 문자열로 시도
-                try:
-                    action_json = json.loads(json_str)
-                except json.JSONDecodeError:
-                    # 원본 파싱 실패 시, 수정된 문자열로 시도
+                # 다양한 방법으로 파싱 시도
+                json_parsing_methods = [
+                    lambda: json.loads(json_str),  # 원본 텍스트
+                    lambda: json.loads(cleaned_json_str),  # 기본 정리된 텍스트
+                    lambda: json.loads(re.sub(r'([\{\,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', cleaned_json_str)),  # 강력한 속성 이름 수정
+                    lambda: json.loads(re.sub(r'[\n\r\t]', ' ', cleaned_json_str)),  # 모든 줄바꿈 제거
+                    lambda: json.loads(re.sub(r'\\([^"])', r'\1', cleaned_json_str)),  # 불필요한 이스케이프 제거
+                ]
+                
+                action_json = None
+                last_error = None
+                
+                # 모든 방법 시도
+                for i, parse_method in enumerate(json_parsing_methods):
                     try:
-                        action_json = json.loads(cleaned_json_str)
+                        action_json = parse_method()
                         if session_id:
-                            logger.info(f"[{session_id}] Successfully parsed JSON after cleaning")
+                            logger.info(f"[{session_id}] Successfully parsed JSON using method {i+1}")
+                        break
                     except json.JSONDecodeError as e:
-                        # 여전히 실패하면 마지막 시도로 따옴표가 없는 속성 이름 처리를 더 강력하게 시도
-                        # 인용부호 없는 모든 키를 찾아서 수정하는 더 강력한 접근법
-                        try:
-                            # 모든 키-값 쌍을 찾아서 키에 따옴표가 없으면 추가
-                            stronger_regex = re.compile(r'([\{\,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', re.MULTILINE)
-                            final_attempt = stronger_regex.sub(r'\1"\2":', cleaned_json_str)
-                            action_json = json.loads(final_attempt)
-                            if session_id:
-                                logger.info(f"[{session_id}] Successfully parsed JSON after aggressive property name fixing")
-                        except Exception:
-                            # 모든 시도가 실패했으면 원래 오류 다시 발생
-                            raise e
+                        last_error = e
+                        continue
+                        
+                if action_json is None:
+                    if session_id:
+                        logger.warning(f"[{session_id}] All JSON parsing methods failed: {last_error}")
+                    return None
                     
-                    # answer 필드가 지나치게 길면 잘라내기
-                    if "answer" in action_json and isinstance(action_json["answer"], str) and len(action_json["answer"]) > 1000:
-                        action_json["answer"] = action_json["answer"][:997] + "..."
-                        logger.info(f"[{session_id}] Truncated overly long answer field to 1000 characters")
+                # answer 필드가 지나치게 길면 잘라내기
+                if "answer" in action_json and isinstance(action_json["answer"], str) and len(action_json["answer"]) > 1000:
+                    action_json["answer"] = action_json["answer"][:997] + "..."
+                    logger.info(f"[{session_id}] Truncated overly long answer field to 1000 characters")
                 
                 # Basic validation
                 if not isinstance(action_json, dict):
@@ -291,134 +337,28 @@ class InferenceService:
                 action_type = action_json.get("action_type")
                 tool_name = action_json.get("tool_name")
                 
-                # If action_type field is missing
+                # 기본 필드 존재 여부 확인 및 자동 보정 기능 제거
                 if action_type is None:
-                    # If tool_name exists, set action_type to "tool_call"
-                    if tool_name:
-                        action_json["action_type"] = "tool_call"
-                        if session_id:
-                            logger.warning(f"[{session_id}] Missing action_type field, setting to 'tool_call'")
-                    else:
-                        # Check if direct tool name and arguments are present in action_json
-                        potential_tools = [k for k in action_json.keys() if k not in ["action_type", "tool_name", "arguments", "thought"]]
-                        if len(potential_tools) == 1 and isinstance(action_json[potential_tools[0]], dict):
-                            tool_name = potential_tools[0]
-                            arguments = action_json[tool_name]
-                            action_json = {
-                                "action_type": "tool_call",
-                                "tool_name": tool_name,
-                                "arguments": arguments
-                            }
-                            if session_id:
-                                logger.warning(f"[{session_id}] Reconstructed JSON format for: {tool_name}")
-                        else:
-                            if session_id:
-                                logger.warning(f"[{session_id}] Both action_type and tool_name are missing")
-                            return None
-                
-                # Handle case where action_type is tool name
-                elif action_type != "tool_call" and action_type != "final_answer":
-                    if tool_name is None:  # tool_name is missing and action_type looks like tool name
-                        # Set tool_name as action_type and change action_type to "tool_call"
-                        tool_name = action_type
-                        action_json["tool_name"] = tool_name
-                        action_json["action_type"] = "tool_call"
-                        
-                        # If arguments field is missing, treat all additional keys as arguments
-                        if "arguments" not in action_json:
-                            arguments = {k: v for k, v in action_json.items() 
-                                        if k not in ["action_type", "tool_name", "thought"]}
-                            action_json["arguments"] = arguments
-                            
-                            # Remove original keys
-                            for k in list(arguments.keys()):
-                                if k in action_json:
-                                    del action_json[k]
-                                    
-                        if session_id:
-                            logger.warning(f"[{session_id}] Fixed tool call format: Set '{action_type}' as tool_name")
-                
-                # Handle case where action_type is "tool_call" but tool_name is missing
-                elif action_type == "tool_call" and tool_name is None:
+                    # 자동 보정하지 않고 오류 반환
                     if session_id:
-                        logger.warning(f"[{session_id}] 'tool_call' action missing tool_name")
-                    return None
-                    
-                # Handle case where arguments are not object form
-                if action_type == "tool_call" and "arguments" not in action_json:
-                    # Treat all additional keys as arguments
-                    arguments = {k: v for k, v in action_json.items() 
-                                if k not in ["action_type", "tool_name", "thought"]}
-                    
-                    if arguments:
-                        action_json["arguments"] = arguments
-                        
-                        # Remove original keys
-                        for k in list(arguments.keys()):
-                            if k in action_json:
-                                del action_json[k]
-                                
-                        if session_id:
-                            logger.warning(f"[{session_id}] Created missing arguments object")
-                    else:
-                        action_json["arguments"] = {}
+                        logger.warning(f"[{session_id}] Missing required action_type field")
+                    return {
+                        "action_type": "error",
+                        "error": "Missing required 'action_type' field. Must be 'tool_call' or 'final_answer'.",
+                        "original_response": json_str[:300] + "..." if len(json_str) > 300 else json_str
+                    }
                 
-                # Validate other fields specific to the action type
-                if action_type == "tool_call":
-                    # Check for tool_name
-                    if not tool_name:
-                        logger.warning(f"[{session_id}] Missing tool_name in tool_call")
-                        action_json["tool_name"] = ""
-                        
-                    # Ensure arguments exists and is an object
-                    if "arguments" not in action_json or not isinstance(action_json["arguments"], dict):
-                        logger.warning(f"[{session_id}] Missing or invalid arguments in tool_call")
-                        action_json["arguments"] = {}
-                
+                # 결과 반환
                 return action_json
                 
-            except json.JSONDecodeError as e:
+            except Exception as e:
                 if session_id:
-                    error_detail = str(e)
-                    # 구체적인 오류 메시지 기록
-                    logger.warning(f"[{session_id}] Invalid JSON format: {error_detail}")
-                    
-                    # 문제가 될 수 있는 이스케이프 문자 파악
-                    problematic_chars = []
-                    if r'\$' in json_str:
-                        problematic_chars.append(r'\$')
-                    if r'\'' in json_str or r'\"' in json_str:
-                        problematic_chars.append("escaped quotes")
-                    if '\n' in json_str:
-                        problematic_chars.append("newlines")
-                    
-                    # 오류의 위치 파악
-                    error_pos = getattr(e, 'pos', -1)
-                    
-                    error_location = ""
-                    if error_pos >= 0:
-                        context_start = max(0, error_pos - 20)
-                        context_end = min(len(json_str), error_pos + 20)
-                        error_context = json_str[context_start:context_end]
-                        error_location = f"Error context: '...{error_context}...'"
-                        
-                    error_info = {
-                        "action_type": "error",
-                        "error": f"JSON parsing error: {error_detail}",
-                        "details": {
-                            "problematic_chars": problematic_chars,
-                            "error_location": error_location,
-                            "hint": "Keep answers short and simple. Avoid newlines, special characters, and quotation marks inside JSON values."
-                        },
-                        "original_response": json_str
-                    }
-                    
-                    return error_info
+                    logger.warning(f"[{session_id}] Error during JSON parsing: {str(e)}")
                 return None
-            
+                
         except Exception as e:
             if session_id:
-                logger.error(f"[{session_id}] Error during JSON parsing: {str(e)}")
+                logger.error(f"[{session_id}] Unexpected error during action parsing: {str(e)}", exc_info=True)
             return None
 
     def _format_observation(self, result: Union[str, Dict, Exception]) -> str:
@@ -560,24 +500,11 @@ class InferenceService:
             
         # Setup logging directory - 단일 세션 ID로 통합
         if log_dir:
-            logs_path = os.path.join(log_dir, "api_logs", session_id)
+            logs_path = Path(log_dir) / "api_logs" / session_id
         else:
-            logs_path = os.path.join(self.log_dir, "api_logs", session_id)
+            logs_path = Path(self.log_dir) / "api_logs" / session_id
             
-        os.makedirs(logs_path, exist_ok=True)
-        meta_log_path = os.path.join(logs_path, "meta.json")
-        
-        # 기존 메타데이터 파일이 있으면 읽기
-        meta_data = []
-        if os.path.exists(meta_log_path):
-            try:
-                with open(meta_log_path, "r", encoding="utf-8") as f:
-                    meta_data = json.load(f)
-                    if not isinstance(meta_data, list):
-                        meta_data = [meta_data]  # 단일 객체일 경우 리스트로 변환
-            except Exception as e:
-                logger.error(f"Error reading existing meta.json: {e}. Creating new file.")
-                meta_data = []
+        logs_path.mkdir(parents=True, exist_ok=True)
         
         # Initialize metadata
         metadata = {
@@ -589,6 +516,10 @@ class InferenceService:
             "final_response": "",
             "iteration_count": 0,
             "max_iterations": max_iterations,
+            "model": {
+                "path": self.model_service.model_path,
+                "params": self.model_service.model_params
+            }
         }
         
         # Get available tools and format them for the prompt
@@ -633,15 +564,15 @@ FORMATS - Always use exactly ONE of these:
 }}
 ```
 
-CRITICAL RULES:
-• ONLY ONE JSON BLOCK IN YOUR ENTIRE RESPONSE - If you have multiple thoughts or plans, put them all in the single "thought" field
-• NEVER USE PHRASES LIKE "I'll try this tool", "Let me try", "Next, I'll try" - Just put ALL reasoning in the "thought" field and call ONE tool
-• DO NOT WRITE MULTIPLE TOOL CALLS OR ALTERNATIVE APPROACHES - Choose the best approach and implement it in ONE JSON block
-• WAIT for each tool result before proceeding - do not assume the result
-• Use tools with correct parameters - check the required parameters carefully
-• CAREFULLY ANALYZE TOOL RESULTS in context - words like "error" or "failed" might appear in successful results too
-• If you keep getting the same error with a tool, CHANGE YOUR APPROACH instead of repeating the same thing
-• PAY ATTENTION TO ERROR MESSAGES - they often tell you exactly what's wrong with your parameters
+⚠️ EXTREMELY CRITICAL RULES:
+• YOU MUST OUTPUT EXACTLY ONE JSON BLOCK PER RESPONSE - NOT TWO, NOT THREE, JUST ONE
+• NEVER INCLUDE BOTH A TOOL CALL AND FINAL ANSWER IN THE SAME RESPONSE
+• CHOOSE EITHER TOOL CALL OR FINAL ANSWER, NEVER BOTH
+• ALL REASONING GOES INSIDE THE "thought" FIELD, NOT OUTSIDE THE JSON
+• NEVER WRITE TEXT LIKE "**Final Answer**" OUTSIDE THE JSON BLOCK
+• NEVER write any explanatory text, reasoning, or planning outside the JSON block
+• PUT ALL YOUR THINKING IN THE "thought" FIELD - IT CAN BE AS LONG AS NEEDED
+• DO NOT REPEAT YOURSELF IN AND OUTSIDE THE JSON - ALL TEXT GOES INSIDE THE JSON
 
 CRITICAL JSON FORMATTING RULES:
 • STRICT JSON FORMAT IS REQUIRED - Your entire response MUST be valid parseable JSON
@@ -655,21 +586,6 @@ CRITICAL JSON FORMATTING RULES:
 • ESCAPE any necessary quotes in values with a backslash: \\"
 • For long responses, put brief conclusion in "answer" field and details in "thought" field
 • If you need to provide a structured response, use simple markdown without complex formatting
-
-TOOL RESULT ANALYSIS:
-• READ THE ENTIRE RESULT carefully before determining if it indicates success or failure
-• CONSIDER THE CONTEXT - words like "error" or "invalid" might be part of normal content
-• Words like "error", "invalid", or "failed" don't always indicate actual errors - check the full context
-• Look for specific error patterns like "isError: true" or clear error messages from the tool
-• Use your judgment to determine the next steps based on the complete response
-• If the same tool fails 3 times in a row, TRY A COMPLETELY DIFFERENT APPROACH
-
-PARAMETER VALIDATION:
-• Always check if you're using the correct parameter NAMES for the tool you're calling
-• Make sure all REQUIRED parameters are provided
-• Use appropriate VALUE TYPES for each parameter (string, number, boolean)
-• For file paths, ensure the directory exists before writing files
-• WHEN A TOOL REPORTS MISSING PARAMETERS, carefully read the error to identify which ones to add
 
 {tools_section}
 
@@ -738,7 +654,7 @@ Carefully analyze tool results in context to determine your next steps."""
                 metadata["iterations"].append(iteration_data)
                 
                 # Save current state to meta.json
-                self._save_metadata_to_log(meta_data, metadata, meta_log_path)
+                await async_save_meta_log(Path(logs_path), session_id, metadata)
                 
                 return {
                     "response": "I'm sorry, AI couldn't generate a response. Please try again later.",
@@ -802,7 +718,7 @@ Carefully analyze tool results in context to determine your next steps."""
                 error_count += 1
                 
                 # Save current state to meta.json
-                self._save_metadata_to_log(meta_data, metadata, meta_log_path)
+                await async_save_meta_log(Path(logs_path), session_id, metadata)
                 
                 # Skip to next iteration
                 continue
@@ -854,7 +770,7 @@ Carefully analyze tool results in context to determine your next steps."""
                         repeated_tool_failures[tool_key] = 0
                         
                         # Save current state to meta.json
-                        self._save_metadata_to_log(meta_data, metadata, meta_log_path)
+                        await async_save_meta_log(Path(logs_path), session_id, metadata)
                         continue
                     
                     if tool_schema:
@@ -904,7 +820,7 @@ Carefully analyze tool results in context to determine your next steps."""
                     metadata["iterations"].append(iteration_data)
                     
                     # Save current state to meta.json
-                    self._save_metadata_to_log(meta_data, metadata, meta_log_path)
+                    await async_save_meta_log(Path(logs_path), session_id, metadata)
                     
                     continue
                 
@@ -920,7 +836,7 @@ Carefully analyze tool results in context to determine your next steps."""
                     metadata["iterations"].append(iteration_data)
                     
                     # Save current state to meta.json
-                    self._save_metadata_to_log(meta_data, metadata, meta_log_path)
+                    await async_save_meta_log(Path(logs_path), session_id, metadata)
                     
                     # Reset counter and skip to next iteration
                     consecutive_same_tool_error = 0
@@ -930,8 +846,6 @@ Carefully analyze tool results in context to determine your next steps."""
                 # Execute the tool
                 observation = None
                 try:
-                    logger.info(f"[ReAct] Executing tool '{server_name}.{actual_tool_name}' with arguments: {arguments}")
-                    
                     # Get detailed tool information first to help the model understand how to use it
                     tool_details = self._get_detailed_tool_info(server_name, actual_tool_name)
                     tool_details_message = (
@@ -1041,7 +955,7 @@ Carefully analyze tool results in context to determine your next steps."""
             metadata["iterations"].append(iteration_data)
             
             # Save intermediate state after each iteration
-            self._save_metadata_to_log(meta_data, metadata, meta_log_path)
+            await async_save_meta_log(Path(logs_path), session_id, metadata)
             
             # Trim conversation history if it gets too long
             if len(conversation_history) > self.max_history_length:
@@ -1055,7 +969,7 @@ Carefully analyze tool results in context to determine your next steps."""
             metadata["final_response"] = final_answer
         
         # Save final state
-        self._save_metadata_to_log(meta_data, metadata, meta_log_path)
+        await async_save_meta_log(Path(logs_path), session_id, metadata)
         
         # Return the final result
         return {
@@ -1240,34 +1154,6 @@ Carefully analyze tool results in context to determine your next steps."""
             "tool": f"{server_name}.{tool_name}",
             "message": error_msg
         })
-
-    def _save_metadata_to_log(self, meta_data, metadata, meta_log_path):
-        """
-        메타데이터를 로그 파일에 저장합니다. 중복 저장을 방지합니다.
-        
-        Args:
-            meta_data (list): 메타데이터 목록
-            metadata (dict): 현재 저장할 메타데이터
-            meta_log_path (str): 로그 파일 경로
-        """
-        # 중복 저장 방지: 같은 세션 ID, 동일한 이벤트 타입의 기존 데이터가 있는지 확인
-        is_duplicate = False
-        for i, existing_data in enumerate(meta_data):
-            if (existing_data.get("session_id") == metadata["session_id"] and 
-                existing_data.get("event_type") == metadata["event_type"] and
-                existing_data.get("timestamp") == metadata["timestamp"]):
-                # 중복 발견: 기존 데이터 업데이트
-                meta_data[i] = metadata
-                is_duplicate = True
-                break
-                
-        # 중복이 없으면 새로 추가
-        if not is_duplicate:
-            meta_data.append(metadata)
-            
-        # 파일에 저장
-        with open(meta_log_path, "w", encoding="utf-8") as f:
-            json.dump(meta_data, f, indent=2, ensure_ascii=False) 
 
     async def _get_tool_schema(self, server_name: str, tool_name: str) -> Optional[Dict]:
         """Get the schema for a specific tool."""
