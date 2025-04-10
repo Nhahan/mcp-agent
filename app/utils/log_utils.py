@@ -42,9 +42,15 @@ async def async_save_meta_log(log_root_dir: Path, session_id: str, data: Dict[st
     """
     비동기적으로 로그 이벤트를 저장합니다.
     파일 I/O 작업을 별도의 스레드에서 수행하여 메인 이벤트 루프를 차단하지 않습니다.
+    로그 레벨이 DEBUG 이하인 경우에만 저장합니다.
     """
     if not log_root_dir or not session_id:
         logger.warning("Log root directory or session ID not provided, skipping meta log saving.")
+        return
+        
+    # 로그 레벨이 DEBUG보다 높으면 저장하지 않음
+    root_logger = logging.getLogger()
+    if root_logger.level > logging.DEBUG:
         return
 
     try:
