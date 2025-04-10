@@ -180,9 +180,7 @@ class MCPService:
             
         Returns:
             도구 호출 결과
-        """
-        logger.info(f"MCP 도구 호출: '{server_name}/{tool_name}' (인수: {args})")
-        
+        """        
         # 서버가 등록되었는지 확인
         if server_name not in self._mcp_clients:
             error_msg = f"MCP 서버 '{server_name}'가 등록되지 않았습니다."
