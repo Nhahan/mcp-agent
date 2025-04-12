@@ -12,6 +12,57 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
+# Meta JSON Schema (로그 파일 스키마)
+"""
+{
+  "type": "object",
+  "properties": {
+    "session_id": { "type": "string" },
+    "start_time": { "type": "string", "format": "date-time" },
+    "initial_request": { "type": "string" },
+    "language_detected": { "type": "string" },
+    "model_info": { 
+      "type": "object", 
+      "properties": {
+        "path": { "type": "string" },
+        "parameters": { "type": "object" }
+      }
+    },
+    "iterations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "iteration": { "type": "integer" },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "prompt": { "type": "string" },
+          "response": { "type": "string" },
+          "action": { "type": "object" },
+          "observation": { "type": ["string", "object", "null"] },
+          "error": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "timestamp": { "type": "string", "format": "date-time" },
+          "event_type": { "type": "string" },
+          "details": { "type": ["string", "object"] },
+          "iteration": { "type": "integer" }
+        }
+      }
+    },
+    "request_timestamp": { "type": "string", "format": "date-time" },
+    "end_time": { "type": "string", "format": "date-time" },
+    "final_response": { "type": ["string", "object"] }
+  },
+  "required": ["session_id", "start_time"]
+}
+"""
+
 # --- JSON 직렬화 헬퍼 ---
 def default_serializer(obj):
     if isinstance(obj, BaseModel):
@@ -45,21 +96,21 @@ def default_serializer(obj):
             return f"<unserializable: {type(obj).__name__}>"
 
 # 비동기 로그 저장 함수
-async def async_save_meta_log(session_log_dir: Path, session_id: str, event_data: Dict[str, Any]):
+async def async_save_meta_log(session_log_dir: Path, event_data: Dict[str, Any], session_id: str, merge: bool = False):
     """
     비동기적으로 로그 이벤트를 단일 세션 JSON 파일에 저장/업데이트합니다.
     파일 I/O 작업을 별도의 스레드에서 수행합니다.
     로그 레벨이 DEBUG 이하인 경우에만 저장합니다.
+    
+    Args:
+        session_log_dir: 로그 디렉토리 경로
+        event_data: 저장할 이벤트 데이터 (딕셔너리)
+        session_id: 세션 ID
+        merge: 기존 파일과 병합 여부 (기본값: False)
     """
-    if not session_log_dir or not session_id:
-        logger.warning("Session log directory or session ID not provided, skipping meta log saving.")
-        return
-
-    # 로그 레벨 체크는 그대로 유지
     root_logger = logging.getLogger()
     if root_logger.level > logging.DEBUG:
         # Optionally log that we are skipping due to level
-        # logger.debug(f"Skipping meta log saving for session {session_id} due to log level.")
         return
 
     try:
@@ -75,10 +126,16 @@ async def async_save_meta_log(session_log_dir: Path, session_id: str, event_data
             _update_session_log_file, log_file_path, session_id, event_data
         )
 
-        logger.debug(f"Asynchronously updated meta log ({event_data.get('event_type', 'unknown')}) in: {log_file_path}")
+        # 이벤트 타입을 안전하게 가져오기 (event_data가 딕셔너리인지 확인)
+        event_type = "unknown"
+        if isinstance(event_data, dict):
+            event_type = event_data.get('event_type', 'unknown')
 
     except Exception as e:
-        event_type = event_data.get('event_type', 'unknown')
+        # 이벤트 타입을 안전하게 가져오기 (event_data가 딕셔너리인지 확인)
+        event_type = "unknown"
+        if isinstance(event_data, dict):
+            event_type = event_data.get('event_type', 'unknown')
         logger.error(f"Failed to process async meta log event '{event_type}' for session {session_id}: {e}", exc_info=True)
 
 
@@ -112,94 +169,137 @@ def _update_session_log_file(log_file_path: Path, session_id: str, event_data: D
                         logger.warning(f"Failed to decode JSON from {log_file_path}. Re-initializing.")
                         session_data = OrderedDict()
                 else:
-                    # Initialize basic structure for new file
+                    # Initialize basic structure for new file with specified field order
+                    session_data = OrderedDict()
                     session_data['session_id'] = session_id
                     session_data['start_time'] = datetime.now().isoformat()
+                    session_data['request_timestamp'] = '' # Initialize explicitly
+                    session_data['initial_request'] = ""
+                    session_data['language_detected'] = ""
+                    session_data['model_info'] = {}
                     session_data['iterations'] = []
                     session_data['errors'] = []
+                    session_data['final_response'] = None # Initialize explicitly
+                    session_data['end_time'] = None # Initialize explicitly
+                    
+                event_type = event_data.get("event_type") if isinstance(event_data, dict) else None
 
-                # --- Update session_data based on event_data ---
-                event_type = event_data.get("event_type")
+                # --- Remove model info from non-api_request events --- 
+                if event_type != "api_request" and isinstance(event_data, dict):
+                    if "model_info" in event_data:
+                        del event_data["model_info"]
+                        
+                # Ensure basic fields are present if loading existing data
+                if 'session_id' not in session_data: session_data['session_id'] = session_id
+                if 'start_time' not in session_data: session_data['start_time'] = datetime.now().isoformat() # Fallback start time
+                if 'initial_request' not in session_data: session_data['initial_request'] = ""
+                if 'language_detected' not in session_data: session_data['language_detected'] = ""
+                if 'model_info' not in session_data: session_data['model_info'] = {}
+                if 'iterations' not in session_data: session_data['iterations'] = []
+                if 'errors' not in session_data: session_data['errors'] = []
 
-                # --- Explicitly ignore 'react_process' event type --- 
-                if event_type == "react_process":
-                    logger.warning(f"Ignoring deprecated event_type 'react_process' for session {session_id}")
-                    # To prevent writing, we should ideally return here or ensure session_data isn't modified.
-                    # Let's simply skip modifications for this event.
-                    pass # Modifications skipped, file will be re-written with existing session_data
-                else:
-                    # --- Remove model info from non-api_request events --- 
-                    # This is a safeguard against incorrect data being passed.
-                    if event_type != "api_request":
-                        if "model_info" in event_data:
-                            del event_data["model_info"]
+                if event_type == "api_request":
+                    # Store initial request details directly from event_data
+                    # Only set if not already present
+                    if 'initial_request' not in session_data or not session_data['initial_request']:
+                        session_data['initial_request'] = event_data.get('initial_request')
+                    
+                    # Handle language detection - update if provided
+                    if "language_detected" in event_data:
+                        session_data['language_detected'] = event_data["language_detected"]
+                    
+                    # Handle model info - update if provided
+                    if "model_info" in event_data:
+                        session_data['model_info'] = event_data["model_info"]
+                    
+                    # Use timestamp from event_data for request_timestamp if available and not set
+                    if 'request_timestamp' in event_data and ('request_timestamp' not in session_data or not session_data['request_timestamp']):
+                        session_data['request_timestamp'] = event_data['request_timestamp']
+                    elif 'request_timestamp' not in session_data: # Ensure it exists
+                        session_data['request_timestamp'] = datetime.now().isoformat() # Fallback
+
+                elif event_type == "react_iteration":
+                    # Append iteration data - ADAPTED FOR is_final FORMAT
+                    iteration_content_raw = event_data.get("iteration_data", {})
+                    if iteration_content_raw and isinstance(iteration_content_raw, dict):
+                        # Create a new dict to store cleaned/structured iteration data
+                        current_iteration_log = OrderedDict()
+                        current_iteration_log['iteration'] = iteration_content_raw.get('iteration')
+                        current_iteration_log['timestamp'] = iteration_content_raw.get('timestamp', datetime.now().isoformat())
+                        current_iteration_log['llm_prompt_length'] = iteration_content_raw.get('llm_prompt_length')
+                        current_iteration_log['llm_response'] = iteration_content_raw.get('llm_response') # Raw LLM response
+                        
+                        # Extract action details based on is_final from parsed_action
+                        parsed_action = iteration_content_raw.get('parsed_action', {})
+                        current_iteration_log['action'] = OrderedDict() # Initialize action sub-object
+                        if isinstance(parsed_action, dict):
+                            is_final = parsed_action.get('is_final') # Could be True, False, or None (on error)
+                            current_iteration_log['action']['is_final'] = is_final
+                            current_iteration_log['action']['thought'] = parsed_action.get('thought')
                             
-                    # Ensure basic fields are present if loading existing data
-                    if 'session_id' not in session_data: session_data['session_id'] = session_id
-                    if 'iterations' not in session_data: session_data['iterations'] = []
-                    if 'errors' not in session_data: session_data['errors'] = []
-                    if 'start_time' not in session_data: session_data['start_time'] = datetime.now().isoformat() # Fallback start time
-
-
-                    if event_type == "api_request":
-                        # Store initial request details, add model info if available
-                        session_data['initial_request'] = event_data.get("request_body")
-                        session_data['language_detected'] = event_data.get("language_detected")
-                        if "model_info" in event_data:
-                             session_data['model_info'] = event_data["model_info"]
-                        # Move timestamp to top level if not already set by start_time
-                        if 'timestamp' in event_data and 'request_timestamp' not in session_data:
-                             session_data['request_timestamp'] = event_data['timestamp']
-
-
-                    elif event_type == "react_iteration":
-                        # Append iteration data
-                        iteration_content = event_data.get("iteration_data", {})
-                        if iteration_content: # Ensure there's data to append
-                            session_data['iterations'].append(iteration_content)
-
-                    elif event_type == "tool_error" or event_data.get("error"):
-                        # Log errors encountered
-                        error_details = {
-                            "timestamp": event_data.get("timestamp", datetime.now().isoformat()),
-                            "event_type": event_type,
-                            "details": event_data.get("error_details") or event_data.get("error")
-                        }
-                        # Add related iteration number if available
-                        if "iteration_number" in event_data:
-                            error_details["iteration"] = event_data["iteration_number"]
-                        session_data['errors'].append(error_details)
-
-
-                    elif event_type == "api_response":
-                         # Store final response details
-                         session_data['final_response'] = event_data.get("response_body")
-                         session_data['end_time'] = event_data.get("timestamp", datetime.now().isoformat())
-                         # If iterations were logged directly in response_body, ensure they are merged/handled correctly
-                         # (Current design expects iterations via react_iteration events)
-                         if "thoughts_and_actions" in event_data.get("response_body", {}):
-                             # Potentially reconcile/add these if not logged via react_iteration
-                             # For now, assume react_iteration covers this. If not, logic needed here.
-                             pass
-
-
+                            if is_final is True:
+                                current_iteration_log['action']['answer'] = parsed_action.get('answer')
+                            elif is_final is False:
+                                current_iteration_log['action']['tool_name'] = parsed_action.get('tool_name')
+                                current_iteration_log['action']['arguments'] = parsed_action.get('arguments')
+                            # If is_final is None, only log thought and is_final=None
+                                
+                        current_iteration_log['observation'] = iteration_content_raw.get('observation') # 올바른 키 'observation' 사용
+                        current_iteration_log['error'] = iteration_content_raw.get('error') # Log iteration-specific errors
+                        
+                        session_data['iterations'].append(current_iteration_log)
                     else:
-                        # Generic update for other event types? Or log as unhandled?
-                        # For now, let's store it under a generic key if type is unknown
-                        if event_type:
-                            if event_type not in session_data: session_data[event_type] = []
-                            # Avoid adding redundant session_id etc. if already top-level
-                            data_to_add = {k: v for k, v in event_data.items() if k not in ['session_id', 'event_type']}
-                            if isinstance(session_data[event_type], list):
-                                 session_data[event_type].append(data_to_add)
-                            else: # If not a list, maybe overwrite or log error? Overwriting for simplicity now.
-                                 session_data[event_type] = data_to_add
-                        else:
-                             logger.warning(f"Log event received without event_type for session {session_id}")
-                             # Add to a specific 'unknown_events' list?
-                             if 'unknown_events' not in session_data: session_data['unknown_events'] = []
-                             session_data['unknown_events'].append(event_data)
+                         logger.warning(f"Received react_iteration event with invalid data: {iteration_content_raw}")
 
+                elif event_type == "tool_error" or event_data.get("error"):
+                    # Log errors encountered
+                    error_details = {
+                        "timestamp": event_data.get("timestamp", datetime.now().isoformat()),
+                        "event_type": event_type,
+                        "details": event_data.get("error_details") or event_data.get("error")
+                    }
+                    # Add related iteration number if available
+                    if "iteration_number" in event_data:
+                        error_details["iteration"] = event_data["iteration_number"]
+                    session_data['errors'].append(error_details)
+
+
+                elif event_type == "api_response":
+                     # Store final response details - always update these
+                     session_data['final_response'] = event_data.get("response_body")
+                     session_data['end_time'] = event_data.get("timestamp", datetime.now().isoformat())
+                     
+                     # Merge iterations if provided in the event (e.g., from final_meta)
+                     if "iterations" in event_data and isinstance(event_data["iterations"], list):
+                         # Avoid duplicating entire list if already present? For now, simple overwrite/append
+                         # If merging is complex, ensure `inference_service` sends the complete final list.
+                         session_data['iterations'] = event_data["iterations"]
+                         
+                     # Merge errors if provided in the event
+                     if "errors" in event_data and isinstance(event_data["errors"], list):
+                         if 'errors' not in session_data: session_data['errors'] = []
+                         # Avoid duplicate errors? Could check hashes or specific content if needed.
+                         # For now, append new errors from the event.
+                         existing_errors_set = set(json.dumps(e, sort_keys=True) for e in session_data.get('errors', []))
+                         for error_item in event_data["errors"]:
+                             error_item_str = json.dumps(error_item, sort_keys=True)
+                             if error_item_str not in existing_errors_set:
+                                 session_data['errors'].append(error_item)
+                                 existing_errors_set.add(error_item_str)
+                                 
+                     # Remove obsolete check for thoughts_and_actions
+                     # if "thoughts_and_actions" in event_data.get("response_body", {}):
+                     #     pass
+
+                else:
+                    # 이벤트 타입이 없는 경우: 경고 로깅 후 데이터 통합 시도하지 않음
+                    # 이전의 복잡한 병합 로직은 데이터 손상 위험이 있어 제거.
+                    if not event_type:
+                         logger.warning(f"Received event data without 'event_type' for session {session_id}. Skipping merging of unknown data: {str(event_data)[:200]}...")
+                    else:
+                         logger.debug(f"Received unhandled event_type '{event_type}' for session {session_id}. Data: {str(event_data)[:200]}...")
+                    # 기본 필드들에 매핑하여 병합 (중복 방지) - REMOVED
+                    # unknown_data 처리 로직 - REMOVED
 
                 # 파일 처음으로 이동하여 덮어쓸 준비
                 f.seek(0)
@@ -240,57 +340,84 @@ def _update_session_log_file(log_file_path: Path, session_id: str, event_data: D
             # --- Apply updates (Duplicated logic - consider refactor) ---
             event_type = event_data.get("event_type")
 
-            # --- Explicitly ignore 'react_process' event type (Fallback) --- 
-            if event_type == "react_process":
-                logger.warning(f"Ignoring deprecated event_type 'react_process' for session {session_id} (non-locking fallback)")
-                # Skip update logic, just rewrite existing data if any
-                pass 
-            else:
-                # --- Remove model info from non-api_request events (Fallback) --- 
-                if event_type != "api_request":
-                    if "model" in event_data:
-                        logger.warning(f"Removing unexpected 'model' key from event '{event_type}' (non-locking fallback)." )
-                        del event_data["model"]
-                    if "model_info" in event_data:
-                        logger.warning(f"Removing unexpected 'model_info' key from event '{event_type}' (non-locking fallback)." )
-                        del event_data["model_info"]
-                        
-                if 'session_id' not in session_data: session_data['session_id'] = session_id
-                if 'iterations' not in session_data: session_data['iterations'] = []
-                if 'errors' not in session_data: session_data['errors'] = []
-                if 'start_time' not in session_data: session_data['start_time'] = datetime.now().isoformat()
+            # --- Remove model info from non-api_request events (Fallback) --- 
+            if event_type != "api_request":
+                if "model" in event_data:
+                    logger.warning(f"Removing unexpected 'model' key from event '{event_type}' (non-locking fallback)." )
+                    del event_data["model"]
+                if "model_info" in event_data:
+                    logger.warning(f"Removing unexpected 'model_info' key from event '{event_type}' (non-locking fallback)." )
+                    del event_data["model_info"]
+                    
+            if 'session_id' not in session_data: session_data['session_id'] = session_id
+            if 'iterations' not in session_data: session_data['iterations'] = []
+            if 'errors' not in session_data: session_data['errors'] = []
+            if 'start_time' not in session_data: session_data['start_time'] = datetime.now().isoformat()
 
-                if event_type == "api_request":
-                    session_data['initial_request'] = event_data.get("request_body")
-                    session_data['language_detected'] = event_data.get("language_detected")
-                    if "model_info" in event_data: session_data['model_info'] = event_data["model_info"]
-                    if 'timestamp' in event_data and 'request_timestamp' not in session_data: session_data['request_timestamp'] = event_data['timestamp']
-                elif event_type == "react_iteration":
-                    iteration_content = event_data.get("iteration_data", {})
-                    if iteration_content: session_data['iterations'].append(iteration_content)
-                elif event_type == "tool_error" or event_data.get("error"):
-                     error_details = {
-                        "timestamp": event_data.get("timestamp", datetime.now().isoformat()),
-                        "event_type": event_type,
-                        "details": event_data.get("error_details") or event_data.get("error")
-                     }
-                     if "iteration_number" in event_data: error_details["iteration"] = event_data["iteration_number"]
-                     session_data['errors'].append(error_details)
-                elif event_type == "api_response":
-                     session_data['final_response'] = event_data.get("response_body")
-                     session_data['end_time'] = event_data.get("timestamp", datetime.now().isoformat())
+            if event_type == "api_request":
+                # Fallback: Store initial request, language, model info if available
+                if 'initial_request' not in session_data or not session_data['initial_request']:
+                    session_data['initial_request'] = event_data.get('initial_request')
+                session_data['language_detected'] = event_data.get("language_detected")
+                if "model_info" in event_data: session_data['model_info'] = event_data["model_info"]
+                if 'request_timestamp' in event_data and ('request_timestamp' not in session_data or not session_data['request_timestamp']):
+                    session_data['request_timestamp'] = event_data['request_timestamp']
+                elif 'request_timestamp' not in session_data: session_data['request_timestamp'] = datetime.now().isoformat()
+            elif event_type == "react_iteration":
+                iteration_content_raw = event_data.get("iteration_data", {})
+                if iteration_content_raw:
+                    # Create a new dict to store cleaned/structured iteration data
+                    current_iteration_log = OrderedDict()
+                    current_iteration_log['iteration'] = iteration_content_raw.get('iteration')
+                    current_iteration_log['timestamp'] = iteration_content_raw.get('timestamp', datetime.now().isoformat())
+                    current_iteration_log['llm_prompt_length'] = iteration_content_raw.get('llm_prompt_length')
+                    current_iteration_log['llm_response'] = iteration_content_raw.get('llm_response') # Raw LLM response
+                    
+                    # Extract action details based on is_final from parsed_action
+                    parsed_action = iteration_content_raw.get('parsed_action', {})
+                    current_iteration_log['action'] = OrderedDict() # Initialize action sub-object
+                    if isinstance(parsed_action, dict):
+                        is_final = parsed_action.get('is_final') # Could be True, False, or None (on error)
+                        current_iteration_log['action']['is_final'] = is_final
+                        current_iteration_log['action']['thought'] = parsed_action.get('thought')
+                        
+                        if is_final is True:
+                            current_iteration_log['action']['answer'] = parsed_action.get('answer')
+                        elif is_final is False:
+                            current_iteration_log['action']['tool_name'] = parsed_action.get('tool_name')
+                            current_iteration_log['action']['arguments'] = parsed_action.get('arguments')
+                        # If is_final is None, only log thought and is_final=None
+                            
+                    current_iteration_log['observation'] = iteration_content_raw.get('observation') # 올바른 키 'observation' 사용
+                    current_iteration_log['error'] = iteration_content_raw.get('error') # Log iteration-specific errors
+                    
+                    session_data['iterations'].append(current_iteration_log)
                 else:
-                    # Handle unknown event types similarly
-                    if event_type:
-                         if event_type not in session_data: session_data[event_type] = []
-                         data_to_add = {k: v for k, v in event_data.items() if k not in ['session_id', 'event_type']}
-                         if isinstance(session_data[event_type], list):
-                              session_data[event_type].append(data_to_add)
-                         else:
-                              session_data[event_type] = data_to_add
-                    else:
-                        if 'unknown_events' not in session_data: session_data['unknown_events'] = []
-                        session_data['unknown_events'].append(event_data)
+                    logger.warning(f"Received react_iteration event with invalid data: {iteration_content_raw}")
+            elif event_type == "tool_error" or event_data.get("error"):
+                 error_details = {
+                    "timestamp": event_data.get("timestamp", datetime.now().isoformat()),
+                    "event_type": event_type,
+                    "details": event_data.get("error_details") or event_data.get("error")
+                 }
+                 if "iteration_number" in event_data: error_details["iteration"] = event_data["iteration_number"]
+                 session_data['errors'].append(error_details)
+            elif event_type == "api_response":
+                 # Fallback: Update final response and end time
+                 session_data['final_response'] = event_data.get("response_body")
+                 session_data['end_time'] = event_data.get("timestamp", datetime.now().isoformat())
+                 # Fallback: Overwrite iterations and errors if present (less safe than locked version)
+                 if "iterations" in event_data and isinstance(event_data["iterations"], list):
+                     session_data["iterations"] = event_data["iterations"]
+                 if "errors" in event_data and isinstance(event_data["errors"], list):
+                     session_data["errors"] = event_data["errors"]
+            else:
+                # 이벤트 타입이 없는 경우 (Fallback): 경고만 로깅하고 병합 시도 안 함
+                if not event_type:
+                    logger.warning(f"(Fallback/No Lock) Received event data without 'event_type' for session {session_id}. Skipping merging.")
+                else:
+                    logger.debug(f"(Fallback/No Lock) Received unhandled event_type '{event_type}' for session {session_id}.")
+                # 기본 필드들에 매핑하여 병합 (중복 방지) - REMOVED FROM FALLBACK
             # --- End of duplicated update logic ---
 
             # Overwrite the file (unsafe without lock)
