@@ -1,41 +1,65 @@
 from typing import Optional
 import logging
 
-# 필요한 서비스 클래스 임포트 (실제 경로 확인 필요)
-try:
-    from app.services.mcp_service import MCPService
-    from app.services.inference_service import InferenceService
-except ImportError as e:
-     # 임포트 실패 시 로깅 (애플리케이션 시작 시 오류 확인 가능)
-     logging.getLogger(__name__).error(f"Failed to import services in dependencies.py: {e}")
-     MCPService = None
-     InferenceService = None
+# Import settings and service classes
+from app.core.config import settings
+from app.services.mcp_service import MCPService
+from app.services.inference_service import InferenceService
+from app.services.model_service import ModelService
 
-# --- 싱글톤 인스턴스 저장 변수 ---
+logger = logging.getLogger(__name__)
+
+# --- Singleton instance storage variables ---
 _mcp_service_instance: Optional[MCPService] = None
 _inference_service_instance: Optional[InferenceService] = None
+_model_service_instance: Optional[ModelService] = None
 
-def set_mcp_service_instance(instance: MCPService):
+def set_mcp_service_instance(instance: Optional[MCPService]) -> None:
     """Sets the global MCPService instance."""
     global _mcp_service_instance
     _mcp_service_instance = instance
+    logger.debug(f"MCP service instance {'set' if instance else 'cleared'}")
 
-def set_inference_service_instance(instance: InferenceService):
+def set_inference_service_instance(instance: Optional[InferenceService]) -> None:
     """Sets the global InferenceService instance."""
     global _inference_service_instance
     _inference_service_instance = instance
+    logger.debug(f"Inference service instance {'set' if instance else 'cleared'}")
 
-# --- 의존성 주입 함수 (Getter) ---
+def set_model_service_instance(instance: Optional[ModelService]) -> None:
+    """Sets the global ModelService instance."""
+    global _model_service_instance
+    _model_service_instance = instance
+    logger.debug(f"Model service instance {'set' if instance else 'cleared'}")
+
+# --- Dependency injection functions (Getters) ---
 def get_mcp_service() -> MCPService:
-     """Returns the singleton MCPService instance."""
-     if _mcp_service_instance is None:
-         # 이 오류는 lifespan 이 올바르게 설정 및 실행되지 않았음을 의미
-         raise RuntimeError("MCPService has not been initialized. Ensure the application lifespan context is correctly set up.")
-     return _mcp_service_instance
+    """
+    Returns the singleton MCPService instance.
+    This is used by FastAPI for dependency injection.
+    """
+    if _mcp_service_instance is None:
+        # This error means the lifespan context hasn't properly initialized services
+        logger.error("MCPService requested but not initialized. Application lifespan might not have run properly.")
+        raise RuntimeError("MCPService has not been initialized. Ensure the application lifespan context is correctly set up.")
+    return _mcp_service_instance
 
 def get_inference_service() -> InferenceService:
-     """Returns the singleton InferenceService instance."""
-     if _inference_service_instance is None:
-         # 이 오류는 lifespan 이 올바르게 설정 및 실행되지 않았음을 의미
-         raise RuntimeError("InferenceService has not been initialized. Ensure the application lifespan context is correctly set up.")
-     return _inference_service_instance 
+    """
+    Returns the singleton InferenceService instance.
+    This is used by FastAPI for dependency injection.
+    """
+    if _inference_service_instance is None:
+        logger.error("InferenceService requested but not initialized. Application lifespan might not have run properly.")
+        raise RuntimeError("InferenceService has not been initialized. Ensure the application lifespan context is correctly set up.")
+    return _inference_service_instance
+
+def get_model_service() -> ModelService:
+    """
+    Returns the singleton ModelService instance.
+    This is used by FastAPI for dependency injection.
+    """
+    if _model_service_instance is None:
+        logger.error("ModelService requested but not initialized. Application lifespan might not have run properly.")
+        raise RuntimeError("ModelService has not been initialized. Ensure the application lifespan context is correctly set up.")
+    return _model_service_instance 

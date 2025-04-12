@@ -5,22 +5,24 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pathlib import Path
 import sys
+from typing import Optional
 
 from app.api.api import api_router
-from app.core.config import get_settings, Settings
+from app.core.config import settings # Import settings directly
 from app.services.mcp_service import MCPService
 from app.services.inference_service import InferenceService
+from app.services.model_service import ModelService
 
-# dependencies.py 에서 필요한 것들 임포트
 from app.dependencies import (
     get_mcp_service,
     get_inference_service,
+    get_model_service,
     set_mcp_service_instance,
     set_inference_service_instance,
-    _mcp_service_instance, # 종료 시 None 확인용
-    _inference_service_instance # 종료 시 None 확인용
+    set_model_service_instance
 )
 
+# Configure logging based on settings
 logging.config.dictConfig({
     "version": 1,
     "disable_existing_loggers": False,
@@ -31,7 +33,7 @@ logging.config.dictConfig({
     },
     "handlers": {
         "console": {
-            "level": "DEBUG", # Default to DEBUG for console
+            "level": settings.log_level.upper(), # Use settings log level
             "class": "logging.StreamHandler",
             "formatter": "standard",
         },
@@ -39,21 +41,21 @@ logging.config.dictConfig({
     "loggers": {
         "": { # Root logger
             "handlers": ["console"],
-            "level": "DEBUG", # Set root level to DEBUG
+            "level": settings.log_level.upper(), # Use settings log level
             "propagate": False,
         },
         "app": { # Logger for the 'app' namespace
             "handlers": ["console"],
-            "level": "DEBUG", # Ensure app logger is DEBUG
+            "level": settings.log_level.upper(), # Use settings log level
             "propagate": False,
         },
         "uvicorn.error": {
             "handlers": ["console"],
-            "level": "INFO",
+            "level": "INFO", # Keep uvicorn loggers at INFO
             "propagate": False,
         },
         "uvicorn.access": {
-            "handlers": ["console"], # Use console handler for access logs too
+            "handlers": ["console"],
             "level": "INFO",
             "propagate": False,
         },
@@ -67,146 +69,156 @@ logging.config.dictConfig({
 
 logger = logging.getLogger(__name__)
 
-# Set watchfiles logger level
-watchfiles_logger = logging.getLogger("watchfiles")
-watchfiles_logger.setLevel(logging.WARNING)
-
 # Add project root to sys.path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-# Import ModelService
-from app.services.model_service import ModelService, ModelError
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Application lifespan context manager. 
+    Handles initialization and cleanup of core services:
+    - ModelService for LLM operations
+    - MCPService for Model Context Protocol servers
+    - InferenceService combining both for the ReAct pattern
+    """
     logger.info("Starting application lifespan...")
-    settings = get_settings()
 
-    # --- 로깅 설정 (변경 없음) --- 
-    log_level = settings.log_level.upper()
-    logging.getLogger("app").setLevel(log_level)
-    logging.getLogger("").setLevel(log_level)
+    # Create log directory
     log_dir = Path(settings.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Logging initialized. Log level: {log_level}, Log directory: {log_dir}")
+    logger.info(f"Logging initialized. Log level: {settings.log_level.upper()}, Log directory: {log_dir}")
 
-    # --- 서비스 인스턴스 생성 및 dependencies.py 에 설정 --- 
-    model_service = None
-    mcp_service = None
-    inference_service = None
+    # Initialize core service instances
+    model_service: Optional[ModelService] = None
+    mcp_service: Optional[MCPService] = None
+    inference_service: Optional[InferenceService] = None
     
     try:
-        # 1. ModelService 생성 및 모델 로드
-        logger.info("Initializing ModelService...")
-        model_path = settings.model_path # Get path from settings
-        if not model_path or not Path(model_path).exists():
-             logger.critical(f"Model path not configured or file not found: {model_path}")
-             raise FileNotFoundError(f"Model file not found at path specified in settings: {model_path}")
-             
-        model_params = {
-            "n_ctx": settings.n_ctx, 
-            "n_gpu_layers": settings.gpu_layers,
-        }
-        model_service = ModelService(model_path=model_path, model_params=model_params)
-        logger.info("Loading model...")
-        model_loaded = await model_service.load_model() # Assuming load_model returns bool
-        if not model_loaded:
-             logger.critical("Failed to load the model.")
-             raise ModelError("Model loading failed during application startup.")
-        logger.info("Model loaded successfully.")
+        # 1. ModelService - handles LLM interactions
+        logger.info(f"Initializing ModelService with model path: {settings.model_path}")
+        # Model params come directly from settings now
+        model_service = ModelService() # No arguments needed; will use settings
+        set_model_service_instance(model_service) # Store instance for DI
+        if model_service.model_loaded:
+            logger.info("ModelService initialized and model loaded successfully.")
+        else:
+            logger.warning("ModelService initialized BUT model loading failed or was deferred. Some endpoints may not work.")
 
-        # 2. MCPService 생성 및 시작
-        logger.info("Initializing MCPService...")
-        mcp_service = MCPService(settings=settings)
+        # 2. MCPService - handles MCP server management
+        logger.info(f"Initializing MCPService with config path: {settings.mcp_config_path}")
+        mcp_service = MCPService() # No settings parameter needed now
         await mcp_service.start_servers()
-        set_mcp_service_instance(mcp_service)
-        logger.info("MCPService started.")
+        set_mcp_service_instance(mcp_service) # Store instance for DI
+        logger.info(f"MCPService started with {len(mcp_service.list_servers() or [])} servers.")
 
-        # 3. InferenceService 생성 (ModelService 및 MCPService 주입)
-        logger.info("Initializing InferenceService...")
-        inference_service = InferenceService(
-            mcp_manager=mcp_service,
-            model_service=model_service # Pass the initialized ModelService
-        )
-        inference_service.set_log_directory(log_dir) # Set log dir if needed
-        inference_service.model_loaded = True # Set model loaded flag explicitly
-        set_inference_service_instance(inference_service)
-        logger.info("InferenceService initialized.")
+        # 3. InferenceService - combines ModelService and MCPService for ReAct pattern
+        logger.info("Initializing InferenceService with ModelService and MCPService...")
+        if model_service and mcp_service: # Ensure dependencies are created
+            inference_service = InferenceService(
+                mcp_manager=mcp_service,
+                model_service=model_service
+            )
+            # Log dir is now handled by settings
+            set_inference_service_instance(inference_service) # Store instance for DI
+            logger.info("InferenceService initialized successfully.")
+        else:
+            logger.error("Cannot initialize InferenceService due to missing ModelService or MCPService.")
+            raise RuntimeError("Failed to initialize core services (Model/MCP) needed by InferenceService.")
 
-        # --- 의존성 주입 오버라이드 설정 --- 
+        # Set dependency overrides to use the initialized instances
+        app.dependency_overrides[get_model_service] = lambda: model_service
         app.dependency_overrides[get_mcp_service] = lambda: mcp_service
         app.dependency_overrides[get_inference_service] = lambda: inference_service
-        logger.info("Dependency overrides set.")
+        logger.info("FastAPI dependency overrides configured.")
 
-        logger.info("Application startup sequence completed successfully.")
+        logger.info(f"Application startup completed successfully. API version: {settings.api_version}")
 
     except Exception as e:
         logger.critical(f"Fatal error during application startup: {e}", exc_info=True)
-        # Ensure partial services are cleaned up if possible, though difficult here
+        # Attempt cleanup even on startup failure
+        if mcp_service:
+            try: 
+                logger.info("Attempting MCPService shutdown due to startup failure...")
+                await mcp_service.stop_servers()
+            except Exception as cleanup_e:
+                 logger.error(f"Error during MCPService cleanup after startup failure: {cleanup_e}", exc_info=True)
+        if model_service:
+            try:
+                logger.info("Attempting ModelService shutdown...")
+                await model_service.shutdown()
+            except Exception as cleanup_e:
+                logger.error(f"Error during ModelService cleanup: {cleanup_e}", exc_info=True)
+        # Clean up dependency instances even on failure
+        set_model_service_instance(None)
+        set_mcp_service_instance(None)
+        set_inference_service_instance(None)
         raise # Re-raise to stop the application
 
-    yield # Application runs here
+    # Yield control back to FastAPI while application runs
+    yield 
 
-    logger.info("Shutting down application lifespan...")
-    # --- 종료 작업 --- 
-    # Use local variables captured before yield
-    if inference_service and hasattr(inference_service, 'shutdown_model') and callable(inference_service.shutdown_model):
-        logger.info("Shutting down Inference Service (releasing model)...")
-        # InferenceService might not need a specific shutdown if model is handled by ModelService
-        # Consider if ModelService needs a shutdown/release method
-        pass # Assuming ModelService handles resource release if needed
+    # --- Shutdown Logic --- 
+    logger.info("Application shutdown initiated...")
     
+    # Stop MCP servers
     if mcp_service:
         logger.info("Shutting down MCP Service...")
-        await mcp_service.stop_servers()
-        
-    # Clean up dependency instances (important if not using locals)
-    set_inference_service_instance(None)
+        try:
+            await mcp_service.stop_servers()
+            logger.info("MCP Service shutdown completed.")
+        except Exception as e:
+            logger.error(f"Error during MCPService shutdown: {e}", exc_info=True)
+    
+    # Release model resources
+    if model_service:
+        logger.info("Shutting down Model Service...")
+        try:
+            await model_service.shutdown() 
+            logger.info("Model Service shutdown completed.")
+        except Exception as e:
+            logger.error(f"Error during ModelService shutdown: {e}", exc_info=True)
+    
+    # Clear dependency instances
+    set_model_service_instance(None)
     set_mcp_service_instance(None)
+    set_inference_service_instance(None)
     logger.info("Dependency instances cleared.")
-    # --- 종료 작업 끝 ---
     logger.info("Application shutdown complete.")
 
+# Create FastAPI application
 app = FastAPI(
-    title="AI Agent API",
-    description="API for the OS-Agnostic AI Agent with MCP integration.",
-    version="0.1.0",
+    title=settings.api_title,
+    description=settings.api_description,
+    version=settings.api_version,
     lifespan=lifespan 
 )
 
-# Include the API router
+# Include API router
 app.include_router(api_router)
-
-# --- 의존성 주입 함수 정의 제거 --- 
-# def get_mcp_service() -> MCPService:
-#      ...
-# 
-# def get_inference_service() -> InferenceService:
-#      ...
 
 @app.get("/")
 async def read_root():
-    return {"message": "AI Agent API is running."}
+    """Root endpoint that confirms the API is running."""
+    return {
+        "status": "active",
+        "message": f"{settings.api_title} v{settings.api_version} is running",
+        "docs_url": "/docs"
+    }
 
-# --- 메인 실행 블록 (변경 없음) --- 
+# --- Main execution block (for direct execution with Python) --- 
 if __name__ == "__main__":
-    # ... (uvicorn 실행 코드)
     import uvicorn
     import argparse
     
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="AI Agent API Server")
+    parser = argparse.ArgumentParser(description=settings.api_description)
     parser.add_argument("--host", default="127.0.0.1", help="Server host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="Server port (default: 8000)")
     args = parser.parse_args()
     
     logger.warning("Running in debug mode directly with uvicorn. Use Docker for production.")
 
-    # Explicitly set watchfiles logger level (to affect reloads)
-    watchfiles_logger = logging.getLogger("watchfiles")
-    watchfiles_logger.setLevel(logging.WARNING)
-    logger.info(f"Explicitly setting watchfiles logger level to WARNING before uvicorn.run")
-
+    # Start the API server
     uvicorn.run("app.main:app", host=args.host, port=args.port, reload=False) 
