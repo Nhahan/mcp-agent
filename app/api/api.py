@@ -1,113 +1,66 @@
 import logging
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from datetime import datetime
 import traceback
-import json
 
 from app.utils.lang_utils import classify_language
 
-from app.services.mcp_service import MCPService # get_mcp_service 제거
-from app.core.config import Settings, get_settings
-
-# InferenceService 임포트 (이제 파일이 존재해야 함)
-from app.services.inference_service import InferenceService # get_inference_service 제거
-
-# 로그 유틸리티 임포트
+from app.services.mcp_service import MCPService
+from app.core.config import settings
+from app.services.inference_service import InferenceService
 from app.utils.log_utils import async_save_meta_log, get_session_log_directory
-
-# main.py 에 정의된 의존성 주입 함수 임포트 -> dependencies.py 로 변경
 from app.dependencies import get_mcp_service, get_inference_service
 
 api_router = APIRouter()
 
-# 로거 설정
 logger = logging.getLogger(__name__)
 
-# --- Helper Functions ---
 def get_session_id(request: Request) -> str:
-    """Generate or retrieve a session ID."""
+    """Generates or retrieves a session ID."""
     return str(int(datetime.now().timestamp() * 1000))
 
-async def _translate_text(text: str, target_language: str, inference_service: InferenceService) -> Optional[str]:
-    """Translates text using the inference service (LLM).
-       Specifically handles KO -> EN translation.
-       Returns original text if input is not KO or target is not EN.
-    """
-    source_language = classify_language(text)
-
-    if not (source_language == 'ko' and target_language == 'en'):
-        logger.debug(f"Translation not required for {source_language} -> {target_language}. Returning original text.")
+async def _translate_text(
+    text: str, 
+    target_language: str, 
+    source_language: str, 
+    inference_service: InferenceService
+) -> Optional[str]:
+    """Translates text between supported languages using the AI model."""
+    
+    # 1. Check if translation is necessary
+    if source_language == target_language:
+        logger.debug(f"Source and target languages are the same ({source_language}). No translation needed.")
         return text
 
-    prompt = f"Translate the following Korean text to English. Output ONLY the English translation, without any introductory text or quotation marks.\nKorean Text: '{text}'\nEnglish Translation:"
-    stop_sequences = ["\n", "Korean Text:"]
-    messages = [{"role": "user", "content": prompt}] # Use chat format
+    # 2. Define language names for the prompt
+    language_map = {"ko": "Korean", "en": "English"}
+    source_lang_name = language_map.get(source_language, source_language)
+    target_lang_name = language_map.get(target_language, target_language)
 
-    try:
-        if not inference_service or not inference_service.model_loaded:
-            logger.error("Inference service not available for KO->EN translation.")
-            return None
+    # 3. Construct the prompt
+    prompt = (
+        f"Translate the following {source_lang_name} text to {target_lang_name}. "
+        f"Output ONLY the translated {target_lang_name} text, without any introductory phrases, explanations, or quotation marks."
+        f"\n{source_lang_name} Text: {text}"
+        f"\n{target_lang_name} Translation:"
+    )
+    messages = [{"role": "user", "content": prompt}]
+        
+    translated_text = await inference_service.model_service.generate_chat(
+        messages=messages, 
+        grammar=None
+    )
 
-        if not hasattr(inference_service, 'model_service') or not inference_service.model_service:
-             logger.error("ModelService not found within InferenceService for KO->EN translation.")
-             return None
-
-        # Use generate_chat instead of generate
-        translated_text = await inference_service.model_service.generate_chat(
-            messages=messages, # Pass messages list
-            max_tokens=len(text) * 3 + 50,
-            temperature=0.2,
-            stop=stop_sequences
-        )
-
-        cleaned_translation = translated_text.strip()
-        if cleaned_translation.startswith("English Translation:"):
-            cleaned_translation = cleaned_translation.replace("English Translation:", "").strip()
-
-        logger.info(f"Translated KO -> EN: '{text[:50]}...' -> '{cleaned_translation[:50]}...'")
+    # 4. Clean the response
+    cleaned_translation = translated_text.strip()
+    if cleaned_translation:
+        logger.debug(f"Translated {source_language} -> {target_language}: '{text}' -> '{cleaned_translation}'")
         return cleaned_translation
-
-    except Exception as e:
-        logger.error(f"KO -> EN translation error: {e}", exc_info=True)
-        return None
-
-async def _translate_en_to_ko(text: str, inference_service: InferenceService) -> Optional[str]:
-    """Translates English text to Korean using the inference service (LLM)."""
-
-    prompt = f"Translate the following English text to Korean. Output ONLY the Korean translation, without any introductory text or quotation marks.\nEnglish Text: '{text}'\nKorean Translation:"
-    stop_sequences = ["\n", "English Text:"]
-    messages = [{"role": "user", "content": prompt}] # Use chat format
-
-    try:
-        if not inference_service or not inference_service.model_loaded:
-            logger.error("Inference service not available for EN->KO translation.")
-            return None
-
-        if not hasattr(inference_service, 'model_service') or not inference_service.model_service:
-             logger.error("ModelService not found within InferenceService for EN->KO translation.")
-             return None
-
-        # Use generate_chat instead of generate
-        translated_text = await inference_service.model_service.generate_chat(
-            messages=messages, # Pass messages list
-            max_tokens=len(text) * 4 + 50,
-            temperature=0.2,
-            stop=stop_sequences
-        )
-
-        cleaned_translation = translated_text.strip()
-        if cleaned_translation.startswith("Korean Translation:"):
-             cleaned_translation = cleaned_translation.replace("Korean Translation:", "").strip()
-
-        logger.info(f"Translated EN -> KO: '{text[:50]}...' -> '{cleaned_translation[:50]}...'")
-        return cleaned_translation
-
-    except Exception as e:
-        logger.error(f"EN -> KO translation error: {e}", exc_info=True)
+    else:
+        logger.warning(f"Translation result is empty after cleaning ({source_language}->{target_language}). Original response: '{translated_text}'. Returning None.")
         return None
 
 # --- Pydantic Models ---
@@ -115,7 +68,6 @@ class ChatRequest(BaseModel):
     text: str
     session_id: Optional[str] = None # Allow client to provide session ID
     language: Optional[str] = None # Optional language hint from client
-
 
 class ErrorDetail(BaseModel):
     code: int
@@ -147,7 +99,7 @@ class HealthResponse(BaseModel):
     model_path: str
     model_exists: bool
     mcp_servers: list
-    version: str = "0.1.0"
+    version: str = settings.api_version # Use from settings
 
     # Pydantic v2 model_ config for protected namespaces if needed
     model_config = {
@@ -159,8 +111,7 @@ class HealthResponse(BaseModel):
 async def chat_endpoint(
     chat_request: ChatRequest,
     request: Request,
-    inference_service: InferenceService = Depends(get_inference_service), # 의존성 주입 사용
-    settings: Settings = Depends(get_settings)
+    inference_service: InferenceService = Depends(get_inference_service),
 ):
     """
     Handle incoming chat requests, process them using the InferenceService with ReAct pattern,
@@ -169,211 +120,170 @@ async def chat_endpoint(
     Logs the interaction details to a session-specific meta.json file.
     """
     session_id = chat_request.session_id or get_session_id(request)
-    client_host = request.client.host if request.client else "unknown"
-    user_input = chat_request.text
-
-    # --- Logging Setup ---
-    # Use the helper function to get the correct log directory
-    log_dir = Path(settings.log_dir) # Base log directory from settings
-    session_log_dir = get_session_log_directory(log_dir, session_id)
+    base_log_dir = Path(settings.log_dir)
+    session_log_dir = get_session_log_directory(base_log_dir, session_id)
     log_file_path = session_log_dir / "meta.json"
-
-    logger.info(f"Received chat request for session {session_id} from {client_host}")
-    logger.debug(f"Session log directory: {session_log_dir}")
-
-    # --- Language Detection and Translation ---
-    detected_lang = classify_language(user_input)
-    lang_for_processing = detected_lang
-    prompt_for_llm = user_input # Default to original input
-    if detected_lang == 'ko':
-        logger.info(f"Korean input detected for session {session_id}. Attempting translation to English.")
-        try:
-            translated_prompt = await _translate_text(user_input, 'en', inference_service)
-            if translated_prompt:
-                prompt_for_llm = translated_prompt
-                logger.info(f"Input successfully translated KO -> EN for session {session_id}.")
-                lang_for_processing = 'en'
-            else:
-                logger.error(f"KO -> EN translation failed for session {session_id}. Using original Korean prompt.")
-                lang_for_processing = 'ko' # Keep original language if translation fails
-                # Ensure prompt_for_llm remains the original user_input here
-                prompt_for_llm = user_input 
-        except Exception as e:
-            logger.error(f"Error during input translation call for session {session_id}: {e}", exc_info=True)
-            lang_for_processing = 'ko' # Fallback to original language on error
-            prompt_for_llm = user_input # Ensure original prompt is used on error
-    else:
-         lang_for_processing = detected_lang if detected_lang else 'en'
-         logger.info(f"Input language '{detected_lang}' detected. Proceeding without translation for LLM.")
-         prompt_for_llm = user_input # Explicitly set for non-KO cases
-
-    # --- Log API Request --- 
-    # Log the actual prompt being sent to the inference service
-    logger.info(f"Prompt being sent to process_react_pattern for session {session_id}: '{prompt_for_llm[:100]}...'")
     
-    model_path_info = "Unknown"
-    model_params_info = {}
-    if inference_service and inference_service.model_service:
-        if inference_service.model_loaded:
-             model_path_info = str(inference_service.model_service.model_path)
-             model_params_info = inference_service.model_service.model_params
-        else:
-             model_path_info = str(inference_service.model_service.model_path or settings.model_path or "Not configured")
-             model_params_info = inference_service.model_service.model_params
-    else:
-         logger.warning("InferenceService or ModelService not fully initialized, cannot log model path.")
+    session_log_dir.mkdir(parents=True, exist_ok=True)
 
-    request_log_data = {
-        "timestamp": datetime.now().isoformat(),
-        "event_type": "api_request",
-        "client_host": client_host,
-        "request_body": chat_request.model_dump(exclude_none=True),
-        "language_detected": detected_lang,
-        "prompt_sent_to_llm": prompt_for_llm,
-        "model": { # Add model info here
-             "path": model_path_info,
-             "params": model_params_info
-        }
-    }
-    await async_save_meta_log(session_log_dir, session_id, request_log_data)
+    # Variables to store final results
+    final_response_for_user = "An unexpected error occurred."
+    response_for_user_en = "An unexpected error occurred."
+    error_detail_for_response: Optional[ErrorDetail] = None
 
-    # --- Process Request using InferenceService --- 
     try:
-        react_result = await inference_service.process_react_pattern(
-            initial_prompt=prompt_for_llm,
-            session_id=session_id,
-            session_log_dir=session_log_dir, # Pass correct log dir
-            max_iterations=20
-        )
+        logger.debug(f"Received raw request body: {chat_request}")
 
-        final_answer_llm = react_result.get("response", "Sorry, I could not generate a response.")
-
-        # --- Translate response back if original was Korean ---
-        final_answer_user = final_answer_llm
+        # --- Language Handling (Input) ---
+        user_input = chat_request.text
+        detected_lang = chat_request.language or classify_language(user_input)
+        logger.info(f"Detected language: {detected_lang} for session {session_id}")
+        
+        prompt_for_llm = user_input
         if detected_lang == 'ko':
-            logger.info(f"Original input was Korean. Attempting to translate EN response back to KO for session {session_id}.")
-            try:
-                translated_response = await _translate_en_to_ko(final_answer_llm, inference_service)
-                if translated_response:
-                    final_answer_user = translated_response
-                    logger.info(f"Response successfully translated EN -> KO for session {session_id}.")
-                else:
-                    logger.error(f"EN -> KO translation failed for session {session_id}. Returning original English response.")
-                    # final_answer_user remains final_answer_llm (English)
-            except Exception as e:
-                logger.error(f"Error during response translation call for session {session_id}: {e}", exc_info=True)
-                # final_answer_user remains final_answer_llm (English)
-        # If input was not KO, final_answer_user remains the English final_answer_llm
+            prompt_for_llm = await _translate_text(user_input, 'en', 'ko', inference_service)
 
-        # --- Log API Response --- 
-        response_log_data = {
-            "timestamp": datetime.now().isoformat(),
-            "event_type": "api_response",
-            "status_code": 200,
-            "response_body": { # Structure matches ChatResponse
-                 "response": final_answer_user,
-            }
+        # --- Initial Logging ---
+        initial_meta = {
+            "session_id": session_id,
+            "start_time": datetime.now().isoformat(),
+            "initial_request": user_input,
+            "language_detected": detected_lang,
+            "model_info": { 
+                "name": Path(settings.model_path).name if settings.model_path else "unknown",
+                "path": settings.model_path,
+                "parameters": { "n_ctx": settings.n_ctx, "gpu_layers": settings.gpu_layers }
+            },
+            "iterations": [],
+            "errors": [],
+            "request_timestamp": datetime.now().isoformat(),
         }
-        await async_save_meta_log(session_log_dir, session_id, response_log_data)
+        await async_save_meta_log(session_log_dir, {"event_type": "api_request", **initial_meta}, session_id)
 
-        # --- Return Response --- 
-        return ChatResponse(
-            response=final_answer_user,
-            log_session_id=session_id,
-            log_path=str(log_file_path)
-        )
+        # --- ReAct Pattern Processing ---
+        try:
+            result = await inference_service.process_react_pattern(
+                initial_prompt=prompt_for_llm,
+                session_id=session_id,
+                session_log_dir=session_log_dir,
+            )
+            
+            if "error" in result:
+                # ReAct processing error
+                logger.error(f"ReAct process failed for session {session_id}: {result['error']}")
+                error_detail_for_response = ErrorDetail(
+                    code=500,
+                    message="ReAct processing failed",
+                    details=result.get("error")
+                )
+                response_for_user_en = f"Error processing your request: {error_detail_for_response.details}"
+                await async_save_meta_log(
+                    session_log_dir,
+                    {"errors": [f"{error_detail_for_response.message}: {error_detail_for_response.details}"], "event_type": "react_error"},
+                    session_id,
+                    merge=True
+                )
+            else:
+                # ReAct processing successful
+                response_for_user_en = result.get("response", "No response generated.")
+                error_detail_for_response = None # No error
 
-    except HTTPException as http_exc:
-        error_log_data = {
-            "timestamp": datetime.now().isoformat(),
-            "event_type": "api_error",
-            "error_details": {
-                "type": "HTTPException",
-                "status_code": http_exc.status_code,
-                "detail": http_exc.detail
-            }
-        }
-        await async_save_meta_log(session_log_dir, session_id, error_log_data)
-        raise http_exc
-
+        except Exception as react_exc:
+            logger.error(f"Unhandled error during ReAct processing for session {session_id}: {react_exc}", exc_info=True)
+            error_detail_for_response = ErrorDetail(
+                code=500,
+                message="Internal server error during ReAct processing",
+                details=str(react_exc)
+            )
+            response_for_user_en = f"Sorry, an error occurred: {error_detail_for_response.details}"
+            await async_save_meta_log(
+                session_log_dir,
+                {"errors": [f"Unhandled ReAct error: {str(react_exc)}"], "event_type": "unhandled_react_error"},
+                session_id,
+                merge=True
+            )
+            
     except Exception as e:
-        logger.error(f"Unhandled error during chat processing for session {session_id}: {e}", exc_info=True)
-        error_details_trace = traceback.format_exc()
-        error_log_data = {
-            "timestamp": datetime.now().isoformat(),
-            "event_type": "api_error",
-            "error_details": {
-                "type": "UnhandledException",
-                "message": str(e),
-                "traceback": error_details_trace
-            }
-        }
-        await async_save_meta_log(session_log_dir, session_id, error_log_data)
-
-        return JSONResponse(
-            status_code=500,
-            content=ChatResponse(
-                response="An unexpected error occurred. Please try again later.",
-                error=ErrorDetail(code=500, message="Internal Server Error"),
-                log_session_id=session_id,
-                log_path=str(log_file_path)
-            ).model_dump(exclude_none=True)
+        logger.error(f"Unhandled error in chat endpoint for session {session_id}: {e}", exc_info=True)
+        error_detail_for_response = ErrorDetail(
+            code=500,
+            message="Internal server error",
+            details=str(e)
         )
+        response_for_user_en = f"Sorry, an unexpected error occurred: {error_detail_for_response.details}"
+        try:
+            await async_save_meta_log(
+                session_log_dir,
+                {"errors": [f"Unhandled endpoint error: {str(e)}"], "event_type": "unhandled_endpoint_error"},
+                session_id,
+                merge=True
+            )
+        except Exception as log_err:
+            logger.error(f"Failed to log unhandled endpoint error for session {session_id}: {log_err}")
 
-# --- Health Endpoint (from status.py) --- 
+    # --- Final Response Translation (if needed) ---
+    final_response_for_user = response_for_user_en
+    if detected_lang == 'ko':
+        logger.info(f"Translating final EN response back to Korean for session {session_id}: {response_for_user_en[:100]}...")
+        try:
+            translated_response = await _translate_text(response_for_user_en, 'ko', 'en', inference_service)
+            if translated_response:
+                final_response_for_user = translated_response
+                logger.info(f"Response translated EN -> KO for session {session_id}")
+            else:
+                logger.warning(f"EN -> KO translation failed for final response. Returning English for session {session_id}")
+        except Exception as trans_e:
+            logger.error(f"Error during final response translation for session {session_id}: {trans_e}", exc_info=True)
+
+    # --- Final Logging --- 
+    logger.debug(f"Final response content being logged for session {session_id}: {final_response_for_user[:100]}...")
+    final_event_data = {
+        "event_type": "api_response",
+        "response_body": final_response_for_user, 
+        "timestamp": datetime.now().isoformat()
+    }
+    try:
+        await async_save_meta_log(session_log_dir, final_event_data, session_id, merge=True)
+    except Exception as log_err:
+         logger.error(f"Failed to save final api_response log for session {session_id}: {log_err}")
+
+    # --- Return Response --- 
+    return ChatResponse(
+        response=final_response_for_user,
+        error=error_detail_for_response, 
+        log_session_id=session_id,
+        log_path=str(log_file_path) if log_file_path.exists() else None,
+        detected_language=detected_lang
+    )
+
 @api_router.get("/health", response_model=HealthResponse, tags=["Status"])
 async def health_check(
     request: Request,
-    mcp_service: MCPService = Depends(get_mcp_service), # 의존성 주입 사용
-    inference_service: InferenceService = Depends(get_inference_service), # 의존성 주입 사용
-    # settings: Settings = Depends(get_settings) # 제거 (필요 시 서비스 통해 접근)
+    mcp_service: MCPService = Depends(get_mcp_service),
+    inference_service: InferenceService = Depends(get_inference_service),
 ):
     """
-    애플리케이션의 상태 (모델 로딩, MCP 서버 연결 등)를 확인합니다.
+    Check the health/status of the application, including model loading status
+    and available MCP servers.
     """
-    # 클라이언트 IP 주소 가져오기
-    client_host = request.client.host if request.client else "unknown"
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    real_ip = request.headers.get("X-Real-IP")
+    if not inference_service or not inference_service.model_service:
+        raise HTTPException(status_code=500, detail="InferenceService or ModelService not initialized")
     
-    if forwarded_for:
-        client_host = forwarded_for.split(",")[0].strip()
-    elif real_ip:
-        client_host = real_ip
-        
-    logger.info(f"GET /health request received from {client_host}")
-
-    # 서비스 인스턴스는 Depends로 주입받음 (request.app.state 제거)
-    # mcp_service: MCPService = request.app.state.mcp_service
-    # inference_service: InferenceService = request.app.state.inference_service
-
-    # Check model status using model_loaded attribute
-    model_path_str = "Unknown"
-    model_exists = False
-    if inference_service and inference_service.model_service and inference_service.model_service.model_path:
-         model_path_obj = Path(inference_service.model_service.model_path)
-         model_path_str = str(model_path_obj)
-         model_exists = model_path_obj.exists()
-    elif settings.model_path: # Fallback to settings if service not fully ready
-         model_path_obj = Path(settings.model_path)
-         model_path_str = str(model_path_obj)
-         model_exists = model_path_obj.exists()
+    model_path = inference_service.model_service.model_path
+    model_exists = Path(model_path).exists() if model_path else False
+    model_loaded = inference_service.model_service.model_loaded if hasattr(inference_service.model_service, 'model_loaded') else False
     
-    model_loaded_status = inference_service.model_loaded if inference_service else False
-
-    # MCP 서버 목록 가져오기 (get_running_servers 사용)
-    running_servers = []
-    if mcp_service:
-        try:
-            running_servers = mcp_service.get_running_servers() # get_active_servers -> get_running_servers
-        except Exception as e:
-             logger.error(f"Error getting running MCP servers during health check: {e}", exc_info=True)
-             
+    try:
+        mcp_servers = mcp_service.list_servers() if mcp_service else []
+    except Exception as e:
+        logger.error(f"Error listing MCP servers in health check: {e}", exc_info=True)
+        mcp_servers = []
+    
     return HealthResponse(
-        status="OK" if mcp_service and inference_service and model_loaded_status else "PARTIALLY_UNAVAILABLE", # 모델 로드 상태 반영
-        model_loaded=model_loaded_status,
-        model_path=model_path_str,
+        status="ok" if model_loaded else "model_not_loaded",
+        model_loaded=model_loaded,
+        model_path=model_path,
         model_exists=model_exists,
-        mcp_servers=running_servers, # 실행 중인 서버 목록 반환
-        version="0.1.0" 
+        mcp_servers=mcp_servers,
+        version=settings.api_version # Use settings directly
     ) 
