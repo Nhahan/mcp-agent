@@ -1,0 +1,36 @@
+# react_output.gbnf Grammar to enforce ReAct JSON structure
+
+# Root must be a JSON object matching our ReAct structure
+root ::= ResponseObject
+
+# Define the main object structure
+ResponseObject ::= "{" ws Members ws "}"
+
+# Define the core members sequence
+# Requires "is_final", "thought", and then EITHER "answer" OR ("tool_name" + "arguments")
+Members ::= IsFinalMember ws "," ws ThoughtMember ws ( ( "," ws AnswerMember ) | ( "," ws ToolNameMember ws "," ws ArgumentsMember ) )
+
+# Define individual members
+IsFinalMember ::= "\"is_final\"" ws ":" ws JsonBoolean
+ThoughtMember ::= "\"thought\"" ws ":" ws JsonString
+AnswerMember ::= "\"answer\"" ws ":" ws JsonString
+ToolNameMember ::= "\"tool_name\"" ws ":" ws JsonString
+ArgumentsMember ::= "\"arguments\"" ws ":" ws JsonObject # Arguments value MUST be a JSON object
+
+# --- Standard JSON components ---
+
+JsonObject ::= "{" ws ( JsonMember ( "," ws JsonMember )* )? ws "}"
+JsonMember ::= JsonString ws ":" ws JsonValue
+JsonArray ::= "[" ws ( JsonValue ( "," ws JsonValue )* )? ws "]"
+JsonValue ::= JsonString | JsonNumber | JsonObject | JsonArray | JsonBoolean | JsonNull
+
+# Basic JSON types
+JsonString ::= "\"" ( EscapedChar | [^"\\\\] )* "\"" ws # Added ws after string
+EscapedChar ::= "\\\\" ( ["\\\\/bfnrt] | "u" Hex Hex Hex Hex )
+Hex ::= [0-9a-fA-F]
+JsonNumber ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )? ws # Added ws after number
+JsonBoolean ::= ("true" | "false") ws # Added ws after boolean
+JsonNull ::= "null" ws # Added ws after null
+
+# Whitespace definition
+ws ::= ([ \t\n]*)

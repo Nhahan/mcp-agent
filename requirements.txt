@@ -1,25 +1,12 @@
-# 기본 웹 프레임워크 및 설정
 fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
-
-# HTTP 클라이언트
 httpx
-
-# MCP 관련 (실행 시점에 필요한 의존성은 mcp.json 참고)
-
-# LLM 추론 (GGUF)
 llama-cpp-python
-
-# 기타 유틸리티
 python-dotenv
-huggingface-hub # 모델/토크나이저 다운로드용
-
-# Watchdog (소스 변경 감지용)
+huggingface-hub
 watchfiles
-
-# Development/Testing
 pytest
 pytest-asyncio
-jsonschema # Added for MCP tool argument validation 
+jsonschema 
