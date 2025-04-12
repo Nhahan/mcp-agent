@@ -57,6 +57,46 @@ The AI agent uses the ReAct (Reasoning + Acting) pattern:
 - Logs include user queries, AI responses, tool calls, and observations
 - Logs are stored in `logs/api_logs/{session_id}/meta.json`
 
+## Configuration Management (`app/core/config.py`)
+
+All major configuration parameters are centralized in `app/core/config.py` using Pydantic's `BaseSettings`. This allows configuration via environment variables or a `.env` file.
+
+**Key Configuration Variables:**
+
+*   **Model Settings:**
+    *   `MODEL_FILENAME`: Name of the model file (e.g., `QwQ-LCoT-7B-Instruct-IQ4_NL.gguf`).
+    *   `MODEL_PATH`: Full path to the model file. If not set, calculated from `MODEL_DIR` and `MODEL_FILENAME`.
+    *   `MODEL_DIR`: Directory where models are stored (defaults to `./models` or `/app/models` in Docker).
+    *   `N_CTX`: Model context window size (default: 32768).
+    *   `GPU_LAYERS`: Number of layers to offload to GPU (default: -1 for all possible).
+    *   `GRAMMAR_PATH`: Path to the GBNF grammar file (default: `react_output.gbnf`).
+*   **LLM Generation Parameters:**
+    *   `MODEL_MAX_TOKENS`: Max tokens to generate (default: 1024).
+    *   `MODEL_TEMPERATURE`: Sampling temperature (default: 0.7).
+    *   `MODEL_TOP_P`: Top-P sampling nucleus (default: 0.9).
+    *   `MODEL_TOP_K`: Top-K sampling limit (default: 40).
+    *   `MODEL_MIN_P`: Min-P sampling (default: 0.05, model must support).
+*   **ReAct Loop:**
+    *   `REACT_MAX_ITERATIONS`: Maximum number of thought/action cycles (default: 10).
+*   **MCP:**
+    *   `MCP_CONFIG_FILENAME`: Name of the MCP configuration file (default: `mcp.json`).
+    *   `MCP_CONFIG_PATH`: Full path to the MCP config file (calculated).
+*   **Logging:**
+    *   `LOG_LEVEL`: Logging level (e.g., INFO, DEBUG) (default: INFO).
+    *   `LOG_DIR`: Directory for log files (default: `logs`).
+
+**Usage in Code:**
+
+Import the settings object and access attributes directly:
+
+```python
+from app.core.config import settings
+
+# Example usage
+max_iterations = settings.react_max_iterations
+model_path = settings.model_path
+```
+
 ## Development Rules
 
 1. **No Hardcoding of MCP Servers**:
@@ -82,6 +122,44 @@ The AI agent uses the ReAct (Reasoning + Acting) pattern:
 6. **No Test Mocking**:
    - Tests must run against the actual system, not mocked components
    - Tests must not be skipped and should reflect real production scenarios
+
+7. **Do Not Check Model Status in Translation**: 
+   - Translation functions (e.g., `_translate_en_to_ko`) should **not** check the model's loading status. `ModelService` is responsible for managing its own state. Rely on `ModelService` to handle requests appropriately or raise errors if it's not ready.
+
+8. **Variable Naming Consistency**:
+   - Always ensure that variable names are consistent throughout the codebase
+   - When a function returns a variable, make sure to use the same name when referring to it in the calling code
+   - Pay special attention to function return values to avoid `NameError` exceptions
+
+9. **Avoid Duplicate Definitions**:
+   - Do not redefine functions or methods within other functions
+   - Import utilities from the appropriate modules instead of redefining them
+   - When modifying methods, scan the entire function for duplicate helper functions
+
+10. **Regular Code Cleanup**:
+   - Regularly scan the codebase for unused imports, variables, and functions
+   - Remove or comment out unused code to improve readability and performance
+   - Use linters and type checkers to identify potential issues before they cause runtime errors
+
+11. **Proper Dependency Injection**:
+   - Never use FastAPI's `Depends` in service class constructors directly
+   - Service classes should import settings directly from `app.core.config`
+   - The application uses singleton patterns for services, with instances created in `lifespan`
+   - Use dependency injection only in API route functions or middleware
+
+12. **Robust Logging Implementation**:
+   - Always use defensive programming techniques when handling data of uncertain structure
+   - Use duck typing and attribute/key access within try-except blocks instead of explicit type checking
+   - Design functions to accept broader types using protocol/interface patterns
+   - Implement graceful fallback strategies for unexpected data structures
+   - When dealing with serialization, ensure proper error handling for non-serializable types
+
+13. **Service Interface Contracts**:
+   - When creating methods that other services depend on, document the method's contract clearly
+   - Maintain backward compatibility when modifying existing service methods
+   - Always implement all expected methods in services that other components depend on
+   - Use descriptive error messages when a required method is missing
+   - Check service interfaces during system startup rather than runtime where possible
 
 ## Model Requirements
 

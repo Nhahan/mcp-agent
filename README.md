@@ -1,4 +1,4 @@
-# MCP Agent - AI Assistant
+# MCP Agent
 
 ![image](https://github.com/user-attachments/assets/ee1b5979-9df5-4c4b-a88f-347e4b09cacb)
 
