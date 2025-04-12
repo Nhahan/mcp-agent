@@ -21,4 +21,5 @@ watchfiles
 
 # Development/Testing
 pytest
-pytest-asyncio 
+pytest-asyncio
+jsonschema # Added for MCP tool argument validation 

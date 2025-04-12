@@ -1,8 +1,9 @@
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import asyncio
+from jsonschema import validate, ValidationError # Import jsonschema
 
 from app.core.config import Settings, get_settings # Import Settings
 from fastapi import Depends # Import Depends
@@ -373,7 +374,8 @@ class MCPService:
             'description': tool_info.get('description', 'No description available'),
             # 추가적인 도구 메타데이터가 있다면 여기에 포함
             'parameters': tool_info.get('parameters', {}),
-            'returnType': tool_info.get('returnType', {})
+            'returnType': tool_info.get('returnType', {}),
+            'inputSchema': tool_info.get('inputSchema', {})
         }
     
     async def execute_tool(self, server_name: str, tool_name: str, arguments: Dict) -> Any:
@@ -390,6 +392,47 @@ class MCPService:
         """
         return await self.call_mcp_tool(server_name, tool_name, arguments)
 
-# Dependency function
-def get_mcp_service(settings: Settings = Depends(get_settings)) -> MCPService:
-     raise NotImplementedError("This function should be overridden in main.py to provide the singleton MCPService instance.") 
+    def validate_tool_arguments(self, server_name: str, tool_name: str, arguments: Dict) -> Tuple[bool, str, Dict]:
+        """Validates the provided arguments against the tool's inputSchema."""
+        logger.debug(f"Validating arguments for tool '{server_name}.{tool_name}'")
+        tool_details = self.get_tool_details(server_name, tool_name)
+
+        schema = tool_details.get('inputSchema')
+
+        if not schema or not isinstance(schema, dict):
+            # If no schema is defined, log a warning and return True (no validation possible)
+            logger.warning(f"No valid inputSchema found for tool '{server_name}.{tool_name}'. Skipping validation.")
+            return True, "Schema not found, validation skipped.", arguments
+
+        try:
+            # Ensure arguments is a dict (it should be, but double-check)
+            if not isinstance(arguments, dict):
+                 raise TypeError("Arguments must be a dictionary.")
+
+            # Perform validation using jsonschema
+            # The `validate` function will raise ValidationError if invalid
+            validate(instance=arguments, schema=schema)
+
+            logger.debug(f"Arguments validated successfully for '{server_name}.{tool_name}' using jsonschema.")
+            return True, "Arguments are valid.", arguments
+
+        except ValidationError as e:
+            # Validation failed
+            # Provide a more informative error message from the validation exception
+            # e.g., "'param_name' is a required property" or "123 is not of type 'string'"
+            error_path = " -> ".join(map(str, e.path)) if e.path else "root"
+            message = f"Validation failed for parameter '{error_path}': {e.message}"
+            logger.warning(f"Validation failed for '{server_name}.{tool_name}': {message}")
+            return False, message, arguments
+
+        except TypeError as e:
+             # Handle cases where arguments themselves are not a dict
+             message = f"Invalid arguments format: {str(e)}"
+             logger.warning(f"Validation failed for '{server_name}.{tool_name}': {message}")
+             return False, message, arguments
+
+        except Exception as e:
+            # Catch other potential errors during validation
+            message = f"An unexpected error occurred during validation: {str(e)}"
+            logger.error(f"Unexpected validation error for '{server_name}.{tool_name}': {e}", exc_info=True)
+            return False, message, arguments

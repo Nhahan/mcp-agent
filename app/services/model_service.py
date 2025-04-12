@@ -94,14 +94,10 @@ class ModelService:
         Returns:
             생성된 텍스트
         """
-        if not self.model_loaded or self.model is None:
-            logger.error("LLM model is not loaded. Cannot generate text.")
-            return "Error: LLM model is not available."
-
         try:
             # Set generation parameters
-            temperature = kwargs.get("temperature", 0.3)
-            max_tokens = kwargs.get("max_tokens", 4096)  # Default to 4K tokens
+            temperature = kwargs.get("temperature", 0.2)
+            max_tokens = kwargs.get("max_tokens", 1024)  # Default to 4K tokens
             top_p = kwargs.get("top_p", 0.9)
             top_k = kwargs.get("top_k", 40)
             repeat_penalty = kwargs.get("repeat_penalty", 1.1)

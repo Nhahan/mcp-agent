@@ -26,20 +26,19 @@ class ParsingError(InferenceError):
     """Error when LLM response parsing fails"""
     pass
 
+# Helper for JSON serialization in _format_observation
+def default_serializer(obj):
+    """Fallback serializer for JSON dumping."""
+    return str(obj)
+
 class InferenceService:
     def __init__(
         self,
         mcp_manager: MCPService,
-        model_path: str,
-        model_params: Dict[str, Any] = None,
+        model_service: ModelService,
     ):
-        self.mcp_manager = mcp_manager  # MCP manager instance
-        
-        # ModelService initialization
-        self.model_service = ModelService(
-            model_path=model_path,
-            model_params=model_params
-        )
+        self.mcp_manager = mcp_manager
+        self.model_service = model_service
         
         # Model load status flag for checking
         self.model_loaded = False
@@ -52,7 +51,7 @@ class InferenceService:
         self.log_dir = None
         self._tools_schema_cache = {}  # Tool schema cache
         
-        logger.info("InferenceService initialized with MCPService")
+        logger.info(f"InferenceService initialized with MCPService and ModelService (model path: {self.model_service.model_path})")
 
         # Regular expression patterns for parsing
         self.json_regex = re.compile(r'```json\s*([\s\S]*?)\s*```')  # Pattern to extract JSON blocks
@@ -67,246 +66,82 @@ class InferenceService:
         if not self.log_dir.exists():
             self.log_dir.mkdir(parents=True, exist_ok=True)
 
-    async def init_model(self):
-        """Initialize the model."""
-        try:
-            result = await self.model_service.load_model()
-            self.model_loaded = result
-            return result
-        except ModelError as e:
-            logger.critical(f"Model initialization failed: {e}")
-            raise InferenceError(str(e)) from e
-
-    async def initialize_model(self):
-        """
-        init_model method wrapper.
-        External API called from main.py and other places.
-        """
-        return await self.init_model()
-
-    async def generate_chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
-        """Generate text using chat-style messages."""
-        if not self.model_loaded:
-            logger.error("LLM model is not loaded. Cannot generate text.")
-            return "Error: LLM model is not available."
-
-        try:
-            return await self.model_service.generate_chat(messages, **kwargs)
-        except Exception as e:
-            logger.error(f"Error during chat generation: {e}", exc_info=True)
-            return "Error: Could not generate chat response from LLM."
-
-    async def shutdown_model(self):
-        """Release LLM resources."""
-        logger.info("Shutting down LLMInterface...")
-        try:
-            await self.model_service.shutdown()
-            self.model_loaded = False
-            logger.info("LLM model resources released successfully.")
-        except Exception as e:
-            logger.error(f"Error during model shutdown: {e}", exc_info=True)
-            
-        await asyncio.sleep(0)
-
-    async def _cache_tool_schemas(self):
-        """Pre-fetch and cache schema for all available tools."""
-        logger.info("Caching tool schemas...")
-        all_tools = self.mcp_manager.get_all_tools()
-        self._tool_schemas = {}
-        for server_name, tools in all_tools.items():
-            for tool_info in tools:
-                tool_key = f"{server_name}.{tool_info['name']}"
-                self._tool_schemas[tool_key] = tool_info.get('inputSchema', {})
-        logger.info(f"Cached schemas for {len(self._tool_schemas)} tools.")
-
-    async def _format_tools_for_prompt(self) -> Dict[str, Any]:
-        """Simplify and return available tool list."""
-        # Get tools directly from MCP service
-        full_tools = self.mcp_manager.get_all_tools() # Full tool information
-        if not full_tools:
-            logger.warning("No tools available from MCP service.")
-            return {} # Return empty dictionary
-        
-        # Create dictionary with simplified tool information
-        simplified_tools = {}
-        for server_name, tools in full_tools.items():
-            simplified_tools[server_name] = {}
-            for tool_name, tool_info in tools.items():
-                # Include only tool name and description
-                simplified_tools[server_name][tool_name] = {
-                    "name": tool_name,
-                    "description": tool_info.get("description", "No description available.")
-                    # Exclude detailed information such as input schema
-                }
-        
-        # Return simplified tool information
-        return simplified_tools
-    
-    async def _get_tool_details(self, server_name: str, tool_name: str) -> Dict[str, Any]:
-        """Return detailed information about a specific tool."""
-        full_tools = self.mcp_manager.get_all_tools()
-        if not full_tools or server_name not in full_tools or tool_name not in full_tools.get(server_name, {}):
-            return {"error": f"Tool {server_name}.{tool_name} not found"}
-        
-        # Return detailed information about the tool
-        return full_tools[server_name][tool_name]
-
     def _parse_llm_action_json(self, llm_output: str, session_id: str = None, iteration: int = None) -> Optional[Dict[str, Any]]:
-        """
-        Extract and parse JSON-formatted actions from LLM output.
-        Handle various incorrect formats as much as possible.
-        
-        Args:
-            llm_output: LLM output text
-            session_id: Session ID for logging
-            iteration: Current iteration number (to handle first iteration differently)
-            
-        Returns:
-            Parsed action dictionary or None if parsing fails
-        """
+        """Parse the LLM's response to extract the action JSON."""
+        if session_id:
+            logger.debug(f"[{session_id}] Raw LLM output for parsing: {llm_output[:500]}{'...' if len(llm_output) > 500 else ''}")
+
         try:
-            # 디버깅을 위한 원본 출력 로깅
-            if session_id:
-                logger.debug(f"[{session_id}] Raw LLM output for parsing: {llm_output[:200]}...")
-            
-            # JSON 직접 추출 시도 - 가장 간단한 방법부터 시도
-            try:
-                # 전체 텍스트가 직접 JSON인지 확인
-                action_json = json.loads(llm_output.strip())
-                if isinstance(action_json, dict):
-                    if session_id:
-                        logger.info(f"[{session_id}] Successfully parsed direct JSON format")
-                    return action_json
-            except json.JSONDecodeError:
-                # 직접 파싱 실패, 계속 진행
-                pass
-                
-            # JSON 블록 추출 (정규식 개선)
-            # 1. ```json ... ``` 형식 우선 시도
+            # Extract potential JSON block
             json_blocks = re.findall(r'```(?:json)?\s*\n?(.*?)\n?```', llm_output, re.DOTALL)
-            
-            # 2. 마커 없는 JSON 객체 추출 시도
-            if not json_blocks:
-                # 중괄호로 감싸진 텍스트 블록 찾기
-                json_blocks = re.findall(r'(\{.*?\})', llm_output, re.DOTALL)
-                if session_id and json_blocks:
-                    logger.info(f"[{session_id}] Found JSON blocks without markers: {len(json_blocks)}")
-            
-            if not json_blocks:
-                if session_id:
-                    logger.warning(f"[{session_id}] Could not find any JSON blocks. Trying to extract from full text.")
-                # 전체 텍스트에서 중괄호 패턴을 한 번 더 찾아봄
-                json_pattern = r'(\{(?:[^{}]|(?:\{(?:[^{}]|(?:\{[^{}]*\}))*\}))*\})'
-                json_blocks = re.findall(json_pattern, llm_output, re.DOTALL)
-                
-            if not json_blocks:
-                if session_id:
-                    logger.warning(f"[{session_id}] Could not find any JSON blocks")
-                return None
-            
-            # Error handling when multiple JSON blocks are found - only one JSON block is allowed
+
+            # Check for multiple JSON blocks
             if len(json_blocks) > 1:
                 if session_id:
-                    logger.warning(f"[{session_id}] Multiple JSON blocks found ({len(json_blocks)})")
-                
-                # 첫 번째 블록을 시도
-                first_json_str = json_blocks[0].strip()
-                try:
-                    action_json = json.loads(first_json_str)
-                    if session_id:
-                        logger.info(f"[{session_id}] Using first JSON block from multiple blocks")
-                    return action_json
-                except json.JSONDecodeError:
-                    pass
-                    
-                # 모든 블록을 시도해보고 파싱되는 첫 번째 블록 사용
-                for i, block in enumerate(json_blocks):
-                    try:
-                        json_str = block.strip()
-                        action_json = json.loads(json_str)
-                        if isinstance(action_json, dict):
-                            if session_id:
-                                logger.info(f"[{session_id}] Successfully parsed JSON block {i+1} of {len(json_blocks)}")
-                            return action_json
-                    except:
-                        continue
-                
-                # 모든 블록이 파싱 실패하면 오류 반환
+                    logger.warning(f"[{session_id}] Multiple JSON blocks found ({len(json_blocks)}). Returning error immediately.")
+                # Return an error action immediately
                 return {
                     "action_type": "error",
-                    "error": f"Multiple JSON blocks found ({len(json_blocks)}). Please provide exactly ONE JSON block.",
+                    "error": f"Parsing Error: Multiple JSON blocks found ({len(json_blocks)}). You MUST provide exactly ONE JSON block in your entire response, enclosed in ```json ... ```.",
                     "original_response": llm_output[:300] + "..." if len(llm_output) > 300 else llm_output
                 }
-            
-            # Process single JSON block
-            json_str = json_blocks[0].strip()
-            
-            # 향상된 JSON 정리 과정
-            # 1. 일반적인 이스케이프 문제 처리
-            cleaned_json_str = json_str
-            
-            if r'\$' in cleaned_json_str:
-                cleaned_json_str = cleaned_json_str.replace(r'\$', '$')
-            
-            # 2. 속성 이름이 따옴표로 둘러싸여 있지 않은 경우 수정
-            try:
-                # 속성 이름 뒤에 콜론이 오는 패턴을 찾아 따옴표로 감싸기
-                # 예: thought: -> "thought":
-                property_regex = re.compile(r'(\n\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)')
-                cleaned_json_str = property_regex.sub(r'\1"\2"\3', cleaned_json_str)
-                
-                # JSON 문자열 처음에 있는 속성도 처리
-                start_property_regex = re.compile(r'^{\s*([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)')
-                cleaned_json_str = start_property_regex.sub(r'{ "\1"\2', cleaned_json_str)
-                
-                if cleaned_json_str != json_str:
-                    logger.info(f"[{session_id}] Fixed unquoted property names in JSON")
-            except Exception as e:
-                logger.warning(f"[{session_id}] Error while fixing property names: {str(e)}")
-                # 실패해도 계속 진행
-                
-            # 3. answer 필드에서 줄바꿈 및 특수 문자 처리
-            try:
-                # 정규 표현식으로 answer 필드 찾기
-                answer_regex = re.compile(r'"answer"\s*:\s*"(.*?)(?<!\\)"(?=,|\s*})', re.DOTALL)
-                answer_match = answer_regex.search(cleaned_json_str)
-                
-                if answer_match:
-                    # answer 필드 내용 가져오기
-                    answer_content = answer_match.group(1)
-                    
-                    # 개행 문자를 공백으로 변환
-                    sanitized_answer = answer_content.replace('\n', ' ').replace('\r', ' ')
-                    
-                    # 연속된 공백을 하나로 합치기
-                    sanitized_answer = re.sub(r'\s+', ' ', sanitized_answer)
-                    
-                    # JSON에서 문제가 될 수 있는 문자 이스케이프 처리
-                    sanitized_answer = sanitized_answer.replace('"', '\\"')
-                    
-                    # 정리된 answer로 교체
-                    cleaned_json_str = cleaned_json_str[:answer_match.start(1)] + sanitized_answer + cleaned_json_str[answer_match.end(1):]
-                    
-                    if sanitized_answer != answer_content:
-                        logger.info(f"[{session_id}] Sanitized answer field content for better JSON parsing")
-            except Exception as e:
-                logger.warning(f"[{session_id}] Error during answer field sanitization: {str(e)}")
-                # 실패해도 계속 진행
-            
-            try:
-                # 다양한 방법으로 파싱 시도
+
+            if len(json_blocks) == 1:
+                json_str = json_blocks[0].strip()
+                if not json_str:
+                    if session_id:
+                         logger.warning(f"[{session_id}] Found an empty JSON block.")
+                    return None # Treat empty block as no valid JSON
+
+                # --- JSON Cleaning Stages ---
+                # 1. Basic cleaning (comments, trailing commas, whitespace)
+                cleaned_json_str_basic = re.sub(r'^//.*?\n', '', json_str, flags=re.MULTILINE)
+                cleaned_json_str_basic = re.sub(r'\s*/\*.*?\*/', '', cleaned_json_str_basic, flags=re.DOTALL)
+                cleaned_json_str_basic = re.sub(r',\s*([\}\]])', r'\1', cleaned_json_str_basic)
+                cleaned_json_str_basic = cleaned_json_str_basic.strip()
+
+                # 2. Clean control characters within string values
+                #    This regex finds strings ("...") and replaces \n, \r, \t within them
+                def clean_control_chars_in_strings(match):
+                    string_content = match.group(1)
+                    # Replace \n, \r, \t with spaces within the matched string content
+                    cleaned_content = re.sub(r'[\n\r\t]', ' ', string_content)
+                    # Replace multiple spaces with a single space
+                    cleaned_content = re.sub(r'\s+', ' ', cleaned_content)
+                    return f'"{cleaned_content}"' # Return the cleaned string with quotes
+
+                try:
+                     # Apply the cleaning only within quoted strings
+                     # This regex is complex: it tries to correctly handle escaped quotes (\") inside strings.
+                     # Pattern: " ( (?: [^"\\] | \\. )* ) "
+                     cleaned_json_str_controls = re.sub(r'"((?:[^"\\]|\\.)*)"', clean_control_chars_in_strings, cleaned_json_str_basic)
+                     if cleaned_json_str_controls != cleaned_json_str_basic:
+                          logger.info(f"[{session_id}] Attempted to clean control characters within JSON string values.")
+                     else:
+                          cleaned_json_str_controls = cleaned_json_str_basic
+
+                except Exception as regex_err:
+                     logger.warning(f"[{session_id}] Regex error during control character cleaning: {regex_err}. Using basic cleaned string.")
+                     cleaned_json_str_controls = cleaned_json_str_basic
+
+
+                # --- JSON Parsing Attempts ---
                 json_parsing_methods = [
-                    lambda: json.loads(json_str),  # 원본 텍스트
-                    lambda: json.loads(cleaned_json_str),  # 기본 정리된 텍스트
-                    lambda: json.loads(re.sub(r'([\{\,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', cleaned_json_str)),  # 강력한 속성 이름 수정
-                    lambda: json.loads(re.sub(r'[\n\r\t]', ' ', cleaned_json_str)),  # 모든 줄바꿈 제거
-                    lambda: json.loads(re.sub(r'\\([^"])', r'\1', cleaned_json_str)),  # 불필요한 이스케이프 제거
+                    # Try the most aggressively cleaned string first (controls cleaned)
+                    lambda: json.loads(cleaned_json_str_controls),
+                    # Fallback to basic cleaned string
+                    lambda: json.loads(cleaned_json_str_basic),
+                    # Fallback to original extracted string
+                    lambda: json.loads(json_str),
+                    # Fallback: replace all newlines globally (might break structure, last resort)
+                    lambda: json.loads(re.sub(r'[\n\r\t]', ' ', cleaned_json_str_basic)),
+                    # Fallback: remove unnecessary escapes globally (might break structure, last resort)
+                    # lambda: json.loads(re.sub(r'\\([^\"])', r'\\1', cleaned_json_str_basic)), # Potentially risky, keep commented
                 ]
-                
+
                 action_json = None
                 last_error = None
-                
-                # 모든 방법 시도
+
                 for i, parse_method in enumerate(json_parsing_methods):
                     try:
                         action_json = parse_method()
@@ -315,113 +150,114 @@ class InferenceService:
                         break
                     except json.JSONDecodeError as e:
                         last_error = e
+                        # Log which method failed for debugging
+                        logger.debug(f"[{session_id}] JSON parsing method {i+1} failed: {e}")
                         continue
-                        
+                    except Exception as e: # Catch other potential errors from lambda
+                         last_error = e
+                         logger.error(f"[{session_id}] Unexpected error during JSON parsing method {i+1}: {e}", exc_info=True)
+                         continue
+
+
                 if action_json is None:
                     if session_id:
-                        logger.warning(f"[{session_id}] All JSON parsing methods failed: {last_error}")
-                    return None
-                    
+                        logger.warning(f"[{session_id}] All JSON parsing methods failed: {last_error}. Original text: {json_str[:200]}...")
+                    # 파싱 실패 시 에러 액션 반환
+                    return {
+                        "action_type": "error",
+                        "error": f"JSON Parsing Error: Failed to parse the JSON block after multiple attempts. Last error: {last_error}. Ensure JSON is valid, especially check for unescaped control characters (like newlines) within string values.",
+                        "original_response": json_str[:300] + "..." if len(json_str) > 300 else json_str
+                    }
+
                 # answer 필드가 지나치게 길면 잘라내기
                 if "answer" in action_json and isinstance(action_json["answer"], str) and len(action_json["answer"]) > 1000:
                     action_json["answer"] = action_json["answer"][:997] + "..."
-                    logger.info(f"[{session_id}] Truncated overly long answer field to 1000 characters")
-                
+                    if session_id:
+                        logger.info(f"[{session_id}] Truncated overly long answer field to 1000 characters")
+
                 # Basic validation
                 if not isinstance(action_json, dict):
                     if session_id:
-                        logger.warning(f"[{session_id}] JSON is not an object")
-                    return None
-                
-                # Check if LLM follows the correct format and modify if necessary
-                action_type = action_json.get("action_type")
-                tool_name = action_json.get("tool_name")
-                
-                # 기본 필드 존재 여부 확인 및 자동 보정 기능 제거
-                if action_type is None:
-                    # 자동 보정하지 않고 오류 반환
-                    if session_id:
-                        logger.warning(f"[{session_id}] Missing required action_type field")
+                        logger.warning(f"[{session_id}] Parsed JSON is not an object/dictionary.")
+                    # 유효하지 않은 JSON 형태 에러 반환
                     return {
                         "action_type": "error",
-                        "error": "Missing required 'action_type' field. Must be 'tool_call' or 'final_answer'.",
+                        "error": "Invalid JSON Format: The parsed content is not a valid JSON object (dictionary).",
                         "original_response": json_str[:300] + "..." if len(json_str) > 300 else json_str
                     }
-                
+
+                # Check if LLM follows the correct format
+                action_type = action_json.get("action_type")
+                if action_type not in ["tool_call", "final_answer"]:
+                    if session_id:
+                        logger.warning(f"[{session_id}] Missing or invalid 'action_type'. Must be 'tool_call' or 'final_answer'. Found: {action_type}")
+                    return {
+                        "action_type": "error",
+                        "error": f"Invalid Action Type: Missing or invalid 'action_type'. It must be either 'tool_call' or 'final_answer'. Found: '{action_type}'.",
+                        "original_response": json_str[:300] + "..." if len(json_str) > 300 else json_str
+                    }
+
                 # 결과 반환
                 return action_json
-                
-            except Exception as e:
+
+            # Handle case with zero blocks
+            else: # len(json_blocks) == 0
                 if session_id:
-                    logger.warning(f"[{session_id}] Error during JSON parsing: {str(e)}")
-                return None
-                
+                    logger.warning(f"[{session_id}] No JSON block found in the response.")
+                # 블록이 없을 경우, LLM이 JSON 형식을 따르지 않은 것으로 간주하고 에러 반환
+                return {
+                    "action_type": "error",
+                    "error": "Formatting Error: No JSON block found in your response. You MUST provide your response (tool call or final answer) inside a single ```json ... ``` block.",
+                    "original_response": llm_output[:300] + "..." if len(llm_output) > 300 else llm_output
+                }
+
         except Exception as e:
+            # Catch any unexpected errors during the parsing process
             if session_id:
                 logger.error(f"[{session_id}] Unexpected error during action parsing: {str(e)}", exc_info=True)
-            return None
+            return {
+                "action_type": "error",
+                "error": f"Internal Server Error: An unexpected error occurred during response parsing: {str(e)}",
+                "original_response": llm_output[:300] + "..." if len(llm_output) > 300 else llm_output
+            }
 
     def _format_observation(self, result: Union[str, Dict, Exception]) -> str:
-        """Format the result of tool execution into a string."""
-        if isinstance(result, Exception):
-            error_message = str(result)
-            # Extract cleaner error message if possible
-            if ":" in error_message:
-                error_message = error_message.split(":", 1)[1].strip()
-            
-            return (
-                "The tool execution resulted in an exception.\n"
-                f"Details: {error_message}\n\n"
-                "Analyze this message to determine what went wrong and how to proceed."
-            )
+        """Format the result of tool execution into a simple string representation."""
+        try:
+            if isinstance(result, Exception):
+                # Extract just the core error message
+                error_message = str(result)
+                # Attempt to get a cleaner message after the first colon if present
+                if ":" in error_message:
+                     parts = error_message.split(":", 1)
+                     if len(parts) > 1 and parts[1].strip():
+                           error_message = parts[1].strip()
+                # Prefix with ERROR: for clarity
+                return f"ERROR: {error_message}"
 
-        if isinstance(result, dict):
-            # Prettify JSON for better readability
-            try:
-                # Format the result as JSON string
-                json_str = json.dumps(result, indent=2, ensure_ascii=False)
-                
-                # Return the result without making assumptions about success/failure
-                return f"Tool execution completed. Result:\n```json\n{json_str}\n```\n\nAnalyze this result carefully to determine your next step."
-            except Exception as e:
-                return f"Tool execution completed but result couldn't be formatted as JSON. Raw result: {str(result)}"
-        
-        if isinstance(result, str):
-            # 파일 내용이나 코드 같은 텍스트는 코드 블록 안에 표시
-            # 파일 내용 패턴 감지 (일반적인 파일 내용은 여러 줄 텍스트이거나 특정 패턴을 가짐)
-            is_file_content = '\n' in result or result.strip().startswith('<!DOCTYPE') or result.strip().startswith('<?xml')
-            
-            # 코드로 보이는 패턴 감지
-            is_code = any(pattern in result for pattern in ['function', 'class', 'def ', 'import ', '<html', '<?php', '// ', '/* ', '#include'])
-            
-            # 파일 내용이나 코드로 판단되면 코드 블록으로 표시
-            if is_file_content or is_code:
-                # 코드 언어 추측
-                lang = ""
-                if result.strip().startswith('<!DOCTYPE') or '<html' in result:
-                    lang = "html"
-                elif result.strip().startswith('<?xml'):
-                    lang = "xml"
-                elif any(pattern in result for pattern in ['function', 'const ', 'var ', '// ']):
-                    lang = "javascript"
-                elif any(pattern in result for pattern in ['def ', 'import ', '# ']):
-                    lang = "python"
-                elif any(pattern in result for pattern in ['<?php']):
-                    lang = "php"
-                elif any(pattern in result for pattern in ['#include', 'int main']):
-                    lang = "cpp"
-                
-                # Format output based on length
-                if len(result) > 2000:
-                    truncated_result = result[:2000] + "...[TRUNCATED due to length]"
-                    return f"Tool execution completed. Result (truncated):\n```{lang}\n{truncated_result}\n```\n\nAnalyze this result carefully for your next step."
-                return f"Tool execution completed. Result:\n```{lang}\n{result}\n```\n\nAnalyze this result carefully for your next step."
+            elif isinstance(result, dict):
+                # Directly return the JSON string representation
+                try:
+                    # Use default_serializer for objects that aren't directly serializable
+                    return json.dumps(result, indent=2, ensure_ascii=False, default=default_serializer)
+                except Exception as e:
+                    logger.warning(f"Failed to serialize dict result to JSON: {e}")
+                    # Fallback to simple string representation
+                    return str(result)
+
+            elif isinstance(result, str):
+                # Return the string directly, truncate if excessively long
+                if len(result) > 3000: # Increased limit slightly
+                    return result[:3000] + "...[TRUNCATED]"
+                return result
             else:
-                # 일반 텍스트는 기존 방식대로 처리
-                if len(result) > 2000:
-                    truncated_result = result[:2000] + "...[TRUNCATED due to length]"
-                    return f"Tool execution completed. Result (truncated):\n{truncated_result}\n\nAnalyze this result carefully for your next step."
-                return f"Tool execution completed. Result:\n{result}\n\nAnalyze this result carefully for your next step."
+                # For any other type, return its string representation
+                 return str(result)
+
+        except Exception as e:
+            # Catch any unexpected error during formatting itself
+            logger.error(f"Error during _format_observation: {str(e)}", exc_info=True)
+            return f"ERROR: Failed to format the observation result ({type(result).__name__})."
 
     # Conversation history management methods
     def get_conversation_history(self, session_id: str) -> List[Dict[str, str]]:
@@ -467,21 +303,12 @@ class InferenceService:
         # Update saved history
         self.conversation_histories[session_id] = history
 
-    def update_system_message(self, role_intro=None, language=None, errors=None):
-        """Update system message with optional role intro and errors."""
-        if role_intro is None:
-            role_intro = "You are an AI assistant that helps with any task. You answer questions and use tools to complete tasks."
-            if language != "ko":
-                role_intro = "You are an AI assistant that helps with any task. You answer questions and use tools to complete tasks."
-                
-        # ... existing code ...
-
     async def process_react_pattern(
         self,
         initial_prompt: str,
         session_id: str,
+        session_log_dir: Path,
         max_iterations: int = 10,
-        log_dir: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Process a chat using ReAct pattern.
@@ -489,23 +316,19 @@ class InferenceService:
         Args:
             initial_prompt: The input text from the user.
             session_id: A unique identifier for the chat session.
+            session_log_dir: Directory to store logs for the session.
             max_iterations: Maximum number of ReAct pattern iterations.
-            log_dir: Directory to store logs. If not provided, logs will be stored in the default directory.
             
         Returns:
             A dictionary containing the final response and metadata.
         """
         if not self.model_loaded:
-            await self.initialize_model()
-            
-        # Setup logging directory - 단일 세션 ID로 통합
-        if log_dir:
-            logs_path = Path(log_dir) / "api_logs" / session_id
-        else:
-            logs_path = Path(self.log_dir) / "api_logs" / session_id
-            
-        logs_path.mkdir(parents=True, exist_ok=True)
-        
+            logger.warning("Model not loaded. Initializing...")
+            initialized = await self.init_model()
+            if not initialized:
+                logger.error("Failed to initialize model during ReAct processing.")
+                return {"response": "Error: Model initialization failed.", "error": "Model init failed"}
+
         # Initialize metadata
         metadata = {
             "timestamp": datetime.now().isoformat(),
@@ -531,9 +354,9 @@ class InferenceService:
             for server_name, server_tools in mcp_tools.items():
                 tools_section += f"\nServer: {server_name}\n"
                 for tool_name, tool_info in server_tools.items():
-                    # Provide only tool names without detailed descriptions initially
-                    tools_section += f"- {tool_name}\n"
-                tools_section += "\nTo use a tool, specify its name with the server prefix (e.g., 'server-name.tool-name').\nDetailed description for each tool will be provided when you decide to use it."
+                    tools_section += f"- {server_name}.{tool_name}\n"
+            tools_section += "\nTo use a tool, specify its full name including the server prefix (e.g., 'server-name.tool-name')."
+            tools_section += "\nDetailed descriptions for tools will be provided if needed."
         else:
             tools_section += "No tools are currently available."
             
@@ -549,8 +372,8 @@ FORMATS - Always use exactly ONE of these:
 ```json
 {{
   "action_type": "tool_call",
-  "thought": "Your detailed step-by-step reasoning including ALL your analysis and plans",
-  "tool_name": "server-name.tool-name", 
+  "thought": "(Your detailed step-by-step reasoning IN ENGLISH including analysis and plans)",
+  "tool_name": "your_server_name.your_tool_name",
   "arguments": {{ "param1": "value1" }}
 }}
 ```
@@ -559,37 +382,40 @@ FORMATS - Always use exactly ONE of these:
 ```json
 {{
   "action_type": "final_answer",
-  "thought": "Your detailed reasoning including what you tried and what you learned",
-  "answer": "Complete answer to user's question"
+  "thought": "(Your detailed reasoning IN ENGLISH including what you tried and learned)",
+  "answer": "(Complete answer to user's question IN ENGLISH)"
 }}
 ```
 
 ⚠️ EXTREMELY CRITICAL RULES:
-• YOU MUST OUTPUT EXACTLY ONE JSON BLOCK PER RESPONSE - NOT TWO, NOT THREE, JUST ONE
-• NEVER INCLUDE BOTH A TOOL CALL AND FINAL ANSWER IN THE SAME RESPONSE
-• CHOOSE EITHER TOOL CALL OR FINAL ANSWER, NEVER BOTH
-• ALL REASONING GOES INSIDE THE "thought" FIELD, NOT OUTSIDE THE JSON
-• NEVER WRITE TEXT LIKE "**Final Answer**" OUTSIDE THE JSON BLOCK
-• NEVER write any explanatory text, reasoning, or planning outside the JSON block
-• PUT ALL YOUR THINKING IN THE "thought" FIELD - IT CAN BE AS LONG AS NEEDED
-• DO NOT REPEAT YOURSELF IN AND OUTSIDE THE JSON - ALL TEXT GOES INSIDE THE JSON
+• **ALL YOUR OUTPUT MUST BE IN ENGLISH.** This includes the 'thought', 'tool_name', 'arguments', and 'answer' fields.
+• YOU MUST OUTPUT EXACTLY ONE JSON BLOCK PER RESPONSE - NOT TWO, NOT THREE, JUST ONE.
+• NEVER INCLUDE BOTH A TOOL CALL AND FINAL ANSWER IN THE SAME RESPONSE.
+• CHOOSE EITHER TOOL CALL OR FINAL ANSWER, NEVER BOTH.
+• ALL REASONING GOES INSIDE THE "thought" FIELD (IN ENGLISH), NOT OUTSIDE THE JSON.
+• NEVER WRITE TEXT LIKE "**Final Answer**" OUTSIDE THE JSON BLOCK.
+• NEVER write any explanatory text, reasoning, or planning outside the JSON block.
+• PUT ALL YOUR THINKING IN THE "thought" FIELD (IN ENGLISH) - IT CAN BE AS LONG AS NEEDED.
+• DO NOT REPEAT YOURSELF IN AND OUTSIDE THE JSON - ALL TEXT GOES INSIDE THE JSON.
+• **CAREFULLY MATCH ARGUMENT NAMES**: Meticulously check the tool's 'Input Schema Properties' and 'Required Parameters' in the feedback. Ensure the argument names you use in the `arguments` object **EXACTLY** match the names specified in the schema's `properties`. Do not invent new argument names.
 
 CRITICAL JSON FORMATTING RULES:
-• STRICT JSON FORMAT IS REQUIRED - Your entire response MUST be valid parseable JSON
-• ALL PROPERTY NAMES MUST BE IN DOUBLE QUOTES - e.g., "property": not property:
-• NEVER use single quotes for property names - only double quotes allowed for keys
-• ALWAYS use double quotes around ALL keys in the JSON, including "thought" and "answer"
-• Keep your "answer" field SHORT and CONCISE - Maximum 500 characters recommended
-• AVOID numbered lists (1., 2., 3.) in JSON values - use commas or bullet points instead
-• DO NOT use NEWLINES (\\n) in the "answer" field - provide a continuous paragraph
-• AVOID special characters in JSON - no quotes within quotes, no backslashes
-• ESCAPE any necessary quotes in values with a backslash: \\"
-• For long responses, put brief conclusion in "answer" field and details in "thought" field
-• If you need to provide a structured response, use simple markdown without complex formatting
+• STRICT JSON FORMAT IS REQUIRED - Your entire response MUST be valid parseable JSON.
+• ALL PROPERTY NAMES MUST BE IN DOUBLE QUOTES - e.g., "property": not property:.
+• NEVER use single quotes for property names - only double quotes allowed for keys.
+• ALWAYS use double quotes around ALL keys in the JSON, including "thought" and "answer".
+• Keep your "answer" field SHORT and CONCISE - Maximum 500 characters recommended.
+• AVOID numbered lists (1., 2., 3.) in JSON values - use commas or bullet points instead.
+• DO NOT use NEWLINES (\n) in the "answer" field - provide a continuous paragraph.
+• AVOID special characters in JSON - no quotes within quotes, no backslashes.
+• ESCAPE any necessary quotes in values with a backslash: \\".
+• For long responses, put brief conclusion in "answer" field and details in "thought" field.
+• If you need to provide a structured response, use simple markdown without complex formatting.
+• **NEVER embed raw JSON strings, complex structures, raw file content, or unescaped quotes/control characters directly inside your "thought" or "answer" string values.** Summarize or rephrase the information as plain text if needed. Make sure the final JSON is always valid.
 
 {tools_section}
 
-Always use server prefix for tool names (e.g., "server-name.tool-name")
+Always use the full server prefix for tool names (example format: 'your_server_name.your_tool_name').
 Carefully analyze tool results in context to determine your next steps."""
         
         # Initialize or update the conversation history for ReAct
@@ -612,7 +438,17 @@ Carefully analyze tool results in context to determine your next steps."""
         if len(conversation_history) <= 1:  # Only has system message
             self.add_to_conversation(session_id, "user", initial_prompt)
             conversation_history = self.get_conversation_history(session_id)
-        
+        elif conversation_history[-1]["role"] != "user":
+             # If the last message wasn't from the user, add the current prompt
+             # This handles cases where a tool was just used
+             self.add_to_conversation(session_id, "user", initial_prompt)
+             conversation_history = self.get_conversation_history(session_id)
+            # else: # If last message was user, assume it's part of the current turn? Or replace?
+            # logger.debug(f"Last message was already user for {session_id}. Not re-adding initial prompt.")
+            # Let's assume the API call always represents a new user turn for now.
+            # If this behavior needs change (e.g. allow multiple user messages), this logic needs update.
+            # For now, we add the prompt only if the history is short or last message != user.
+
         # Record all iterations for logging
         iterations_data = []
         
@@ -622,7 +458,9 @@ Carefully analyze tool results in context to determine your next steps."""
         last_tool_name = None
         last_error = None
         
-        # Main ReAct loop
+        # Maintain failure counts across iterations for specific tool + argument combos
+        repeated_failures = {} # Key: (tool_key, frozenset(arguments.items())), Value: count
+
         for iteration in range(max_iterations):
             metadata["iteration_count"] = iteration + 1
             iteration_data = {
@@ -633,17 +471,17 @@ Carefully analyze tool results in context to determine your next steps."""
                 "action": None,
                 "observation": None,
                 "error": None,
+                "tool_name_requested": None,
+                "arguments_provided": None,
+                "schema_found": None,
+                "schema_content": None,
+                "validation_result": None,
+                "validation_skipped_reason": None,
             }
-            
-            # 연속 같은 도구 사용 실패 감지
-            repeated_tool_failures = {}
-            if 'repeated_tool_failures' in metadata:
-                repeated_tool_failures = metadata['repeated_tool_failures']
-            else:
-                metadata['repeated_tool_failures'] = repeated_tool_failures
             
             # Generate chat response
             try:
+                logger.info(f"[ReAct Info] Iteration {iteration+1} Conversation History: {conversation_history}")
                 llm_response = await self.model_service.generate_chat(conversation_history)
                 logger.info(f"[ReAct] Iteration {iteration+1} LLM Response: {llm_response}")
                 iteration_data["response"] = llm_response
@@ -653,8 +491,14 @@ Carefully analyze tool results in context to determine your next steps."""
                 iteration_data["error"] = error_msg
                 metadata["iterations"].append(iteration_data)
                 
-                # Save current state to meta.json
-                await async_save_meta_log(Path(logs_path), session_id, metadata)
+                # Log this iteration event
+                log_event_data = {
+                    "timestamp": datetime.now().isoformat(),
+                    "event_type": "react_iteration",
+                    "session_id": session_id,
+                    "iteration_data": iteration_data
+                }
+                await async_save_meta_log(session_log_dir, session_id, log_event_data)
                 
                 return {
                     "response": "I'm sorry, AI couldn't generate a response. Please try again later.",
@@ -663,9 +507,6 @@ Carefully analyze tool results in context to determine your next steps."""
             
             # Add LLM response to conversation history
             conversation_history.append({"role": "assistant", "content": llm_response})
-            
-            # Optionally provide tool details if the LLM is trying to use a tool (proactive approach)
-            # await self._provide_tool_details_when_needed(conversation_history, llm_response)
             
             # Parse the LLM's response to identify the action
             action = None
@@ -700,15 +541,16 @@ Carefully analyze tool results in context to determine your next steps."""
                 # Add error message to the history to guide model
                 error_feedback = (
                     f"ERROR: {error_msg}\n\n"
-                    f"I noticed you provided multiple JSON blocks or invalid JSON format. Please remember:\n\n"
-                    f"1. Your ENTIRE response should contain EXACTLY ONE JSON block\n"
-                    f"2. Put ALL your reasoning in the 'thought' field - do not write separate thoughts outside the JSON\n"
-                    f"3. Choose ONE tool to use - do not suggest multiple alternatives\n\n"
-                    f"Example of correct format:\n```json\n"
-                    f'{{"action_type": "tool_call", "thought": "I need to do X because of Y. First I\'ll try this approach. If that fails, I might need to try another approach later.", "tool_name": "server-name.tool-name", "arguments": {{"param1": "value1"}} }}\n'
+                    f"CRITICAL ERROR: Your response was not valid JSON. Common mistakes include:\n"
+                    f"- Missing commas between elements.\n"
+                    f"- Unescaped quotes (\") or control characters (like newlines) inside string values (e.g., in 'thought' or 'answer'). **Do not put raw file content or other complex text directly into string fields without proper escaping or summarization.**\n"
+                    f"- Providing multiple JSON blocks instead of ONE.\n\n"
+                    f"Please carefully correct the JSON format and ensure it contains EXACTLY ONE valid JSON block.\n\n"
+                    f"Example format:\n```json\n"
+                    f'{{"action_type": "tool_call", "thought": "I need to do X because of Y...", "tool_name": "server-name.tool-name", "arguments": {{"param1": "value1"}} }}\n'
                     f"```\n\n"
                     f"OR\n\n```json\n"
-                    f'{{"action_type": "final_answer", "thought": "Based on all the steps I\'ve taken and the results I\'ve seen, I\'ve determined that...", "answer": "The answer to your question is..."}}\n'
+                    f'{{"action_type": "final_answer", "thought": "Based on all the steps...", "answer": "The answer is..."}}\n'
                     f"```"
                 )
                 
@@ -717,8 +559,14 @@ Carefully analyze tool results in context to determine your next steps."""
                 metadata["iterations"].append(iteration_data)
                 error_count += 1
                 
-                # Save current state to meta.json
-                await async_save_meta_log(Path(logs_path), session_id, metadata)
+                # Log this iteration event
+                log_event_data = {
+                    "timestamp": datetime.now().isoformat(),
+                    "event_type": "react_iteration",
+                    "session_id": session_id,
+                    "iteration_data": iteration_data
+                }
+                await async_save_meta_log(session_log_dir, session_id, log_event_data)
                 
                 # Skip to next iteration
                 continue
@@ -727,158 +575,262 @@ Carefully analyze tool results in context to determine your next steps."""
             if action.get("action_type") == "tool_call":
                 tool_name = action.get("tool_name", "")
                 arguments = action.get("arguments", {})
-                
-                # Parse server_name and actual tool_name from the full tool_name
+                arguments_key = frozenset(arguments.items()) # Immutable key for dict
+
+                iteration_data["tool_name_requested"] = tool_name
+                iteration_data["arguments_provided"] = arguments
+
                 server_name = None
                 actual_tool_name = None
-                
+                tool_key = None
+
+                # --- Handle final_answer provided as tool_name ---
+                if tool_name == "final_answer":
+                    error_feedback = "ERROR: Invalid action. Use 'action_type': 'final_answer' for final answers, not 'tool_name': 'final_answer'."
+                    conversation_history.append({"role": "user", "content": error_feedback})
+                    iteration_data["error"] = "Invalid action: final_answer used as tool_name"
+                    metadata["iterations"].append(iteration_data)
+                    # Log iteration event
+                    log_event_data = {
+                        "timestamp": datetime.now().isoformat(),
+                        "event_type": "react_iteration",
+                        "session_id": session_id,
+                        "iteration_data": iteration_data
+                    }
+                    await async_save_meta_log(session_log_dir, session_id, log_event_data)
+                    continue
+
                 if tool_name and "." in tool_name:
-                    # If tool_name contains a dot, split it to get server_name and actual_tool_name
                     parts = tool_name.split(".", 1)
                     server_name = parts[0]
                     actual_tool_name = parts[1]
-                    
-                    # 도구 실행 전에 도구의 정확한 파라미터 정보를 가져와 제공
-                    tool_details = self._get_detailed_tool_info(server_name, actual_tool_name)
-                    tool_schema = await self._get_tool_schema(server_name, actual_tool_name)
-                    
-                    # 해당 도구의 연속 실패 횟수 확인
                     tool_key = f"{server_name}.{actual_tool_name}"
-                    if tool_key in repeated_tool_failures:
-                        repeated_tool_failures[tool_key] += 1
-                    else:
-                        repeated_tool_failures[tool_key] = 1
-                    
-                    # 연속 실패가 3회 이상인 경우 AI에게 다른 접근 방식 제안
-                    if repeated_tool_failures.get(tool_key, 0) >= 3:
-                        logger.warning(f"[ReAct] Tool '{tool_key}' has failed repeatedly ({repeated_tool_failures[tool_key]} times)")
-                        reset_message = (
-                            f"I notice you've tried using '{tool_key}' multiple times with the same parameters, but it's not working.\n\n"
-                            f"Required parameters for this tool: {self._format_required_params(tool_schema)}\n\n"
-                            f"Current parameters you're using: {json.dumps(arguments, indent=2)}\n\n"
-                            f"Consider one of these approaches:\n"
-                            f"1. Try a completely different tool\n"
-                            f"2. Provide a final answer based on what you know so far\n"
-                            f"3. Use the correct parameter names as shown above\n\n"
-                            f"If you continue using this tool, please make significant changes to your approach."
-                        )
-                        conversation_history.append({"role": "user", "content": reset_message})
-                        iteration_data["error"] = f"Repeated tool failure: {tool_key}"
-                        metadata["iterations"].append(iteration_data)
-                        
-                        # 실패 카운터 리셋
-                        repeated_tool_failures[tool_key] = 0
-                        
-                        # Save current state to meta.json
-                        await async_save_meta_log(Path(logs_path), session_id, metadata)
-                        continue
-                    
-                    if tool_schema:
-                        # 파라미터 불일치 감지 및 자동 수정
-                        fixed_arguments = arguments.copy()  # 원본 인수 복사만 하고 수정 없이 사용
-                        
-                        # 파라미터가 수정되었다면 AI에게 알림
-                        if fixed_arguments != arguments:
-                            param_diff = []
-                            for k in set(list(arguments.keys()) + list(fixed_arguments.keys())):
-                                if k not in arguments:
-                                    param_diff.append(f"Added '{k}'")
-                                elif k not in fixed_arguments:
-                                    param_diff.append(f"Removed '{k}'")
-                                elif arguments[k] != fixed_arguments[k]:
-                                    param_diff.append(f"Changed '{k}'")
-                            
-                            param_changes = ", ".join(param_diff)
-                            logger.info(f"[ReAct] Fixed tool arguments: {param_changes}")
-                            
-                            # 변경 내용을 AI에게 알림
-                            info_message = (
-                                f"NOTE: I've adjusted the parameters for '{server_name}.{actual_tool_name}' based on its schema.\n"
-                                f"Changes: {param_changes}\n\n"
-                                f"Required parameters for this tool: {self._format_required_params(tool_schema)}\n\n"
-                                f"Proceeding with corrected parameters."
+
+                    # --- Get Tool Schema and Log ---
+                    tool_schema = await self._get_tool_schema(server_name, actual_tool_name)
+                    schema_found = isinstance(tool_schema, dict) and bool(tool_schema)
+                    iteration_data["schema_found"] = schema_found
+                    iteration_data["schema_content"] = tool_schema if schema_found else None
+                    iteration_data["validation_result"] = None
+                    iteration_data["validation_skipped_reason"] = None
+
+                    # --- Schema-Based Validation or Skip ---
+                    is_valid = True
+                    validation_message = "Schema not found, validation skipped."
+                    validation_failed = False # Flag for failure counting
+
+                    if schema_found:
+                        is_valid, validation_message, _ = self.mcp_manager.validate_tool_arguments(server_name, actual_tool_name, arguments)
+                        iteration_data["validation_result"] = {"is_valid": is_valid, "message": validation_message}
+
+                        if not is_valid:
+                            validation_failed = True # Mark validation as failed
+                            logger.warning(f"[ReAct] Tool argument validation failed for '{tool_key}': {validation_message}")
+                            required_params_str = self._format_required_params(tool_schema)
+                            schema_properties = tool_schema.get('properties', {})
+                            provided_args_str = json.dumps(arguments, indent=2)
+
+                            # --- NEW: More explicit feedback based on parsed errors ---
+                            error_detail = validation_message # Default
+
+                            # Use more specific parsing of jsonschema errors
+                            required_match = re.search(r"'(.+?)' is a required property", validation_message)
+                            additional_match = re.search(r"Additional properties are not allowed \('(.+?)' was unexpected\)", validation_message)
+                            type_match = re.search(r"parameter '(.+?)': .+ is not of type '(\w+)'", validation_message) # Path might be nested
+                            # --- NEW: More explicit feedback based on parsed errors ---
+                            specific_guidance = ""
+                            if required_match:
+                                missing_param = required_match.group(1)
+                                # Check if the AI tried to provide a similar but incorrect name (common mistake)
+                                possible_mistake = None
+                                for provided_arg in arguments.keys():
+                                    # Simple check for common variations (e.g., file_path vs path)
+                                    if missing_param in provided_arg or provided_arg in missing_param:
+                                         possible_mistake = provided_arg
+                                         break
+                                if possible_mistake:
+                                     error_detail = f"You provided the parameter '{possible_mistake}', but the schema requires the parameter named **'{missing_param}'**. Please use the exact name '{missing_param}'."
+                                     specific_guidance = f"Rename the parameter '{possible_mistake}' to '{missing_param}'."
+                                else:
+                                     error_detail = f"You missed the required parameter **'{missing_param}'**. Please include it in the `arguments`."
+                                     specific_guidance = f"Add the required parameter '{missing_param}' to the `arguments` object."
+
+                            elif additional_match:
+                                unexpected_param = additional_match.group(1)
+                                valid_params = list(schema_properties.keys())
+                                error_detail = f"You provided an unexpected parameter **'{unexpected_param}'**. The schema only allows these parameters: {valid_params}. Please remove '{unexpected_param}'."
+                                specific_guidance = f"Remove the unexpected parameter '{unexpected_param}' from the `arguments`."
+                            elif type_match:
+                                param_name = type_match.group(1) # Might be nested path like properties -> address -> street
+                                expected_type = type_match.group(2)
+                                # Try to get the actual provided type if possible
+                                provided_value = arguments.get(param_name) # Simple lookup, might fail for nested
+                                provided_type = type(provided_value).__name__ if provided_value is not None else "unknown"
+                                error_detail = f"The parameter **'{param_name}'** requires a **{expected_type}** value, but you provided a value of type **{provided_type}**. Please provide a value of the correct type."
+                                specific_guidance = f"Ensure the value for '{param_name}' is a {expected_type}."
+                            # Add more specific error parsing if needed...
+                            # --- Feedback Generation End ---
+
+                            error_feedback = (
+                                f"❌ **ERROR: Tool Argument Validation Failed for '{tool_key}'**\n\n"
+                                f"**Reason:** {error_detail}\n\n"
+                                f"**Arguments you provided:**\n```json\n{provided_args_str}\n```\n\n"
+                                f"**Tool Schema Reminder:**\n"
+                                f"- Tool Description: {tool_schema.get('description', 'N/A')}\n"
+                                f"- Input Schema Properties: {json.dumps(schema_properties, indent=2)}\n"
+                                f"- Required Parameters: {required_params_str}\n\n"
+                                f"**ACTION REQUIRED:** {specific_guidance} Correct the `arguments` object in your next JSON response based on the schema and try the tool call again, or choose a different action."
                             )
-                            conversation_history.append({"role": "user", "content": info_message})
-                            arguments = fixed_arguments
-                    
-                    # Validate and fix tool arguments
-                    is_valid, validation_message, fixed_arguments = await self._validate_tool_arguments(server_name, actual_tool_name, arguments)
-                    
-                    # Check for same tool repeated with error
-                    if f"{server_name}.{actual_tool_name}" == last_tool_name and last_error is not None:
-                        consecutive_same_tool_error += 1
+
+                            conversation_history.append({"role": "user", "content": error_feedback})
+                            iteration_data["error"] = f"Argument validation failed: {validation_message}"
+                            metadata["iterations"].append(iteration_data)
+                            # (Log iteration event)
+                            log_event_data = {
+                                "timestamp": datetime.now().isoformat(),
+                                "event_type": "react_iteration",
+                                "session_id": session_id,
+                                "iteration_data": iteration_data
+                            }
+                            await async_save_meta_log(session_log_dir, session_id, log_event_data)
+                            # continue # Skip execution handled below by validation_failed flag
+                        else:
+                            logger.info(f"[ReAct] Tool arguments validated successfully for '{tool_key}'.")
+
+                    else: # Schema not found
+                        iteration_data["validation_skipped_reason"] = "Schema not found"
+                        # (Schema not found warning message logic - keep as is)
+                        logger.warning(f"[ReAct] No schema found for '{tool_key}'. Skipping argument validation.")
+                        tool_details_str = self._get_detailed_tool_info(server_name, actual_tool_name)
+                        schema_warning_feedback = (
+                            f"WARNING: I could not find the input schema (parameter list) for the tool '{tool_key}'.\n"
+                            f"Description: {tool_details_str}\n\n"
+                            f"I will attempt to execute it with the arguments you provided: {json.dumps(arguments)}\n"
+                            f"However, if it fails, you may need to guess the correct arguments based on the description or try calling it with no arguments if that seems appropriate."
+                        )
+                        conversation_history.append({"role": "user", "content": schema_warning_feedback})
+
+
+                    # --- Execute Tool (only if validation passed) ---
+                    observation = None
+                    tool_error = None
+                    execution_failed = False # Flag for failure counting
+
+                    if not validation_failed: # Only execute if validation passed (or was skipped)
+                        try:
+                            # (Existing execution logic - inform LLM, call execute_tool, format observation)
+                            if schema_found:
+                                required_params_str = self._format_required_params(tool_schema)
+                                schema_properties = tool_schema.get('properties', {})
+                                tool_info_message = (
+                                    f"INFO: You requested to call the tool '{tool_key}'. Arguments validated successfully.\n"
+                                    f"Schema Reminder:\n"
+                                    f"Input Schema Properties: {json.dumps(schema_properties, indent=2)}\n"
+                                    f"Required Parameters: {required_params_str}\n\n"
+                                    f"I will now execute the tool with the arguments provided: {json.dumps(arguments)}"
+                                )
+                            else: # Schema was not found
+                                tool_info_message = (
+                                    f"INFO: Attempting to execute tool '{tool_key}' (schema was not found). "
+                                    f"Arguments provided: {json.dumps(arguments)}"
+                                )
+                            if not iteration_data.get("validation_skipped_reason"):
+                                conversation_history.append({"role": "user", "content": tool_info_message})
+                            
+                            logger.info(f"[ReAct {session_id}] Executing tool '{tool_key}' with arguments: {arguments}")
+                            tool_result = await self.mcp_manager.execute_tool(server_name, actual_tool_name, arguments)
+                            observation = self._format_observation(tool_result)
+                            iteration_data["observation"] = observation
+                            logger.info(f"[ReAct {session_id}] Tool execution successful. Result: {observation[:200]}...")
+                            # Reset failure count for this specific tool+args combo on success
+                            failure_key = (tool_key, arguments_key)
+                            if failure_key in repeated_failures:
+                                 del repeated_failures[failure_key]
+
+                        except Exception as e:
+                            execution_failed = True # Mark execution as failed
+                            logger.error(f"[ReAct {session_id}] Tool execution error for '{tool_key}': {str(e)}", exc_info=True)
+                            observation = self._format_observation(e)
+                            tool_error = str(observation)
+                            iteration_data["observation"] = observation
+                            iteration_data["error"] = tool_error
                     else:
-                        consecutive_same_tool_error = 0
-                        last_tool_name = f"{server_name}.{actual_tool_name}"
-                else:
-                    error_feedback = (
-                        f"ERROR: Invalid tool name format: {tool_name}. Must include server name.\n\n"
-                        f"Please use the correct format for tool calls with server name included."
-                    )
-                    conversation_history.append({"role": "user", "content": error_feedback})
-                    iteration_data["error"] = "Invalid tool name format"
-                    metadata["iterations"].append(iteration_data)
+                        # If validation failed, skip execution and set error message for feedback
+                        tool_error = iteration_data["error"] # Use validation error for feedback context
+                        observation = None # No observation if validation failed
+
+                    # --- Handle Repeated Failures ---
+                    # Increment failure count only if validation or execution failed
+                    if validation_failed or execution_failed:
+                         failure_key = (tool_key, arguments_key)
+                         repeated_failures[failure_key] = repeated_failures.get(failure_key, 0) + 1
+                         current_fail_count = repeated_failures[failure_key]
+
+                         # Provide repeated failure warning if count reaches threshold
+                         if current_fail_count >= 3:
+                              logger.warning(f"[ReAct {session_id}] Tool '{tool_key}' with args {arguments} failed {current_fail_count} times consecutively. Adding final guidance.")
+                              required_params_str = self._format_required_params(iteration_data.get("schema_content"))
+                              last_error_msg = iteration_data["error"] # Use the logged error
+                              reset_message = (
+                                   f"NOTICE: Trying to use tool '{tool_key}' with the arguments:\n```json\n{json.dumps(arguments, indent=2)}\n```\n"
+                                   f"has failed {current_fail_count} times in a row.\n"
+                                   f"Last Error: {last_error_msg}\n"
+                                   f"Tool Schema Reminder: Required parameters are {required_params_str}.\n\n"
+                                   f"**STOP trying this specific tool call.** Either:\n"
+                                   f"1. Try the tool '{tool_key}' again but with **significantly different arguments** based on the schema.\n"
+                                   f"2. Try a **completely different tool**.\n"
+                                   f"3. Provide a **final_answer** based on the information you already have."
+                              )
+                              conversation_history.append({"role": "user", "content": reset_message})
+                              iteration_data["error"] += f" (Repeated Failure: {current_fail_count} times)"
+                              # Do not reset counter here, let a future *successful* call reset it.
+
+                    # --- Construct feedback message for LLM ---                    
+                    observation_message_for_llm = ""
+                    if tool_error: # This covers both validation and execution errors
+                         tool_schema_content = iteration_data.get("schema_content")
+                         schema_properties = tool_schema_content.get('properties', {}) if tool_schema_content else {}
+                         required_params_str = self._format_required_params(tool_schema_content) if tool_schema_content else "Unknown (schema not found)"
+
+                         observation_message_for_llm = (
+                             f"ERROR: Executing tool '{tool_key}' failed.\n"
+                             f"Error details: {tool_error}\n\n" # Use formatted error
+                             + (f"Recall the tool's schema:\n"
+                                f"Input Schema Properties: {json.dumps(schema_properties, indent=2)}\n"
+                                f"Required Parameters: {required_params_str}\n\n" if schema_found else # Only show if schema was found
+                                "Tool schema was not found, so requirements are unknown.\n\n")
+                             + f"ACTION REQUIRED: Review the error and schema (if available). Correct the `arguments` and try again, or choose a different action."
+                         )
+
+                    elif observation is not None: # Check observation is not None
+                        observation_message_for_llm = (
+                            f"Result from tool call {tool_key}:\n" # Use tool_key
+                            f"{observation}\n\n"
+                            "Carefully analyze this complete result to determine your next step."
+                        )
+                    else:
+                        # This case should ideally not happen if validation passed and execution was attempted
+                        # But handle it just in case
+                        observation_message_for_llm = f"Tool '{tool_key}' seems to have executed (validation passed), but no specific observation was generated. This might be unexpected."
+                        logger.warning(f"[ReAct {session_id}] No observation generated for {tool_key} after successful validation.")
+
+
+                    if observation_message_for_llm:
+                        conversation_history.append({"role": "user", "content": observation_message_for_llm})
                     
-                    # Save current state to meta.json
-                    await async_save_meta_log(Path(logs_path), session_id, metadata)
-                    
-                    continue
-                
-                # If the same tool fails more than twice, provide a stronger hint
-                if consecutive_same_tool_error >= 2:
-                    error_feedback = (
-                        f"ERROR: You've tried the same tool '{server_name}.{actual_tool_name}' multiple times with errors.\n\n"
-                        f"Last error: {last_error}\n\n"
-                        f"Please try a completely different approach or tool, or if you have enough information, provide a final answer."
-                    )
-                    conversation_history.append({"role": "user", "content": error_feedback})
-                    iteration_data["error"] = error_feedback
-                    metadata["iterations"].append(iteration_data)
-                    
-                    # Save current state to meta.json
-                    await async_save_meta_log(Path(logs_path), session_id, metadata)
-                    
-                    # Reset counter and skip to next iteration
-                    consecutive_same_tool_error = 0
-                    last_error = None
-                    continue
-                
-                # Execute the tool
-                observation = None
-                try:
-                    # Get detailed tool information first to help the model understand how to use it
-                    tool_details = self._get_detailed_tool_info(server_name, actual_tool_name)
-                    tool_details_message = (
-                        f"Before executing tool '{server_name}.{actual_tool_name}', here's important information about it:\n\n"
-                        f"{tool_details}\n\n"
-                        f"Required parameters: {self._format_required_params(tool_schema)}"
-                    )
-                    conversation_history.append({"role": "user", "content": tool_details_message})
-                    
-                    # Execute tool via MCP service
-                    tool_result = await self.mcp_manager.execute_tool(server_name, actual_tool_name, arguments)
-                    observation = self._format_observation(tool_result)
-                    
-                    # 도구 성공 시 연속 실패 카운터 리셋
-                    if tool_key in repeated_tool_failures:
-                        repeated_tool_failures[tool_key] = 0
-                    
-                    logger.info(f"[ReAct] Tool execution result: {observation[:200]}...")
-                except Exception as e:
-                    logger.error(f"[ReAct] Tool execution error: {str(e)}")
-                    observation = self._format_observation(e)
-                    error_count += 1
-                
-                # Add observation to conversation history
-                if observation:
-                    observation_message = (
-                        f"Result from tool call {server_name}.{actual_tool_name}:\n"
-                        f"{observation}\n\n"
-                        "Carefully analyze this complete result to determine if the tool executed successfully and what information you can extract from it."
-                    )
-                    conversation_history.append({"role": "user", "content": observation_message})
-                    iteration_data["observation"] = observation
-            
+                    # If validation or execution failed, continue to next iteration
+                    if validation_failed or execution_failed:
+                         metadata["iterations"].append(iteration_data) # Log the failed iteration
+                         # Define iter_log_event_data here before using it
+                         iter_log_event_data = {
+                             "timestamp": datetime.now().isoformat(),
+                             "event_type": "react_iteration",
+                             "session_id": session_id,
+                             "iteration_data": iteration_data
+                         }
+                         await async_save_meta_log(session_log_dir, session_id, iter_log_event_data)
+                         continue # Go to next iteration
+
             elif action.get("action_type") == "final_answer":
                 final_answer = action.get("answer", "")
                 thought = action.get("thought", "")
@@ -888,6 +840,7 @@ Carefully analyze tool results in context to determine your next steps."""
                 
                 # Return final answer immediately
                 metadata["final_response"] = final_answer
+                iteration_data["action"] = action # Ensure final action is logged
                 metadata["iterations"].append(iteration_data)
                 break
                 
@@ -943,24 +896,30 @@ Carefully analyze tool results in context to determine your next steps."""
             else:
                 # Unknown action type
                 error_feedback = (
-                    f"ERROR: Unknown action type '{action.get('action_type')}'.\n\n"
-                    f"Please use only 'tool_call' or 'final_answer' as the action_type value."
+                    f"ERROR: Unknown action type '{action.get('action_type')}'. Use 'tool_call' or 'final_answer'."
                 )
                 conversation_history.append({"role": "user", "content": error_feedback})
                 iteration_data["error"] = "Unknown action type"
                 metadata["iterations"].append(iteration_data)
                 continue
             
-            # Add iteration data to the list
-            metadata["iterations"].append(iteration_data)
+            # Add iteration data to the list (only if not already added due to error/failure)
+            # The check `if validation_failed or execution_failed:` above handles appending on failure
+            if not iteration_data.get("error"):
+                 metadata["iterations"].append(iteration_data)
             
-            # Save intermediate state after each iteration
-            await async_save_meta_log(Path(logs_path), session_id, metadata)
+            # Log iteration data using the central async function
+            # (The check above prevents double logging on failure)
+            if not iteration_data.get("error"):
+                await async_save_meta_log(session_log_dir, session_id, {
+                    "timestamp": datetime.now().isoformat(),
+                    "event_type": "react_iteration",
+                    "session_id": session_id,
+                    "iteration_data": iteration_data
+                })
             
-            # Trim conversation history if it gets too long
-            if len(conversation_history) > self.max_history_length:
-                # Keep the system message and the most recent messages
-                conversation_history = [conversation_history[0]] + conversation_history[-(self.max_history_length-1):]
+            # Check conversation history length and trim if necessary
+            self.trim_conversation_history(session_id)
         
         # If we reached max iterations without a final answer, use the last response
         if final_answer is None:
@@ -969,42 +928,13 @@ Carefully analyze tool results in context to determine your next steps."""
             metadata["final_response"] = final_answer
         
         # Save final state
-        await async_save_meta_log(Path(logs_path), session_id, metadata)
+        await async_save_meta_log(session_log_dir, session_id, metadata)
         
         # Return the final result
         return {
             "response": final_answer,
             "metadata": metadata
         }
-
-    def _format_full_response(self, iterations_history: List[Dict[str, Any]]) -> str:
-        """Format the iterations history into a readable full response."""
-        full_response = []
-        
-        for iteration in iterations_history:
-            response = iteration.get("response", "")
-            observation = iteration.get("observation", "")
-            
-            full_response.append(response)
-            if observation:
-                full_response.append(f"Observation: {observation}")
-        
-        return "\n\n".join(full_response)
-
-    async def generate(self, prompt: str, **kwargs) -> str:
-        """Generate text using LLM. (Text prompt style)"""
-        if not self.model_loaded:
-            logger.error("LLM model is not loaded. Cannot generate text.")
-            return "Error: LLM model is not available."
-
-        logger.debug(f"Generating text for prompt (last 500 chars): ...{prompt[-500:]}")
-        
-        try:
-            # ModelService의 generate_text 메서드 사용
-            return await self.model_service.generate_text(prompt, **kwargs)
-        except Exception as e:
-            logger.error(f"Error during text generation: {e}", exc_info=True)
-            return "Error: Could not generate text from LLM."
 
     # More detailed tool information for when a tool is selected
     def _get_detailed_tool_info(self, server_name: str, tool_name: str) -> str:
@@ -1033,127 +963,6 @@ Carefully analyze tool results in context to determine your next steps."""
                 result += f"Example {i}:\n```json\n{example_str}\n```\n\n"
         
         return result
-
-    # Add a new method to provide tool details when needed
-    async def _provide_tool_details_when_needed(self, conversation_history: List[Dict[str, str]], llm_response: str) -> None:
-        """Analyze LLM response to see if it's trying to use a tool, and if so, provide details."""
-        # Extract JSON from response
-        json_match = self.json_regex.search(llm_response)
-        if not json_match:
-            return
-        
-        try:
-            # Parse JSON to check if it's a tool call
-            json_str = json_match.group(1).strip()
-            action_json = json.loads(json_str)
-            
-            # Check if it's a tool call
-            if action_json.get("action_type") == "tool_call":
-                tool_name = action_json.get("tool_name", "")
-                
-                # Parse server_name and actual_tool_name
-                if tool_name and "." in tool_name:
-                    parts = tool_name.split(".", 1)
-                    server_name = parts[0]
-                    actual_tool_name = parts[1]
-                    
-                    # Get detailed tool information
-                    tool_details = self._get_detailed_tool_info(server_name, actual_tool_name)
-                    
-                    # Add tool details to conversation history
-                    tool_details_message = f"Here is detailed information about this tool. Please review the parameters and format:\n\n{tool_details}"
-                    conversation_history.append({"role": "user", "content": tool_details_message})
-                    
-                    logger.info(f"[ReAct] Provided detailed information for tool: {tool_name}")
-        except Exception as e:
-            logger.warning(f"[ReAct] Error providing tool details: {str(e)}")
-            # Continue without providing details 
-
-    async def _validate_tool_arguments(self, server_name: str, tool_name: str, arguments: Dict) -> Tuple[bool, Optional[str], Optional[Dict]]:
-        """Validate tool arguments against schema."""
-        try:
-            # 1. 도구 스키마 가져오기
-            schema = await self._get_tool_schema(server_name, tool_name)
-            if not schema:
-                return False, None, f"Schema not found for tool '{server_name}.{tool_name}'"
-                
-            # 2. 스키마 검증 전에 인수 수정 시도
-            fixed_args = arguments.copy()  # 원본 인수 복사만 하고 수정 없이 사용
-                
-            # 3. 필수 파라미터 확인
-            missing_params = []
-            required_params = schema.get("required", [])
-            properties = schema.get("properties", {})
-            
-            for param in required_params:
-                if param not in fixed_args or fixed_args[param] is None:
-                    missing_params.append(param)
-                    
-            if missing_params:
-                # 오류 메시지 생성
-                error_msg = f"Missing required parameter(s) for '{server_name}.{tool_name}': {', '.join(missing_params)}\n\n"
-                error_msg += "Required parameters:\n"
-                for param in required_params:
-                    param_info = properties.get(param, {})
-                    param_type = param_info.get("type", "string")
-                    param_desc = param_info.get("description", "No description available")
-                    error_msg += f"- {param}: {param_type} - {param_desc}\n"
-                
-                return False, error_msg, None
-                
-            # 4. 타입 검증 (간단한 검증)
-            # TODO: 더 상세한 JSON 스키마 검증 구현
-            
-            return True, None, fixed_args
-            
-        except Exception as e:
-            logger.error(f"Error validating tool arguments: {str(e)}")
-            return False, f"Error validating arguments: {str(e)}", None
-
-    def _process_tool_validation_error(
-        self, 
-        server_name: str, 
-        tool_name: str, 
-        error_msg: str, 
-        conversation: List[Dict],
-        metadata: Dict
-    ) -> None:
-        """Process tool validation error and add helpful feedback."""
-        logger.warning(f"Tool validation error for {server_name}.{tool_name}: {error_msg}")
-        
-        # 도구 상세 설명 가져오기
-        tool_details = self._get_detailed_tool_info(server_name, tool_name)
-        
-        # JSON 파싱 에러 처리
-        if "Expecting property name" in error_msg or "Invalid JSON" in error_msg:
-            feedback = (
-                f"Invalid JSON format was used for tool call. "
-                f"All property names and string values within the JSON block must be wrapped in double quotes (\")."
-            )
-            
-        # 요구되는 파라미터 누락 처리
-        elif "Missing required parameter" in error_msg:
-            feedback = error_msg  # 이미 상세한 메시지가 생성됨
-            
-        # 기타 검증 오류
-        else:
-            feedback = error_msg
-        
-        # 도구 설명을 피드백에 추가
-        feedback += f"\n\n{tool_details}\n\n"
-        feedback += "위 도구 정보를 참고하여 올바른 매개변수로 다시 시도해보세요."
-        
-        # 피드백을 관찰 결과로 대화에 추가
-        self._add_observation_to_conversation(feedback, conversation)
-        
-        # 메타데이터 업데이트
-        if "errors" not in metadata:
-            metadata["errors"] = []
-        metadata["errors"].append({
-            "error_type": "tool_validation",
-            "tool": f"{server_name}.{tool_name}",
-            "message": error_msg
-        })
 
     async def _get_tool_schema(self, server_name: str, tool_name: str) -> Optional[Dict]:
         """Get the schema for a specific tool."""
@@ -1202,11 +1011,13 @@ Carefully analyze tool results in context to determine your next steps."""
             param_info.append(f"'{param}' ({param_type}){': ' + param_desc if param_desc else ''}")
         
         return ", ".join(param_info) if param_info else "No required parameters"
-    
-    def _add_observation_to_conversation(self, observation: str, conversation: List[Dict]) -> None:
-        """Add an observation as an assistant message to the conversation."""
-        observation_msg = {
-            "role": "assistant",
-            "content": f"Observation: {observation}"
-        }
-        conversation.append(observation_msg) 
+
+    def trim_conversation_history(self, session_id: str):
+        """Trim conversation history to the maximum allowed length."""
+        history = self.get_conversation_history(session_id)
+        if len(history) > self.max_history_length:
+            # Keep the system message and the most recent messages
+            self.conversation_histories[session_id] = [history[0]] + history[-self.max_history_length+1:]
+        else:
+            # No need to trim
+            pass 
