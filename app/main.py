@@ -76,6 +76,9 @@ project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# Import ModelService
+from app.services.model_service import ModelService, ModelError
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting application lifespan...")
@@ -90,64 +93,79 @@ async def lifespan(app: FastAPI):
     logger.info(f"Logging initialized. Log level: {log_level}, Log directory: {log_dir}")
 
     # --- 서비스 인스턴스 생성 및 dependencies.py 에 설정 --- 
-    # 1. MCPService 생성 및 시작
-    mcp_service = MCPService(settings=settings)
-    await mcp_service.start_servers()
-    set_mcp_service_instance(mcp_service) # dependencies.py 에 설정
-
-    # 2. InferenceService 생성 (MCPService 주입)
-    model_path = settings.model_path
-    model_params = {
-        "n_ctx": settings.n_ctx, 
-        "n_gpu_layers": settings.gpu_layers,
-    }
-    inference_service = InferenceService(
-        mcp_manager=mcp_service, # 로컬 변수 사용
-        model_path=model_path,
-        model_params=model_params
-    )
-    inference_service.set_log_directory(log_dir)
-    set_inference_service_instance(inference_service) # dependencies.py 에 설정
+    model_service = None
+    mcp_service = None
+    inference_service = None
     
-    # --- 의존성 주입 오버라이드 설정 --- 
-    # dependencies.py 에서 가져온 getter 함수 사용
-    app.dependency_overrides[get_mcp_service] = get_mcp_service
-    app.dependency_overrides[get_inference_service] = get_inference_service
-
     try:
-        # --- 시작 작업 ---
-        # 모델 파일 존재 여부 확인
-        model_path = Path(settings.model_path)
-        if not model_path.exists():
-            logger.critical(f"모델 파일을 찾을 수 없습니다: {model_path}")
-            logger.critical(f"필요한 모델 파일을 ./models 디렉토리에 수동으로 다운로드하세요")
-            raise FileNotFoundError(f"필요한 모델 파일을 찾을 수 없습니다: {model_path}")
-        
-        logger.info(f"모델 파일을 찾았습니다: {model_path}")
-        logger.info("LLM 모델 초기화 중...")
-        await inference_service.initialize_model() # 로컬 변수 사용
-        # --- 시작 작업 끝 ---
- 
-        logger.info("애플리케이션 시작 작업이 성공적으로 완료되었습니다.")
+        # 1. ModelService 생성 및 모델 로드
+        logger.info("Initializing ModelService...")
+        model_path = settings.model_path # Get path from settings
+        if not model_path or not Path(model_path).exists():
+             logger.critical(f"Model path not configured or file not found: {model_path}")
+             raise FileNotFoundError(f"Model file not found at path specified in settings: {model_path}")
+             
+        model_params = {
+            "n_ctx": settings.n_ctx, 
+            "n_gpu_layers": settings.gpu_layers,
+        }
+        model_service = ModelService(model_path=model_path, model_params=model_params)
+        logger.info("Loading model...")
+        model_loaded = await model_service.load_model() # Assuming load_model returns bool
+        if not model_loaded:
+             logger.critical("Failed to load the model.")
+             raise ModelError("Model loading failed during application startup.")
+        logger.info("Model loaded successfully.")
+
+        # 2. MCPService 생성 및 시작
+        logger.info("Initializing MCPService...")
+        mcp_service = MCPService(settings=settings)
+        await mcp_service.start_servers()
+        set_mcp_service_instance(mcp_service)
+        logger.info("MCPService started.")
+
+        # 3. InferenceService 생성 (ModelService 및 MCPService 주입)
+        logger.info("Initializing InferenceService...")
+        inference_service = InferenceService(
+            mcp_manager=mcp_service,
+            model_service=model_service # Pass the initialized ModelService
+        )
+        inference_service.set_log_directory(log_dir) # Set log dir if needed
+        inference_service.model_loaded = True # Set model loaded flag explicitly
+        set_inference_service_instance(inference_service)
+        logger.info("InferenceService initialized.")
+
+        # --- 의존성 주입 오버라이드 설정 --- 
+        app.dependency_overrides[get_mcp_service] = lambda: mcp_service
+        app.dependency_overrides[get_inference_service] = lambda: inference_service
+        logger.info("Dependency overrides set.")
+
+        logger.info("Application startup sequence completed successfully.")
+
     except Exception as e:
         logger.critical(f"Fatal error during application startup: {e}", exc_info=True)
-        # 예외를 다시 발생시켜 앱이 종료되도록 함
-        raise
+        # Ensure partial services are cleaned up if possible, though difficult here
+        raise # Re-raise to stop the application
 
     yield # Application runs here
 
     logger.info("Shutting down application lifespan...")
     # --- 종료 작업 --- 
-    # dependencies.py 에서 가져온 인스턴스 변수 사용 (_inference_service_instance)
-    inf_service_to_shutdown = _inference_service_instance
-    mcp_service_to_shutdown = _mcp_service_instance
-    
-    if inf_service_to_shutdown:
+    # Use local variables captured before yield
+    if inference_service and hasattr(inference_service, 'shutdown_model') and callable(inference_service.shutdown_model):
         logger.info("Shutting down Inference Service (releasing model)...")
-        await inf_service_to_shutdown.shutdown_model()
-    if mcp_service_to_shutdown:
+        # InferenceService might not need a specific shutdown if model is handled by ModelService
+        # Consider if ModelService needs a shutdown/release method
+        pass # Assuming ModelService handles resource release if needed
+    
+    if mcp_service:
         logger.info("Shutting down MCP Service...")
-        await mcp_service_to_shutdown.stop_servers()
+        await mcp_service.stop_servers()
+        
+    # Clean up dependency instances (important if not using locals)
+    set_inference_service_instance(None)
+    set_mcp_service_instance(None)
+    logger.info("Dependency instances cleared.")
     # --- 종료 작업 끝 ---
     logger.info("Application shutdown complete.")
 
