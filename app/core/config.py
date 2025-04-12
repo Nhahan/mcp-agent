@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     model_temperature: float = float(os.getenv("MODEL_TEMPERATURE", 0.6))
     model_top_p: float = float(os.getenv("MODEL_TOP_P", 0.95))
     model_top_k: int = int(os.getenv("MODEL_TOP_K", 40))
-    model_min_p: float = float(os.getenv("MODEL_MIN_P", 0))
+    model_min_p: float = float(os.getenv("MODEL_MIN_P", 0.05))
 
     # ReAct 루프 설정
     react_max_iterations: int = int(os.getenv("MAX_ITERATIONS", 10)) # 최대 반복 횟수

@@ -1,6 +1,6 @@
 # MCP Agent
 
-![image](https://github.com/user-attachments/assets/ee1b5979-9df5-4c4b-a88f-347e4b09cacb)
+![iamge](https://github.com/user-attachments/assets/e6d4ccc9-751e-44cf-bd3b-e2b4bd80e500)
 
 ## Introduction
 

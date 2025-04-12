@@ -54,18 +54,13 @@ class MCPClient:
                          await asyncio.sleep(0.1)
                     break # Exit loop if EOF or process terminated
 
-                # 원시 데이터 로깅 추가
-                raw_line_for_log = line_bytes.decode(errors='replace').strip() # 로깅용 디코딩 (오류시 대체 문자)
-                logger.debug(f"Received raw bytes from '{self.name}': {line_bytes[:100]}... ({len(line_bytes)} bytes), Decoded (log only): {raw_line_for_log}")
-                
                 line = line_bytes.decode().strip()
                 if not line:
                     continue # Skip empty lines
 
-                # logger.debug(f"Received from '{self.name}': {line}") # 위에서 로깅하므로 중복 제거 가능
                 try:
                     message = json.loads(line)
-                    logger.debug(f"Parsed JSON message from '{self.name}': {message}") # 파싱 성공 로그 추가
+                    logger.debug(f"Parsed JSON message from '{self.name}': {message}")
                     self._handle_message(message)
                 except json.JSONDecodeError:
                     logger.warning(f"Received non-JSON line from '{self.name}': {line}")
