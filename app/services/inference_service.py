@@ -185,7 +185,6 @@ class InferenceService:
         for i, parse_method in enumerate(parsing_methods):
             try:
                 parsed_dict = parse_method()
-                logger.info(f"{log_prefix} Successfully parsed JSON using method {i+1} (checked for duplicate keys)")
                 break
             except ValueError as ve:
                 if "Duplicate key found" in str(ve):
@@ -295,9 +294,6 @@ class InferenceService:
             validated_action["tool_name"] = tool_name.strip()
             validated_action["arguments"] = arguments if arguments is not None else {} # Default to empty dict if None
 
-        # Log the validated action details separately
-        thought_summary = f"{validated_action['thought'][:50]}..." if validated_action['thought'] else "No thought"
-        logger.info(f"{log_prefix}Successfully parsed and validated action: is_final={validated_action['is_final']}, thought='{thought_summary}'")
         return validated_action
 
     def _format_observation(self, result: Union[str, Dict, Exception]) -> str:
@@ -448,11 +444,7 @@ class InferenceService:
                  continue # Retry loop
 
             # Successfully parsed action
-            iteration_data["action"] = parsed_action # Log the valid action structure
-            # logger.info(f"{log_prefix}Parsed Action: {'is_final': {parsed_action['is_final']}, 'thought': '{parsed_action['thought'][:50]}...'}")
-            # Updated log format to avoid f-string issue
-            thought_summary = f"{parsed_action['thought'][:50]}..." if parsed_action.get('thought') else "No thought"
-            logger.info(f"{log_prefix}Parsed Action: is_final={parsed_action['is_final']}, thought='{thought_summary}'")
+            iteration_data["action"] = parsed_action
 
             # Add thought to conversation history
             self.add_to_conversation(session_id, "assistant", llm_response) # Add the full successful response block
@@ -540,20 +532,29 @@ class InferenceService:
                             f"\n"
                             f"Please review the error, check the tool description, and correct the 'arguments' in your next JSON response. Ensure all required arguments are provided."
                         )
-                        logger.info(f"{log_prefix}Providing simplified feedback to LLM for failed validation.")
                         iteration_data["error"] = validation_error_msg # Log the validation error itself
                     else:
                         # Argument validation passed or skipped, proceed with execution
                         try:
                              tool_result = await self.mcp_manager.execute_tool(server_name, tool_name, arguments)
                              observation = self._format_observation(tool_result)
-                             logger.info(f"{log_prefix}Tool '{tool_name_full}' executed successfully. Observation (truncated): {observation[:200]}...")
+                             logger.info(f"{log_prefix}Tool '{tool_name_full}' executed successfully. Observation: {observation[:200]}...")
                         except Exception as e:
                              error_msg = f"Tool execution failed for '{tool_name_full}': {type(e).__name__}: {e}"
                              logger.error(f"{log_prefix}{error_msg}", exc_info=True)
-                             # Provide schema info in feedback even for execution errors
+                             # Provide schema AND description in feedback for execution errors
+                             tool_info = self.mcp_manager.get_tool_info(server_name, tool_name)
+                             tool_description = tool_info.get('description', 'No description available.') if tool_info else 'Tool description not found.'
                              schema_details = self._get_detailed_tool_info(server_name, tool_name)
-                             observation = f"System Error: {error_msg}. Tool execution failed. Check your arguments against the schema.\n\nTool Schema for '{tool_name_full}':\n{schema_details}"
+                             observation = (
+                                 f"System Error: {error_msg}. Tool execution failed.\n"
+                                 f"\n"
+                                 f"Tool Description: {tool_description}\n"
+                                 f"\n"
+                                 f"Tool Schema for '{tool_name_full}':\n{schema_details}\n"
+                                 f"\n"
+                                 f"Please analyze the error, review the tool description and schema, and decide if you can retry (potentially with corrected arguments) or if you need to try a different approach."
+                             )
                              iteration_data["error"] = error_msg
 
                 # Add the observation to conversation history
@@ -652,6 +653,13 @@ class InferenceService:
             # Add other parameters like stop sequences if needed, maybe from settings too?
             # "stop": ["Observation:"] # Example stop sequence
         }
+
+        # --- Add Grammar if loaded in ModelService --- 
+        if self.model_service.grammar is not None:
+             generation_params["grammar"] = self.model_service.grammar
+             logger.debug(f"{log_prefix}Applying default grammar loaded from ModelService.")
+        else:
+             logger.debug(f"{log_prefix}No default grammar found in ModelService, not applying grammar.")
 
         # Filter out params with default/None values if the model service expects clean args
         # generation_params = {k: v for k, v in generation_params.items() if v is not None} 
@@ -778,7 +786,7 @@ class InferenceService:
 ABSOLUTELY CRITICAL: Your response MUST contain EXACTLY ONE JSON object inside the ```json block. DO NOT output multiple JSON objects.
 ONE ACTION AT A TIME: Perform only ONE step per response - either ONE tool_call OR ONE final_answer. Do not plan multiple steps in one response.
 
-You are an AI assistant. Use tools or provide a final answer step-by-step.
+Be extremely concise. In each step, decide whether to call ONE tool (`is_final: false`) or provide the final answer (`is_final: true` with the `answer` field) to complete the user's request.
 
 **RESPONSE FORMAT:** Your *entire* response MUST be inside ONE ```json ... ``` block containing ONLY ONE JSON object.
 Choose ONE of the following single actions:
@@ -787,9 +795,9 @@ Choose ONE of the following single actions:
 ```json
 {{
   "is_final": false, /* Must be false or omitted for tool call */
-  "thought": "Your reasoning about why this tool is needed and what parameters to use.",
+  "thought": "Your reasoning about why this tool is needed and what parameters to use. CRITICALLY, first outline the specific sequence of steps needed to fulfill the entire user request based on previous actions, then explain the reasoning for *this specific* tool call as the next logical step in that sequence.",
   "tool_name": "server_name.tool_name", /* REQUIRED: The tool to use (e.g., 'calculator.add') */
-  "arguments": {{}}  /* REQUIRED (even if empty): Dictionary of arguments for the tool based on its schema */
+  "arguments": {{}}  /* REQUIRED (even if empty): Dictionary of arguments. CAREFULLY CHECK the tool description below for the REQUIRED PARAMETER NAMES and their types BEFORE making the first call. */
 }}
 ```
 - `answer` key is NOT ALLOWED here.
@@ -798,8 +806,8 @@ Choose ONE of the following single actions:
 ```json
 {{
   "is_final": true, /* Must be true for the final answer */
-  "thought": "Your final reasoning summarizing the process and the answer.",
-  "answer": "The final answer to the user's query." /* REQUIRED: The final, user-facing answer string */
+  "thought": "Your final reasoning summarizing the process and the answer. If the user requested a specific tone or style for the final answer, briefly explain how you are incorporating that.",
+  "answer": "The final answer to the user's query." /* REQUIRED: The final, user-facing answer string, formatted or styled according to the user's request if specified. */
 }}
 ```
 - `tool_name` and `arguments` keys are NOT ALLOWED here.
@@ -812,10 +820,10 @@ Choose ONE of the following single actions:
 5.  **VALID JSON:** Use double quotes for all keys and string values. Escape internal quotes properly (e.g., `\\\\"\\"\\\\"` for a quote inside a string). No trailing commas. Ensure the `answer` string is a valid JSON string value (no unescaped special characters or incorrect quoting).
 6.  **`arguments` IS ALWAYS A DICT:** Even if a tool takes no arguments, provide `\\\\"arguments\\\\": {{}}`.
 7.  **TOOL SCHEMA:** If a tool call fails due to incorrect arguments, you will receive the tool's schema. Use it to correct the `arguments` in your next attempt.
-8.  **PROGRESSIVE REASONING:** Your 'thought' should explain your reasoning for the *current* step based on the request and previous observations.
-9.  **AVOID REPETITION:** Do NOT repeat the same tool call with the exact same arguments if the previous attempt failed (e.g., timeout, error). Analyze the failure and **IMMEDIATELY try a different approach or tool** in the next step.
-10. **STEP-BY-STEP COMPLETION:** Break down complex user requests into smaller, manageable steps. Ensure each step makes clear progress towards the final goal.
-11. **MANDATORY ERROR CORRECTION:** If you receive an observation starting with \\\\"System Error: Tool Input Error...\\\\", you MUST READ the error message and Tool Schema carefully. In your VERY NEXT JSON response, you **MUST** correct the `arguments` based on the schema and error message. DO NOT perform any other action or ignore the error. Your primary task is to fix the tool call.
+8.  **PROGRESSIVE REASONING & CAREFUL FIRST/FINAL STEP:** Your 'thought' should first outline the sequence of steps needed, then explain your reasoning for the *current* step. Before making the *first* call to a tool, carefully review its description. Identify ALL required parameters, ensure you use the EXACT parameter names specified, and provide values of the correct type. **If the current step depends on information from the previous step's observation (e.g., a PID, a filename), explicitly state in your thought that you are extracting and using that information.** Crucially, ensure the first tool call directly addresses the *first logical step* identified in your plan. **When deciding the final step to present information back to the user, strongly prefer using the final answer (`is_final: true` with `answer`) unless a specific tool is absolutely necessary for the presentation format itself. Ensure the `answer` field incorporates any specific tone or style requested by the user.** Aim to get arguments right on the first try.
+9.  **AVOID REPETITION & RE-EVALUATE APPROACH:** Do NOT repeat the same tool call with the exact same arguments if the previous attempt failed. Analyze the failure: If it was an argument error, correct it based on the schema (Rule 11). If the *same call* fails repeatedly despite argument correction, or if you encounter persistent parsing/execution errors, **IMMEDIATELY RE-EVALUATE your approach**. Ask yourself: Is this the right tool? Is it time for the final answer instead? Try a different tool or provide the final answer (`is_final: true`) if appropriate.
+10. **STEP-BY-STEP COMPLETION:** Break down complex user requests into smaller, manageable steps. Execute these steps **sequentially in the order they are requested or logically required**, ensuring each step makes clear progress towards the final goal.
+11. **MANDATORY ERROR CORRECTION (Argument Errors):** If you receive an observation starting with \\\\"System Error: Tool Input Error...\\\\" (specifically indicating an *argument* issue), this is your **TOP PRIORITY**. You MUST READ the error message and the provided **Tool Schema** carefully. **Pay EXTREMELY close attention to the required parameter names and their types listed in the schema.** Compare this to the arguments you attempted. In your **VERY NEXT JSON response**, you **MUST** call the **same tool** again, but with the `arguments` **corrected based ONLY on the schema and error message.** Ensure all required parameter names are correct and all values have the correct type. DO NOT perform any other action or ignore the error until the failed tool call is successfully corrected. Your primary task is to fix the tool call arguments **based SPECIFICALLY on the provided schema** in the observation.
 
 {tools_section}
 
