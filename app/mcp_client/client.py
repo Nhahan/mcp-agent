@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +155,7 @@ class MCPClient:
              self._connected = False
              return False
 
-    async def call(self, method: str, params: Dict[str, Any] | None = None, timeout: float = 10.0) -> Any:
+    async def call(self, method: str, params: Union[Dict[str, Any], None] = None, timeout: float = 10.0) -> Any:
         """Sends a JSON-RPC request and waits for the response."""
         if not self._is_running or not self.process.stdin or self.process.stdin.is_closing():
             raise ConnectionError(f"MCP Client '{self.name}' is not running or stdin is closed.")
@@ -268,6 +268,15 @@ class MCPClient:
     @cached_tools.setter
     def cached_tools(self, value: dict):
         self._cached_tools = value
+        
+    def get_tools_info(self) -> dict:
+        """
+        도구 정보 캐시를 반환합니다. 캐시가 없으면 빈 딕셔너리를 반환합니다.
+        
+        Returns:
+            dict: 캐싱된 도구 정보 (없으면 빈 딕셔너리)
+        """
+        return self._cached_tools or {}
 
     async def get_tools(self, timeout: float = 10.0) -> dict:
         """Fetches the list of available tools from the server using the mcp/discover method."""
