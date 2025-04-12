@@ -25,38 +25,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('model_manager')
 
-PREDEFINED_MODELS = {
-    "gemma-3-1b-it-q4_0": {
-        "repo_id": "google/gemma-3-1b-it-qat-q4_0-gguf",
-        "filename": "gemma-3-1b-it-q4_0.gguf",
-        "tokenizer": "google/gemma-3-1b-it",
-        "description": "Gemma 3 1B-IT 4-bit Quantized (작은 규모, 빠른 추론)"
-    },
-    "gemma-3-4b-it-q4_0": {
-        "repo_id": "google/gemma-3-4b-it-qat-q4_0-gguf",
-        "filename": "gemma-3-4b-it-q4_0.gguf",
-        "tokenizer": "google/gemma-3-4b-it",
-        "description": "Gemma 3 4B-IT 4-bit Quantized (중간 규모, 높은 성능 밸런스)"
-    },
-    "gemma-3-8b-it-q4_0": {
-        "repo_id": "google/gemma-3-8b-it-qat-q4_0-gguf",
-        "filename": "gemma-3-8b-it-q4_0.gguf",
-        "tokenizer": "google/gemma-3-8b-it",
-        "description": "Gemma 3 8B-IT 4-bit Quantized (큰 규모, 고품질)"
-    },
-    "gemma-3-2b-it-q4_0": {
-        "repo_id": "google/gemma-3-2b-it-qat-q4_0-gguf",
-        "filename": "gemma-3-2b-it-q4_0.gguf",
-        "tokenizer": "google/gemma-3-2b-it",
-        "description": "Gemma 3 2B-IT 4-bit Quantized (작은 규모, 고성능 밸런스)"
-    },
-    "gemma3-4b-it-abliterated-q8_0": {
-        "repo_id": "mradermacher/gemma3-4b-it-abliterated-GGUF",
-        "filename": "gemma3-4b-it-abliterated.Q8_0.gguf",
-        "tokenizer": "google/gemma-3-4b-it",
-        "description": "Gemma 3 4B-IT Abliterated 8-bit Quantized"
-    }
-}
+PREDEFINED_MODELS = {}
 
 async def download_model_httpx(url, target_path, headers=None):
     """HTTP 클라이언트를 사용하여 모델을 다운로드합니다."""

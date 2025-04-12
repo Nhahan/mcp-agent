@@ -1,19 +1,17 @@
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import asyncio
-from jsonschema import validate, ValidationError # Import jsonschema
+from jsonschema import validate, ValidationError
 
-from app.core.config import Settings, get_settings # Import Settings
-from fastapi import Depends # Import Depends
+from app.core.config import settings
 from app.mcp_client.client import MCPClient, MCPError
 
 logger = logging.getLogger(__name__)
 
 class MCPService:
-    def __init__(self, settings: Settings = Depends(get_settings)):
-        self.settings = settings
+    def __init__(self):
         self.config_path = Path(settings.mcp_config_path)
         self._mcp_processes: Dict[str, asyncio.subprocess.Process] = {}
         self._mcp_clients: Dict[str, MCPClient] = {}
@@ -171,6 +169,76 @@ class MCPService:
          """Returns a list of names of currently running MCP servers."""
          return [name for name, process in self._mcp_processes.items() if process.returncode is None]
 
+    def list_servers(self) -> list[str]:
+        """Returns a list of all available server names.
+        This combines both configured servers from mcp.json and actively running servers.
+        """
+        # Combine configured and running servers (might be redundant)
+        configured_servers = set(self.get_available_server_names())
+        running_servers = set(self.get_running_servers())
+        return list(configured_servers.union(running_servers))
+
+    def get_server_tools(self, server_name: str) -> Dict[str, Any]:
+        """
+        특정 MCP 서버의 도구 목록을 가져옵니다.
+        
+        Args:
+            server_name: MCP 서버 이름
+            
+        Returns:
+            Dict[str, Any]: 도구 이름을 키로, 도구 정보를 값으로 가지는 딕셔너리
+        """
+        client = self._mcp_clients.get(server_name)
+        if not client:
+            logger.warning(f"Client for MCP server '{server_name}' not found")
+            return {}
+        
+        tools = client.get_tools_info()
+        if not tools:
+            logger.warning(f"No tools found for MCP server '{server_name}'")
+            return {}
+            
+        return tools
+    
+    def get_tool_info(self, server_name: str, tool_name: str) -> Dict[str, Any]:
+        """
+        특정 MCP 서버의 특정 도구 정보를 가져옵니다.
+        
+        Args:
+            server_name: MCP 서버 이름
+            tool_name: 도구 이름
+            
+        Returns:
+            Dict[str, Any]: 도구 정보
+        """
+        server_tools = self.get_server_tools(server_name)
+        if not server_tools or tool_name not in server_tools:
+            logger.warning(f"Tool '{tool_name}' not found in server '{server_name}'")
+            return {}
+            
+        tool_info = server_tools.get(tool_name, {})
+        return {
+            'description': tool_info.get('description', 'No description available'),
+            'input_schema': tool_info.get('inputSchema', {}),
+        }
+        
+    async def get_tool_schema(self, server_name: str, tool_name: str) -> Optional[Dict]:
+        """
+        특정 MCP 서버의 특정 도구 스키마를 가져옵니다.
+        
+        Args:
+            server_name: MCP 서버 이름
+            tool_name: 도구 이름
+            
+        Returns:
+            Optional[Dict]: 도구 스키마 (입력 스키마)
+        """
+        tool_info = self.get_tool_info(server_name, tool_name)
+        if not tool_info:
+            return None
+            
+        return tool_info.get('input_schema')
+
     async def call_mcp_tool(self, server_name: str, tool_name: str, args: dict) -> Any:
         """MCP 서버의 도구를 호출합니다.
         
@@ -221,18 +289,6 @@ class MCPService:
             logger.error(f"MCP 도구 '{server_name}/{tool_name}' 호출 중 예상치 못한 오류 발생: {e}", exc_info=True)
             return {"error": f"예상치 못한 오류: {str(e)}"}
 
-    def is_server_connected(self, server_name: str) -> bool:
-        """Checks if a specific MCP server client is currently connected."""
-        client = self._mcp_clients.get(server_name)
-        if client:
-            try:
-                conn_status = client.is_connected
-                return conn_status
-            except Exception as e:
-                 logger.error(f"Error getting connection status for '{server_name}': {e}")
-                 return False
-        return False
-
     async def _fetch_server_tools(self, server_name: str) -> dict:
         """Fetches and caches the list of tools for a specific server."""
         client = self._mcp_clients.get(server_name)
@@ -263,77 +319,6 @@ class MCPService:
             logger.error(f"Unexpected error fetching tools for '{server_name}': {e}", exc_info=True)
             client.cached_tools = {} # Cache failure (empty)
             return {}
-
-    def get_server_tools(self, server_name: str) -> dict:
-        """Returns the cached list of tools for a specific server."""
-        client = self._mcp_clients.get(server_name)
-        if client:
-            return client.cached_tools
-        else:
-            logger.warning(f"Client '{server_name}' not found when getting cached tools.")
-            return {}
-
-    async def _start_mcp_server_process(self, server_name: str, server_config: dict) -> asyncio.subprocess.Process:
-        """Starts the MCP server process based on configuration."""
-        command = server_config.get('command')
-        args = server_config.get('args', [])
-
-        if not command:
-            raise ValueError(f"'command' not specified for MCP server '{server_name}'")
-
-        try:
-            full_command = [command] + args
-            logger.info(f"Executing command for MCP server '{server_name}': {' '.join(full_command)}")
-            process = await asyncio.create_subprocess_exec(
-                *full_command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            logger.info(f"MCP server '{server_name}' process started with PID: {process.pid}")
-            # Start the stderr reader task
-            self._start_stderr_reader(server_name, process)
-            return process
-        except FileNotFoundError:
-            logger.error(f"Command '{command}' not found for MCP server '{server_name}'. Check your PATH or command spelling.")
-            raise
-        except Exception as e:
-            logger.error(f"Failed to execute command for MCP server '{server_name}': {e}", exc_info=True)
-            raise
-
-    def _start_stderr_reader(self, server_name: str, process: asyncio.subprocess.Process):
-        async def read_stderr():
-            prefix = f"{server_name}-stderr"
-            while process.returncode is None:
-                try:
-                    if process.stderr:
-                        line = await process.stderr.readline()
-                        if not line:
-                            break
-                        logger.info(f"[{prefix}] {line.decode(errors='ignore').strip()}")
-                    else:
-                        await asyncio.sleep(0.1) # stderr이 없으면 잠시 대기
-                except Exception as e:
-                    if process.returncode is None: # 프로세스가 아직 실행 중일 때만 오류 로깅
-                        logger.error(f"Error reading {prefix}: {e}", exc_info=True)
-                    break
-        
-        # 오류 핸들러가 종료될 때까지 기다리지 않고 백그라운드에서 실행
-        asyncio.create_task(read_stderr(), name=f"{server_name}_stderr_reader")
-
-    def get_all_tools(self) -> Dict[str, Dict]:
-        """
-        모든 MCP 서버의 도구 목록을 가져옵니다.
-        
-        Returns:
-            Dict[str, Dict]: 서버 이름을 키로, 도구 정보를 값으로 가지는 딕셔너리
-        """
-        all_tools = {}
-        for server_name in self._mcp_clients.keys():
-            tools = self.get_server_tools(server_name)
-            if tools:
-                all_tools[server_name] = tools
-        return all_tools
     
     def get_all_tool_details(self) -> Dict[str, Dict]:
         """
@@ -436,3 +421,51 @@ class MCPService:
             message = f"An unexpected error occurred during validation: {str(e)}"
             logger.error(f"Unexpected validation error for '{server_name}.{tool_name}': {e}", exc_info=True)
             return False, message, arguments
+
+    async def _start_mcp_server_process(self, server_name: str, server_config: dict) -> asyncio.subprocess.Process:
+        """Starts the MCP server process based on configuration."""
+        command = server_config.get('command')
+        args = server_config.get('args', [])
+
+        if not command:
+            raise ValueError(f"'command' not specified for MCP server '{server_name}'")
+
+        try:
+            full_command = [command] + args
+            logger.info(f"Executing command for MCP server '{server_name}': {' '.join(full_command)}")
+            process = await asyncio.create_subprocess_exec(
+                *full_command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            logger.info(f"MCP server '{server_name}' process started with PID: {process.pid}")
+            # Start the stderr reader task
+            self._start_stderr_reader(server_name, process)
+            return process
+        except FileNotFoundError:
+            logger.error(f"Command '{command}' not found for MCP server '{server_name}'. Check your PATH or command spelling.")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to execute command for MCP server '{server_name}': {e}", exc_info=True)
+            raise
+
+    def _start_stderr_reader(self, server_name: str, process: asyncio.subprocess.Process):
+        async def read_stderr():
+            prefix = f"{server_name}-stderr"
+            while process.returncode is None:
+                try:
+                    if process.stderr:
+                        line = await process.stderr.readline()
+                        if not line:
+                            break
+                        logger.info(f"[{prefix}] {line.decode(errors='ignore').strip()}")
+                    else:
+                        await asyncio.sleep(0.1) # stderr이 없으면 잠시 대기
+                except Exception as e:
+                    if process.returncode is None: # 프로세스가 아직 실행 중일 때만 오류 로깅
+                        logger.error(f"Error reading {prefix}: {e}", exc_info=True)
+                    break
+        
+        # 오류 핸들러가 종료될 때까지 기다리지 않고 백그라운드에서 실행
+        asyncio.create_task(read_stderr(), name=f"{server_name}_stderr_reader")

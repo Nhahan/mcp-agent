@@ -1,15 +1,16 @@
 import logging
-import time
-import os
 import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from pathlib import Path
 
 try:
-    from llama_cpp import Llama  # Using llama-cpp-python
+    from llama_cpp import Llama, LlamaGrammar
 except ImportError:
     Llama = None
+    LlamaGrammar = None
     logging.error("llama-cpp-python library not found. Please install it for LLM features.")
+
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -22,159 +23,154 @@ class ModelService:
     
     def __init__(
         self,
-        model_path: str,
-        model_params: Dict[str, Any] = None,
+        # model_path and model_params will now be primarily determined by settings
+        # They can be overridden via arguments if needed, but default to settings
+        model_path: Optional[str] = None,
+        model_params: Optional[Dict[str, Any]] = None
     ):
         """
-        ModelService 초기화
+        ModelService 초기화. 설정은 주로 app.core.config.settings 에서 가져옵니다.
         
         Args:
-            model_path: 모델 파일 경로
-            model_params: 모델 초기화 매개변수
+            model_path: 모델 파일 경로 (지정되지 않으면 settings.model_path 사용).
+            model_params: 모델 초기화 매개변수 (지정되지 않으면 settings 에서 n_ctx, n_gpu_layers 사용).
         """
-        self.model = None
-        self.model_path = model_path
-        self.model_params = model_params or {}
+        # Use provided path/params or fallback to settings
+        self.model_path = model_path if model_path else settings.model_path
+        
+        if not self.model_path:
+            raise ModelError("Model path is not configured in settings or provided to ModelService.")
+        
+        # Construct model_params from settings if not provided
+        if model_params is None:
+            self.model_params = {
+                "n_ctx": settings.n_ctx, 
+                "n_gpu_layers": settings.gpu_layers
+                # Add other llama-cpp specific init params from settings if needed
+            }
+            logger.info(f"Using model params from settings: {self.model_params}")
+        else:
+            self.model_params = model_params
+            logger.info(f"Using provided model params: {self.model_params}")
+            
+        # Ensure required params are present
+        self.model_context_limit = self.model_params.get("n_ctx", settings.n_ctx) # Fallback to settings default again
+        self.n_gpu_layers = self.model_params.get("n_gpu_layers", settings.gpu_layers)
+        
+        self.model: Optional[Llama] = None
         self.model_loaded = False
+        self.grammar: Optional[LlamaGrammar] = None
+
+        if not Path(self.model_path).exists():
+            logger.error(f"Model file not found at {self.model_path}. Ensure it is downloaded.")
+            # Consider not raising here, but checking model_loaded before use
+            # raise ModelError(f"Model file not found: {self.model_path}")
+            self.model_loaded = False # Explicitly set to false
+            return # Exit init if model file doesn't exist
+
+        # Load Grammar from settings.grammar_path
+        grammar_path_str = settings.grammar_path
+        if grammar_path_str:
+            grammar_path = Path(grammar_path_str)
+            if grammar_path.is_file(): # Check if it's a file
+                try:
+                    self.grammar = LlamaGrammar.from_file(str(grammar_path))
+                    logger.info(f"Successfully loaded grammar from {grammar_path}")
+                except Exception as e:
+                    logger.error(f"Failed to load or parse grammar file {grammar_path}: {e}", exc_info=True)
+                    self.grammar = None
+            else:
+                logger.warning(f"Grammar path specified ({grammar_path}), but it's not a file or doesn't exist.")
+                self.grammar = None
+        else:
+            logger.info("No grammar path specified in settings. Grammar will not be used.")
+            self.grammar = None
         
-        logger.info("ModelService initialized with model path: %s", self.model_path)
-        logger.info("Model parameters: %s", self.model_params)
-        
-        if Llama is None:
-             logger.error("llama-cpp-python is not installed. LLM features will be disabled.")
-    
-    async def load_model(self) -> bool:
-        """
-        모델을 메모리에 로드합니다.
-        
-        Returns:
-            성공 여부 (True/False)
-        """
-        logger.info("Starting model initialization...")
+        # Load the LLM model
         try:
-            from llama_cpp import Llama
-            
-            # 시간 측정 시작
-            start_time = time.time()
-            
-            # 모델 파일 확인
-            if not os.path.exists(self.model_path):
-                error_msg = f"모델 파일을 찾을 수 없습니다: {self.model_path}"
-                logger.critical(error_msg)
-                raise ModelError(error_msg)
+            if Llama is None:
+                raise ModelError("llama-cpp-python is not installed.")
                 
-            # 모델 로드
-            logger.info(f"모델 로드 시작. 경로: {self.model_path}, 매개변수: {self.model_params}")
+            logger.info(f"Loading LLM model from: {self.model_path} with n_ctx={self.model_context_limit}, n_gpu_layers={self.n_gpu_layers}")
             self.model = Llama(
                 model_path=self.model_path,
-                **self.model_params
+                n_ctx=self.model_context_limit, 
+                n_gpu_layers=self.n_gpu_layers,
+                verbose=settings.log_level.upper() == "DEBUG", # Be verbose only in debug mode
             )
-            
-            # 소요 시간 계산 및 로깅
-            elapsed_time = time.time() - start_time
-            logger.info(f"모델 초기화 완료! 소요 시간: {elapsed_time:.2f}초")
-            
-            # 모델 로드 완료 플래그 설정
             self.model_loaded = True
-            
-            return True
+            logger.info("LLM model loaded successfully.")
         except Exception as e:
-            error_msg = f"모델 초기화 중 오류 발생: {str(e)}"
-            logger.critical(error_msg, exc_info=True)
-            raise ModelError(error_msg) from e
+            logger.error(f"Failed to load LLM model from {self.model_path}: {e}", exc_info=True)
+            self.model_loaded = False
 
-    async def generate_chat(self, messages: list, **kwargs) -> str:
-        """
-        LLM을 사용하여 채팅 스타일의 텍스트를 생성합니다.
+    async def generate_chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        generation_params = {
+            "max_tokens": kwargs.get("max_tokens", settings.model_max_tokens),
+            "temperature": kwargs.get("temperature", settings.model_temperature),
+            "top_p": kwargs.get("top_p", settings.model_top_p),
+            "top_k": kwargs.get("top_k", settings.model_top_k),
+            "min_p": kwargs.get("min_p", settings.model_min_p),
+            "stop": kwargs.get("stop", ["</s>", "<|eot_id|>", "<|endoftext|>", "\nObservation:", "\nUSER:", "```"]),
+        }
         
-        Args:
-            messages: 채팅 메시지 목록 (role, content 형식)
-            **kwargs: 생성 매개변수 (temperature, max_tokens 등)
-            
-        Returns:
-            생성된 텍스트
-        """
-        try:
-            # Set generation parameters
-            temperature = kwargs.get("temperature", 0.2)
-            max_tokens = kwargs.get("max_tokens", 1024)  # Default to 4K tokens
-            top_p = kwargs.get("top_p", 0.9)
-            top_k = kwargs.get("top_k", 40)
-            repeat_penalty = kwargs.get("repeat_penalty", 1.1)
-            
-            # Log messages (sensitive information may be present, so log only a part)
-            logger.debug(f"Generating chat completion for {len(messages)} messages")
-            if messages:
-                last_message = messages[-1].get('content', '')
-                logger.debug(f"Last message (first 100 chars): {last_message[:100]}...")
-            
-            # Use chat-style API to generate text
-            start_time = time.time()
-            
-            try:
-                completion_result = await asyncio.to_thread(
-                    self.model.create_chat_completion,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    repeat_penalty=repeat_penalty,
-                    stream=False
-                )
-                
-                end_time = time.time()
-                generation_time = end_time - start_time
-                
-                # Extract response
-                if "choices" in completion_result and completion_result["choices"]:
-                    response_text = completion_result["choices"][0]["message"]["content"]
-                    logger.debug(f"Generated text in {generation_time:.2f}s: {response_text[:512]}...")
-                    return response_text.strip()
+        # Apply grammar ONLY if it's loaded AND not explicitly disabled in kwargs
+        if "grammar" in kwargs:
+                # Allow explicit override (e.g., grammar=None for translation)
+                if kwargs["grammar"] is not None:
+                    generation_params["grammar"] = kwargs["grammar"]
+                    logger.debug("Applying grammar provided in kwargs.")
                 else:
-                    logger.error(f"Unexpected response format from llama-cpp: {completion_result}")
-                    return "Error: Unexpected response format from LLM."
-                    
-            except ValueError as e:
-                if "exceed context window" in str(e):
-                    logger.error(f"Context window exceeded: {e}")
-                    return "Error: Context window size exceeded. Please try a shorter conversation."
-                raise
-                
-        except Exception as e:
-            logger.error(f"Error during chat generation: {e}", exc_info=True)
-            return "Error: Could not generate chat response from LLM."
-    
+                    logger.debug("Grammar explicitly disabled by kwargs=None.")
+        elif self.grammar: # Otherwise, apply the default loaded grammar if it exists
+                generation_params["grammar"] = self.grammar
+                logger.debug("Applying default loaded grammar.")
+        final_params = generation_params
+
+        output: Dict[str, Any] = await asyncio.to_thread(
+                 self.model.create_chat_completion, messages=messages, **final_params
+        )
+        
+        # Extract generated text
+        if output and 'choices' in output and output['choices']:
+                generated_text = output['choices'][0].get('message', {}).get('content', '').strip()
+        else:
+                logger.warning(f"Unexpected output structure from create_chat_completion: {output}")
+                generated_text = ""
+        return generated_text
+
     async def generate_text(self, prompt: str, **kwargs) -> str:
         """
-        단일 프롬프트로 텍스트를 생성합니다.
+        단일 프롬프트로 텍스트를 생성합니다. (generate_chat 사용)
         
         Args:
             prompt: 입력 프롬프트
-            **kwargs: 생성 매개변수
+            **kwargs: 생성 매개변수 (generate_chat으로 전달됨)
             
         Returns:
             생성된 텍스트
         """
-        # 프롬프트를 채팅 형식으로 변환
         messages = [
+            # Basic system prompt, can be made configurable if needed
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": prompt}
         ]
-        
+        # Pass kwargs directly to generate_chat, allowing override of defaults
         return await self.generate_chat(messages, **kwargs)
     
     async def shutdown(self) -> None:
         """모델 자원을 해제합니다."""
         logger.info("Shutting down model resources...")
         if self.model is not None:
+            # llama-cpp doesn't have an explicit close/shutdown method
+            # Deleting the object should release resources via __del__
             try:
-                del self.model
+                del self.model # Rely on garbage collection and __del__
             except Exception as e:
                 logger.error(f"Error trying to delete model object: {e}")
             
             self.model = None
             self.model_loaded = False
-            logger.info("Model resources released.")
+            logger.info("Model resources marked for release.")
             
-        await asyncio.sleep(0) 
+        await asyncio.sleep(0) # Yield control briefly 
