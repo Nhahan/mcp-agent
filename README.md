@@ -1,14 +1,8 @@
 # MCP Agent
 
-<div align="center">
-
-![logo_image](https://github.com/user-attachments/assets/e8928978-5d79-415f-b0d2-5d8a03dcb445)
-
-</div>
+![ai](https://github.com/user-attachments/assets/f91fd874-b0dc-469f-b908-48e1a3ddc001)
 
 ## Introduction
-
-![ai](https://github.com/user-attachments/assets/af60fd4f-26e8-4c1a-9065-0acae5b25867)
 
 > *(This demo uses the `QwQ` 7B model)*
 
