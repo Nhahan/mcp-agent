@@ -1,7 +1,7 @@
 import logging
 import re
 import json
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, AsyncGenerator
 from pathlib import Path
 from datetime import datetime
 
@@ -692,7 +692,7 @@ class InferenceService:
 
     def _get_tool_list_prompt(self) -> str:
         """
-        시스템 프롬프트용 도구 목록 설명을 생성합니다.
+        Generates tool list descriptions for the system prompt.
         """
         try:
             all_tools = self.mcp_manager.get_all_tool_details()
@@ -777,58 +777,450 @@ class InferenceService:
                 logger.debug(f"Session {session_id} | Trimmed conversation history to {self.max_history_length} messages.")
 
     def _build_system_prompt(self) -> str:
-        """Builds the system prompt including tool descriptions dynamically."""
-        tools_section = self._get_tool_list_prompt() # Get dynamic tool list
+        """
+        Constructs a system prompt to generate responses to user requests.
+        All responses must be in a JSON format and contain only a single JSON object.
+        """
+        system_prompt = """You are an AI assistant that helps with various tasks. You have tools at your disposal to solve complex problems.
 
-        # Define the system prompt with the new format based on is_final
-        # System prompt emphasizing stricter error handling, tool usage, and JSON format
-        system_prompt_template = f"""URGENT: Your response MUST follow the JSON format using 'is_final'.
-ABSOLUTELY CRITICAL: Your response MUST contain EXACTLY ONE JSON object inside the ```json block. DO NOT output multiple JSON objects.
-ONE ACTION AT A TIME: Perform only ONE step per response - either ONE tool_call OR ONE final_answer. Do not plan multiple steps in one response.
-
-Be extremely concise. In each step, decide whether to call ONE tool (`is_final: false`) or provide the final answer (`is_final: true` with the `answer` field) to complete the user's request.
-
-**RESPONSE FORMAT:** Your *entire* response MUST be inside ONE ```json ... ``` block containing ONLY ONE JSON object.
-Choose ONE of the following single actions:
-
-**1. Single Tool Call (when ONE tool is needed next - `is_final` is false or omitted):**
+**CRITICAL RULES**:
+1. Your ENTIRE response must be a JSON object wrapped in a code block like this:
 ```json
-{{
-  "is_final": false, /* Must be false or omitted for tool call */
-  "thought": "Your reasoning about why this tool is needed and what parameters to use. CRITICALLY, first outline the specific sequence of steps needed to fulfill the entire user request based on previous actions, then explain the reasoning for *this specific* tool call as the next logical step in that sequence.",
-  "tool_name": "server_name.tool_name", /* REQUIRED: The tool to use (e.g., 'calculator.add') */
-  "arguments": {{}}  /* REQUIRED (even if empty): Dictionary of arguments. CAREFULLY CHECK the tool description below for the REQUIRED PARAMETER NAMES and their types BEFORE making the first call. */
-}}
+{
+  "thought": "your logical thinking about the problem",
+  "tool_name": "server_name.tool_name",
+  "arguments": {},
+  "is_final": false
+}
 ```
-- `answer` key is NOT ALLOWED here.
-
-**2. Single Final Answer (ONLY when the entire task is fully complete - `is_final` MUST be true):**
+OR
 ```json
-{{
-  "is_final": true, /* Must be true for the final answer */
-  "thought": "Your final reasoning summarizing the process and the answer. If the user requested a specific tone or style for the final answer, briefly explain how you are incorporating that.",
-  "answer": "The final answer to the user's query." /* REQUIRED: The final, user-facing answer string, formatted or styled according to the user's request if specified. */
-}}
+{
+  "thought": "your final conclusion",
+  "answer": "your final answer to the user",
+  "is_final": true
+}
 ```
-- `tool_name` and `arguments` keys are NOT ALLOWED here.
 
-**CRITICAL RULES:**
-1.  **ONE JSON OBJECT ONLY:** Your entire output MUST be a single ```json block containing EXACTLY ONE JSON object inside. NO text outside, NO multiple objects.
-2.  **ONE ACTION PER TURN:** You must choose EITHER ONE tool_call OR ONE final_answer. Never combine them or list multiple actions.
-3.  **`is_final` DETERMINES FORMAT:** Use `is_final: true` for the final answer, `is_final: false` (or omit `is_final`) for tool calls.
-4.  **ENGLISH LANGUAGE ONLY:** ALL text values inside the JSON (`thought`, `answer`, generated advice/stories, argument string values, etc.) MUST be strictly in ENGLISH. No exceptions.
-5.  **VALID JSON:** Use double quotes for all keys and string values. Escape internal quotes properly (e.g., `\\\\"\\"\\\\"` for a quote inside a string). No trailing commas. Ensure the `answer` string is a valid JSON string value (no unescaped special characters or incorrect quoting).
-6.  **`arguments` IS ALWAYS A DICT:** Even if a tool takes no arguments, provide `\\\\"arguments\\\\": {{}}`.
-7.  **TOOL SCHEMA:** If a tool call fails due to incorrect arguments, you will receive the tool's schema. Use it to correct the `arguments` in your next attempt.
-8.  **PROGRESSIVE REASONING & CAREFUL FIRST/FINAL STEP:** Your 'thought' should first outline the sequence of steps needed, then explain your reasoning for the *current* step. Before making the *first* call to a tool, carefully review its description. Identify ALL required parameters, ensure you use the EXACT parameter names specified, and provide values of the correct type. **If the current step depends on information from the previous step's observation (e.g., a PID, a filename), explicitly state in your thought that you are extracting and using that information.** Crucially, ensure the first tool call directly addresses the *first logical step* identified in your plan. **When deciding the final step to present information back to the user, strongly prefer using the final answer (`is_final: true` with `answer`) unless a specific tool is absolutely necessary for the presentation format itself. Ensure the `answer` field incorporates any specific tone or style requested by the user.** Aim to get arguments right on the first try.
-9.  **AVOID REPETITION & RE-EVALUATE APPROACH:** Do NOT repeat the same tool call with the exact same arguments if the previous attempt failed. Analyze the failure: If it was an argument error, correct it based on the schema (Rule 11). If the *same call* fails repeatedly despite argument correction, or if you encounter persistent parsing/execution errors, **IMMEDIATELY RE-EVALUATE your approach**. Ask yourself: Is this the right tool? Is it time for the final answer instead? Try a different tool or provide the final answer (`is_final: true`) if appropriate.
-10. **STEP-BY-STEP COMPLETION:** Break down complex user requests into smaller, manageable steps. Execute these steps **sequentially in the order they are requested or logically required**, ensuring each step makes clear progress towards the final goal.
-11. **MANDATORY ERROR CORRECTION (Argument Errors):** If you receive an observation starting with \\\\"System Error: Tool Input Error...\\\\" (specifically indicating an *argument* issue), this is your **TOP PRIORITY**. You MUST READ the error message and the provided **Tool Schema** carefully. **Pay EXTREMELY close attention to the required parameter names and their types listed in the schema.** Compare this to the arguments you attempted. In your **VERY NEXT JSON response**, you **MUST** call the **same tool** again, but with the `arguments` **corrected based ONLY on the schema and error message.** Ensure all required parameter names are correct and all values have the correct type. DO NOT perform any other action or ignore the error until the failed tool call is successfully corrected. Your primary task is to fix the tool call arguments **based SPECIFICALLY on the provided schema** in the observation.
+2. Only ONE JSON object is allowed in your ENTIRE response. Do not include any text outside the JSON code block.
 
-{tools_section}
+3. Your JSON response MUST follow these rules:
+   - For using tools: Include "thought", "tool_name", "arguments" and set "is_final" to false
+   - For final answers: Include "thought", "answer" and set "is_final" to true
+   - NEVER mix both formats - either use tool format OR answer format
+   - NEVER include both "tool_name" and "answer" in the same response
+   - ALWAYS provide detailed reasoning in the "thought" field
 
-Analyze the user request and previous steps. Decide the SINGLE NEXT STEP according to your plan and the rules above: either ONE tool call (`is_final: false`) or ONE final answer (`is_final: true`) if the entire task is complete.
+4. For logical reasoning:
+   - Break down problems step by step in the "thought" field
+   - Think about what information you need before providing a final answer
+   - Use tools to gather information when needed
+   - Verify your answers before finalizing
 
-FINAL REMINDER: Output MUST be in ENGLISH ONLY and contain EXACTLY ONE **VALID** JSON object for ONE action. Double-check quotes and escaping in the `answer` field.
+5. For tool usage:
+   - Tool names must follow the format "server_name.tool_name"
+   - Always use EXACTLY the parameter names shown in error messages
+   - If a tool fails with "Missing required argument: 'X'", your next call MUST include parameter "X"
+   - After 2 failed attempts with the same tool, try a different approach or tool
+
+6. WHEN TO PROVIDE FINAL ANSWER:
+   - Once you have ALL the information needed to answer the user's request, STOP using tools
+   - If you've collected all necessary data, IMMEDIATELY provide a final answer (is_final: true)
+   - Do NOT continue making tool calls if you already have the information to answer
+   - If you encounter the same error twice, STOP and provide your best answer with what you know
+
+7. Keep responses concise but complete:
+   - Include detailed thinking but avoid unnecessary verbosity
+   - Focus on answering the user's actual question
+   - Be precise and accurate
+
+ALL responses MUST be in English, including your thoughts and final answers.
 """
-        return system_prompt_template 
+        
+        # Add available tools to the system prompt
+        tools_info = self._get_tool_list_prompt()
+        system_prompt += f"\n\n{tools_info}"
+        
+        # Add enhanced instructions for tool parameters
+        system_prompt += """
+
+**ERROR HANDLING GUIDE:**
+- EXACT PARAMETER NAMES: When an error states "Missing required argument: 'X'", you MUST use parameter name "X" exactly as shown
+- CHANGE APPROACH: After 2 failed attempts with the same error, try a completely different method
+- CAREFUL READING: Tool descriptions often contain hints about required parameters
+- PARAMETER PRIORITY: Error messages have the most accurate information about parameter names
+- SWITCHING TOOLS: If a tool consistently fails despite correct parameters, try an alternative tool
+
+**IMPORTANT REMINDER:**
+Once you have ALL needed information, IMMEDIATELY provide the final answer with "is_final": true.
+NEVER continue using tools when you can already answer the question completely.
+"""
+        
+        return system_prompt
+
+    async def stream_react_pattern(
+        self, 
+        initial_prompt: str,
+        session_id: str,
+        session_log_dir: Path
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Asynchronous generator implementation of the ReAct pattern that yields 
+        each iteration of the thinking process and finally yields the response.
+        
+        Args:
+            initial_prompt: The user's original prompt
+            session_id: Unique identifier for this session
+            session_log_dir: Directory to store logs for this session
+            
+        Yields:
+            Dictionary containing iteration data (thinking) or final response
+        """
+        log_prefix = f"[{session_id}]"
+        
+        # --- FIX: Validate initial_prompt --- 
+        if not initial_prompt or not isinstance(initial_prompt, str):
+             logger.error(f"{log_prefix} Invalid initial_prompt received: {initial_prompt}. Cannot start ReAct stream.")
+             # Yield an error message and stop the generator
+             yield {
+                 "error": "Invalid input received. Cannot start processing.",
+                 "response": "오류: 유효하지 않은 입력입니다." # Provide a user-facing message
+             }
+             return # Stop the generator
+        # --- End FIX ---
+
+        # 1. Build the system prompt
+        system_prompt = self._build_system_prompt()
+        
+        # 2. Initialize variables for the loop
+        # current_iteration = 0 # Moved initialization inside loop start for clarity
+        # user_prompt = initial_prompt # No longer needed here
+        # intermediate_response = None # No longer needed here
+        max_iterations = settings.react_max_iterations
+        is_complete = False
+        final_response = None
+        iterations_log = []
+        
+        # --- FIX: Reset history and add initial prompt BEFORE the loop --- 
+        if session_id in self.conversation_histories:
+            logger.debug(f"{log_prefix} Clearing existing conversation history for session {session_id} before stream.")
+            del self.conversation_histories[session_id]
+            
+        self.conversation_histories.setdefault(session_id, []) # Ensure key exists even after deletion
+        self.add_to_conversation(session_id, "user", initial_prompt)
+        logger.debug(f"{log_prefix} Added initial prompt '{initial_prompt[:50]}...' to history for session {session_id}.")
+        # --- End FIX --- 
+
+        # 4. Loop until max iterations or completion
+        current_iteration = 0 # Initialize counter here
+        while current_iteration < max_iterations and not is_complete:
+            iteration_start_time = datetime.now().isoformat()
+            
+            # 5. Build messages for THIS iteration using the LATEST history
+            current_history = self.get_conversation_history(session_id)
+            if not current_history or current_history[-1]['role'] != 'user':
+                 # Safety check: Should not happen with the fix above, but log if it does
+                 logger.error(f"{log_prefix} History state error: Last message is not from user or history is empty before first LLM call.")
+                 # Attempt recovery by re-adding prompt? Or raise error?
+                 # For now, just log and proceed, likely causing LLM confusion.
+                 # If this occurs, the history management needs deeper review.
+                 pass # Continue for now
+                 
+            messages = [
+                {"role": "system", "content": system_prompt},
+                *current_history
+            ]
+            
+            # --- START DEBUG LOGGING ---
+            try:
+                messages_json_for_log = json.dumps(messages, indent=2, ensure_ascii=False)
+                logger.debug(f"{log_prefix} Iteration {current_iteration} - Messages sent to LLM:\n{messages_json_for_log}")
+            except Exception as log_e:
+                logger.error(f"{log_prefix} Failed to serialize messages for logging: {log_e}")
+                logger.debug(f"{log_prefix} Iteration {current_iteration} - Raw messages (showing roles): {[(m.get('role'), m.get('content', '')[:50] + '...') for m in messages]}")
+            # --- END DEBUG LOGGING ---
+
+            # Log the prompt being sent (optional, can be large)
+            # prompt_log = json.dumps(messages, indent=2) 
+            prompt_log = f"System Prompt + {len(current_history)} history messages" # More concise log
+
+            # 6. Generate response using the model
+            try:
+                model_response = await self.model_service.generate_chat(
+                    messages=messages
+                )
+                
+                # 7. Parse the model response to extract the action
+                parsed_action = self._parse_llm_action_json(model_response, log_prefix)
+                
+                if "error" in parsed_action:
+                    # Handle parsing error - Provide feedback similar to process_react_pattern
+                    error_message = parsed_action.get("error", "Unknown parsing error")
+                    logger.warning(f"{log_prefix} LLM response parsing failed: {error_message}")
+                    feedback = f"System Error: Your previous response could not be parsed. Reason: {error_message}. Please correct your JSON format and try again. Remember to output ONLY a single JSON object inside ```json ... ```."                 
+                    
+                    # Add failed response and feedback to history
+                    # self.add_to_conversation(session_id, "assistant", model_response) # Add the failed response itself? Controversial.
+                    self.add_to_conversation(session_id, "user", feedback) # Add feedback as if user said it
+
+                    iteration_log = {
+                        "iteration": current_iteration,
+                        "timestamp": iteration_start_time,
+                        "prompt": prompt_log, # Use concise log
+                        "response": model_response,
+                        "error": error_message,
+                        "observation": feedback # Log the feedback given
+                    }
+                    iterations_log.append(iteration_log)
+                    
+                    # Yield the error/feedback
+                    yield {
+                        "iteration": current_iteration,
+                        "thought": f"Error during parsing: {error_message}. Attempting to guide the model.", # Provide context in thought
+                        "error": error_message, 
+                        "feedback_provided": feedback # Let client know feedback was sent
+                    }
+                    
+                    current_iteration += 1
+                    continue # Retry loop
+                
+                # Parsing successful - ADD LLM RESPONSE TO HISTORY
+                self.add_to_conversation(session_id, "assistant", model_response)
+
+                # 8. Log the thought immediately
+                thought = parsed_action.get("thought", "")
+                # --- FIX: Enhance iteration_log with more details --- 
+                iteration_log = {
+                    "iteration": current_iteration,
+                    "timestamp": iteration_start_time,
+                    "prompt": prompt_log, # Concise prompt info
+                    "llm_response": model_response, # Log raw response
+                    "parsed_action": parsed_action, # Log parsed action structure
+                    "action": parsed_action, # Keep 'action' for compatibility if needed, but parsed_action is more informative
+                    "observation": None, # Initialize observation
+                    "error": None, # Initialize error
+                    "tool_name_requested": None,
+                    "arguments_provided": None,
+                    "schema_found": None,
+                    "schema_content": None,
+                    "validation_result": None,
+                    # llm_prompt_length might require changes in generate_chat to return token count
+                    # "llm_prompt_length": ??? 
+                }
+                
+                # Yield the thinking step
+                yield {
+                    "iteration": current_iteration,
+                    "thought": thought
+                }
+                
+                # 9. Check if this is the final answer
+                if parsed_action.get("is_final", False):
+                    final_answer = parsed_action.get("answer", "")
+                    # Update action type in log for final answer
+                    iteration_log["action"] = {
+                        "type": "final_answer",
+                        "is_final": True,
+                        "content": final_answer,
+                        "thought": thought
+                    }
+                    # No observation for final answer
+                    iterations_log.append(iteration_log) # Append log for final answer iteration
+                    
+                    # Store the final answer
+                    final_response = final_answer
+                    is_complete = True
+                
+                else:
+                    # 10. Execute the tool action
+                    tool_name_full = parsed_action.get("tool_name", "").strip()
+                    arguments = parsed_action.get("arguments", {})
+                    iteration_log["tool_name_requested"] = tool_name_full 
+                    iteration_log["arguments_provided"] = arguments
+                    
+                    if not tool_name_full:
+                        # Missing tool name - Provide feedback
+                        error_message = "Missing tool name in action"
+                        logger.error(f"{log_prefix} Iteration {current_iteration} failed: {error_message}")
+                        feedback = f"System Error: Your response was missing the required 'tool_name' field. Please specify the tool you want to use."
+                        self.add_to_conversation(session_id, "user", feedback)
+                        
+                        iteration_log["error"] = error_message
+                        iteration_log["observation"] = feedback
+                        iterations_log.append(iteration_log) # Log iteration with error
+                        
+                        # Yield error information
+                        yield {
+                            "iteration": current_iteration,
+                            "thought": thought, 
+                            "error": error_message,
+                            "feedback_provided": feedback
+                        }
+                        
+                        current_iteration += 1
+                        continue 
+                    
+                    # 11. Call the tool
+                    observation = "" 
+                    try:
+                        # Split tool name
+                        if '.' not in tool_name_full:
+                             error_msg = f"Invalid tool name format '{tool_name_full}'. Must be 'server_name.tool_name' format."
+                             logger.warning(f"{log_prefix}{error_msg}")
+                             observation = f"System Error: {error_msg} Available tools are: {self.mcp_manager.list_tools_for_prompt()}"
+                             iteration_log["error"] = error_msg
+                             raise ValueError(error_msg) 
+                        
+                        server_name, specific_tool_name = tool_name_full.split('.', 1)
+                        
+                        # Argument Validation
+                        validation_error_msg = None
+                        schema = await self._get_tool_schema(server_name, specific_tool_name)
+                        if schema:
+                            iteration_log["schema_found"] = True # Log schema found
+                            iteration_log["schema_content"] = schema # Log schema content
+                            validation_result = self._validate_tool_arguments(arguments, schema)
+                            iteration_log["validation_result"] = validation_result # Log validation result
+                            if not validation_result["valid"]:
+                                validation_error_msg = f"Tool Input Error: {validation_result['error']}. Check the schema and your arguments."
+                                logger.warning(f"{log_prefix}Tool '{tool_name_full}' arguments validation failed: {validation_result['error']}")
+                        else:
+                            iteration_log["schema_found"] = False # Log schema not found
+                            logger.warning(f"{log_prefix}Could not retrieve schema for tool '{tool_name_full}'. Skipping argument validation.")
+
+                        if validation_error_msg:
+                            # Validation failed - create feedback observation
+                            tool_info = self.mcp_manager.get_tool_info(server_name, specific_tool_name)
+                            tool_description = tool_info.get('description', 'No description available.') if tool_info else 'Tool description not found.'
+                            missing_args_str = ""
+                            if "Missing required argument" in validation_result['error']:
+                                missing = [arg.split(": '")[-1].rstrip("'") for arg in validation_result['error'].split(';') if arg.strip().startswith("Missing required argument")]
+                                if missing:
+                                    missing_args_str = f" You seem to be missing the following required arguments: {', '.join(missing)}."
+                            
+                            observation = (
+                                f"System Error: Your previous attempt to use the tool '{tool_name_full}' failed due to invalid arguments. "
+                                f"Error details: {validation_result['error']}.{missing_args_str}\n"
+                                f"\n"
+                                f"Tool Description: {tool_description}\n"
+                                f"\n"
+                                f"Please review the error, check the tool description, and correct the 'arguments' in your next JSON response. Ensure all required arguments are provided."
+                            )
+                            iteration_log["error"] = validation_error_msg
+                            raise ToolInputValidationError(validation_error_msg) # Raise to enter the except block
+                        
+                        # Execute tool
+                        tool_result = await self.mcp_manager.execute_tool(server_name, specific_tool_name, arguments)
+                        iteration_log["observation_raw"] = tool_result # Log raw tool result 
+                        
+                        # Format observation for LLM
+                        serialized_result = self._format_observation(tool_result)
+                        observation = serialized_result 
+                        iteration_log["observation"] = observation # Log formatted observation
+                        
+                        # Yield tool execution result
+                        yield {
+                            "iteration": current_iteration,
+                            "thought": thought,
+                            "tool": tool_name_full,
+                            "observation": observation 
+                        }
+                        
+                    except (ValueError, ToolInputValidationError, Exception) as tool_error:
+                        # Tool execution or validation error
+                        if isinstance(tool_error, (ValueError, ToolInputValidationError)):
+                             error_message = str(tool_error)
+                             # Observation already set or created in the validation/value error block
+                        else:
+                            # General execution error - format a new observation
+                            error_message = f"Tool execution failed for '{tool_name_full}': {type(tool_error).__name__}: {tool_error}"
+                            logger.error(f"{log_prefix}{error_message}", exc_info=True)
+                            tool_info = self.mcp_manager.get_tool_info(server_name, specific_tool_name)
+                            tool_description = tool_info.get('description', 'No description available.') if tool_info else 'Tool description not found.'
+                            schema_details = self._get_detailed_tool_info(server_name, specific_tool_name)
+                            observation = (
+                                 f"System Error: {error_message}. Tool execution failed.\n"
+                                 f"\n"
+                                 f"Tool Description: {tool_description}\n"
+                                 f"\n"
+                                 f"Tool Schema for '{tool_name_full}':\n{schema_details}\n"
+                                 f"\n"
+                                 f"Please analyze the error, review the tool description and schema, and decide if you can retry (potentially with corrected arguments) or if you need to try a different approach."
+                            )
+                        
+                        # Ensure error is logged in iteration_log
+                        if "error" not in iteration_log: iteration_log["error"] = error_message 
+                        iteration_log["observation"] = observation # Log the error observation
+
+                        # Yield error information
+                        yield {
+                            "iteration": current_iteration,
+                            "thought": thought, 
+                            "tool": tool_name_full,
+                            "error": error_message, 
+                            "observation": observation 
+                        }
+                    
+                    # ADD OBSERVATION TO HISTORY (success or error)
+                    self.add_to_conversation(session_id, "user", observation) 
+                    iterations_log.append(iteration_log) # Append log AFTER observation/error is finalized
+
+            except Exception as e:
+                # Handle any other errors in the iteration (e.g., during LLM call itself)
+                error_message = f"Iteration error: {str(e)}"
+                logger.error(f"{log_prefix} Error in iteration {current_iteration}: {error_message}", exc_info=True)
+                
+                # Ensure iteration_log is defined even if error happened early
+                if 'iteration_log' not in locals():
+                     iteration_log = {
+                         "iteration": current_iteration,
+                         "timestamp": iteration_start_time,
+                         "prompt": prompt_log, # Use concise log
+                         "error": error_message
+                     }
+                else:
+                     iteration_log["error"] = error_message # Add error to existing log if possible
+
+                iterations_log.append(iteration_log)
+                
+                # Yield error information
+                yield {
+                    "iteration": current_iteration,
+                    "error": error_message
+                }
+            
+            # Increment the iteration counter
+            current_iteration += 1
+
+        # 13. Save the complete log
+        await async_save_meta_log(
+            session_log_dir,
+            {
+                "iterations": iterations_log,
+                "final_response": final_response,
+                "iterations_count": current_iteration,
+                "completion_status": "completed" if is_complete else "max_iterations_reached",
+                "end_time": datetime.now().isoformat(),
+                "event_type": "react_processing_complete"
+            },
+            session_id,
+            merge=True
+        )
+        
+        # 14. Yield the final response
+        if final_response:
+            # Add a step_type to differentiate this from other yields
+            yield {
+                "step_type": "final_response",  # Add explicit step_type for final response
+                "response": final_response
+            }
+        else:
+            # If no final answer was provided, yield an error
+            error_message = "Failed to generate a final answer within the maximum number of iterations."
+            logger.error(f"{log_prefix} {error_message} ({current_iteration}/{max_iterations})")
+            
+            yield {
+                "step_type": "error_response",  # Add explicit step_type for error
+                "response": f"Sorry, I was unable to complete your request within the allowed steps. Please try asking in a different way or break your request into smaller parts.",
+                "error": error_message
+            } 
