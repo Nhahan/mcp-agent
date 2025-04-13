@@ -1,0 +1,25 @@
+root ::= json-object
+json-object ::= "{" ws* ( json-kv ( "," ws* json-kv )* )? ws* "}"
+json-kv ::= json-string ws* ":" ws* json-value
+json-value ::= json-object | json-array | json-string | json-number | json-bool | json-null
+json-array ::= "[" ws* ( json-value ( "," ws* json-value )* )? ws* "]"
+json-string ::= "\"" ( [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F]{4} )* "\""
+json-number ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [-+]? [0-9]+ )?
+json-bool ::= "true" | "false"
+json-null ::= "null"
+ws ::= [ \t\n\r]
+
+# Required fields for using tools
+tool_call ::= "{" ws*
+    "\"thought\"" ws* ":" ws* json-string "," ws*
+    "\"tool_name\"" ws* ":" ws* json-string "," ws*
+    "\"arguments\"" ws* ":" ws* json-object "," ws*
+    "\"is_final\"" ws* ":" ws* "false"
+ws* "}"
+
+# Required fields for final answer
+final_answer ::= "{" ws*
+    "\"thought\"" ws* ":" ws* json-string "," ws*
+    "\"answer\"" ws* ":" ws* json-string "," ws*
+    "\"is_final\"" ws* ":" ws* "true"
+ws* "}"
