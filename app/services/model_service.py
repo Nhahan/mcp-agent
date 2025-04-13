@@ -60,32 +60,31 @@ class ModelService:
         self.model: Optional[Llama] = None
         self.model_loaded = False
         self.grammar: Optional[LlamaGrammar] = None
+        logger.debug(f"ModelService.__init__: Checking for grammar at {settings.grammar_path}")
 
         if not Path(self.model_path).exists():
             logger.error(f"Model file not found at {self.model_path}. Ensure it is downloaded.")
-            # Consider not raising here, but checking model_loaded before use
-            # raise ModelError(f"Model file not found: {self.model_path}")
-            self.model_loaded = False # Explicitly set to false
-            return # Exit init if model file doesn't exist
+            self.model_loaded = False
+            return
 
-        # Load Grammar from settings.grammar_path
-        grammar_path_str = settings.grammar_path
-        if grammar_path_str:
-            grammar_path = Path(grammar_path_str)
-            if grammar_path.is_file(): # Check if it's a file
+        # Try to load grammar from settings if specified
+        if settings.grammar_path:
+            grammar_path = Path(settings.grammar_path)
+            if grammar_path.is_file():
                 try:
-                    self.grammar = LlamaGrammar.from_file(str(grammar_path))
-                    logger.info(f"Successfully loaded grammar from {grammar_path}")
+                    if LlamaGrammar is None:
+                        logger.error("Cannot load grammar because LlamaGrammar is not available (llama-cpp-python missing?).")
+                    else:
+                        self.grammar = LlamaGrammar.from_file(str(grammar_path))
+                        logger.info(f"Successfully loaded grammar from {grammar_path}")
                 except Exception as e:
                     logger.error(f"Failed to load or parse grammar file {grammar_path}: {e}", exc_info=True)
-                    self.grammar = None
+                    self.grammar = None  # Ensure it's None on failure
             else:
                 logger.warning(f"Grammar path specified ({grammar_path}), but it's not a file or doesn't exist.")
-                self.grammar = None
         else:
             logger.info("No grammar path specified in settings. Grammar will not be used.")
-            self.grammar = None
-        
+
         # Load the LLM model
         try:
             if Llama is None:
@@ -105,6 +104,18 @@ class ModelService:
             self.model_loaded = False
 
     async def generate_chat(self, messages: List[Dict[str, str]], **kwargs) -> str:
+        """
+        채팅 메시지 리스트로부터 응답을 생성합니다.
+        
+        Args:
+            messages: 채팅 메시지 리스트 (각 메시지는 "role"과 "content" 키를 가진 딕셔너리)
+            **kwargs: 생성 매개변수 (기본값은 settings에서 가져옴)
+            
+        Returns:
+            생성된 텍스트
+        """
+        logger.debug(f"generate_chat: grammar is {'available' if self.grammar else 'not available'}")
+        
         generation_params = {
             "max_tokens": kwargs.get("max_tokens", settings.model_max_tokens),
             "temperature": kwargs.get("temperature", settings.model_temperature),
@@ -113,31 +124,32 @@ class ModelService:
             "min_p": kwargs.get("min_p", settings.model_min_p),
             "stop": kwargs.get("stop", ["</s>", "<|eot_id|>", "<|endoftext|>", "\nObservation:", "\nUSER:", "```"]),
         }
-        
-        # Apply grammar ONLY if it's loaded AND not explicitly disabled in kwargs
-        if "grammar" in kwargs:
-                # Allow explicit override (e.g., grammar=None for translation)
-                if kwargs["grammar"] is not None:
-                    generation_params["grammar"] = kwargs["grammar"]
-                    logger.debug("Applying grammar provided in kwargs.")
-                else:
-                    logger.debug("Grammar explicitly disabled by kwargs=None.")
-        elif self.grammar: # Otherwise, apply the default loaded grammar if it exists
-                generation_params["grammar"] = self.grammar
-                logger.debug("Applying default loaded grammar.")
-        final_params = generation_params
 
-        output: Dict[str, Any] = await asyncio.to_thread(
-                 self.model.create_chat_completion, messages=messages, **final_params
-        )
-        
-        # Extract generated text
-        if output and 'choices' in output and output['choices']:
+        # Apply grammar if available and not explicitly disabled
+        if self.grammar and kwargs.get("use_grammar", True):
+            generation_params["grammar"] = self.grammar
+            logger.debug("Applying GBNF grammar to enforce output structure")
+            
+        # Ensure the model is loaded before proceeding
+        if not self.model_loaded or self.model is None:
+            logger.error("Model is not loaded. Cannot generate chat completion.")
+            return ""
+
+        try:
+            output: Dict[str, Any] = await asyncio.to_thread(
+                    self.model.create_chat_completion, messages=messages, **generation_params
+            )
+            
+            # Extract generated text
+            if output and 'choices' in output and output['choices']:
                 generated_text = output['choices'][0].get('message', {}).get('content', '').strip()
-        else:
-                logger.warning(f"Unexpected output structure from create_chat_completion: {output}")
+            else:
+                logger.warning(f"Unexpected output structure: {output}")
                 generated_text = ""
-        return generated_text
+            return generated_text
+        except Exception as e:
+            logger.error(f"Error during generation: {e}", exc_info=True)
+            return ""
 
     async def generate_text(self, prompt: str, **kwargs) -> str:
         """
