@@ -2,7 +2,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional
+from typing import Optional, List
 from functools import lru_cache
 from dotenv import load_dotenv
 
@@ -17,37 +17,41 @@ load_dotenv()
 
 class Settings(BaseSettings):
     # API 구성
-    api_title: str = "MCP Agent"
-    api_description: str = "MCP Agent API"
-    api_version: str = "0.1.0"
+    api_title: str = "MCP Agent API"
+    api_description: str = "API for the MCP Agent using ReAct pattern and llama-cpp."
+    api_version: str = "0.2.0"
+    api_v1_prefix: str = "/api/v1" # API prefix
     
     # 모델 구성
-    model_filename: str = os.getenv("MODEL_FILENAME", "")
-    model_dir: Path = Path('/app/models') if os.getenv("RUNNING_IN_DOCKER", "False").lower() == "true" else Path('./models')
-    model_path: Optional[str] = os.getenv("MODEL_PATH") # .env 에서 읽어올 모델 파일 경로, get_settings에서 최종 결정됨
-    n_ctx: int = int(os.getenv("N_CTX", 32768))
-    gpu_layers: int = int(os.getenv("GPU_LAYERS", -1))
+    model_filename: str = "QwQ-LCoT-7B-Instruct-IQ4_NL.gguf" # Default model filename
+    model_dir: Optional[str] = None # Directory for models, defaults below
+    model_path: Optional[str] = None # Full path, overrides dir/filename if set
+    n_ctx: int = 16384  # Reduced from 32768 to improve stability
+    gpu_layers: int = -1 # -1 means offload all possible layers to GPU
     
     # LLM 생성 파라미터
-    model_max_tokens: int = int(os.getenv("MODEL_MAX_TOKENS", 8192))
-    model_temperature: float = float(os.getenv("MODEL_TEMPERATURE", 0.6))
-    model_top_p: float = float(os.getenv("MODEL_TOP_P", 0.95))
-    model_top_k: int = int(os.getenv("MODEL_TOP_K", 40))
-    model_min_p: float = float(os.getenv("MODEL_MIN_P", 0.05))
+    model_max_tokens: int = 1024
+    model_temperature: float = 0.7
+    model_top_p: float = 0.9
+    model_top_k: int = 40
+    model_min_p: float = 0.05 # Only used if model supports it
 
     # ReAct 루프 설정
-    react_max_iterations: int = int(os.getenv("MAX_ITERATIONS", 10)) # 최대 반복 횟수
+    react_max_iterations: int = 10
 
     # 문법 파일 경로 (GBNF)
-    grammar_path: str = os.getenv("GRAMMAR_PATH", "react_output.gbnf") # .env 또는 기본값 사용
+    grammar_path: str = "react_output.gbnf"  # Re-enable grammar for stable output
 
     # 로깅 및 디버깅
-    log_level: str = os.getenv("LOG_LEVEL", "INFO")
-    log_dir: str = os.getenv("LOG_DIR", "logs")
+    log_level: str = "INFO"
+    log_dir: Optional[str] = None # Log directory, defaults below
     
     # MCP 구성
-    mcp_config_filename: str = os.getenv("MCP_CONFIG_FILENAME", "mcp.json")
-    mcp_config_path: Optional[Path] = None # get_settings에서 최종 결정됨
+    mcp_config_filename: str = "mcp.json"
+    mcp_config_path: Optional[str] = None
+    
+    # Environment
+    environment: str = "development" # 'development' or 'production'
     
     # Pydantic v2 경고 해결: protected_namespaces 설정 추가
     model_config = SettingsConfigDict(
@@ -57,24 +61,75 @@ class Settings(BaseSettings):
         extra='ignore' # 명시적으로 정의되지 않은 필드는 무시
     )
         
+    def __init__(self, **values):
+        super().__init__(**values)
+        # Calculate default paths after loading from .env
+        if self.model_dir is None:
+            self.model_dir = str(PROJECT_ROOT / "models")
+        if self.model_path is None:
+             if self.model_filename:
+                self.model_path = str(Path(self.model_dir) / self.model_filename)
+             else:
+                # Handle case where filename is also not provided (optional)
+                self.model_path = None # Or raise an error
+        
+        if self.grammar_path is None:
+            self.grammar_path = str(PROJECT_ROOT / "react_output.gbnf") # Default grammar file
+            
+        if self.mcp_config_path is None:
+            self.mcp_config_path = str(PROJECT_ROOT / self.mcp_config_filename)
+            
+        if self.log_dir is None:
+            self.log_dir = str(PROJECT_ROOT / "logs")
+            
+        # Ensure directories exist (optional, creates if not found)
+        Path(self.model_dir).mkdir(parents=True, exist_ok=True)
+        Path(self.log_dir).mkdir(parents=True, exist_ok=True)
+
     @property
-    def calculated_model_path(self) -> Path:
-        """모델 디렉토리와 파일 이름을 조합하여 전체 모델 경로를 반환합니다."""
-        if not self.model_dir.exists():
-            try:
-                self.model_dir.mkdir(parents=True, exist_ok=True)
-                logger.info(f"Created model directory: {self.model_dir}")
-            except Exception as e:
-                logger.error(f"Failed to create model directory {self.model_dir}: {e}", exc_info=True)
-                # 디렉토리 생성 실패 시에도 일단 경로 객체 반환 시도
-                return Path(self.model_filename) # 잠재적 오류 가능
-        return self.model_dir / self.model_filename
+    def calculated_model_dir_path(self) -> Path:
+        """Returns the model directory as a Path object."""
+        return Path(self.model_dir)
+
+    @property
+    def calculated_model_path(self) -> Optional[Path]:
+        """Calculates and returns the full model path as a Path object, or None."""
+        # Use the property that returns a Path object for the directory check
+        model_dir_p = self.calculated_model_dir_path 
+        if not model_dir_p.exists():
+            logger.warning(f"Model directory does not exist: {model_dir_p}")
+            # Attempt to create it? Or return None?
+            # model_dir_p.mkdir(parents=True, exist_ok=True)
+            return None # Cannot determine path if directory doesn't exist
+
+        if self.model_path:
+            # If model_path is explicitly set, use it
+            return Path(self.model_path)
+        elif self.model_filename:
+            # If only filename is set, construct path using the directory Path object
+            return model_dir_p / self.model_filename
+        else:
+            # If neither path nor filename is set
+            logger.warning("Neither model_path nor model_filename is configured.")
+            return None
 
     @property
     def calculated_mcp_config_path(self) -> Path:
-        """프로젝트 루트와 MCP 설정 파일 이름을 조합하여 전체 경로를 반환합니다."""
-        return PROJECT_ROOT / self.mcp_config_filename
+        """Returns the MCP config path as a Path object."""
+        return Path(self.mcp_config_path)
         
+    @property
+    def calculated_log_dir_path(self) -> Path:
+        """Returns the log directory as a Path object."""
+        return Path(self.log_dir)
+
+    @property
+    def calculated_grammar_path(self) -> Optional[Path]:
+        """Returns the grammar path as a Path object, or None."""
+        if self.grammar_path:
+             return Path(self.grammar_path)
+        return None
+
 # Function to get settings instance, cached for efficiency
 @lru_cache()
 def get_settings() -> Settings:
@@ -82,47 +137,33 @@ def get_settings() -> Settings:
     try:
         settings_instance = Settings()
         
-        # 1. 모델 경로 결정 (MODEL_PATH 환경변수 우선)
-        model_path_from_env = os.getenv("MODEL_PATH")
-        if model_path_from_env:
-            settings_instance.model_path = model_path_from_env
-            logger.info(f"Using MODEL_PATH from environment: {settings_instance.model_path}")
-            # 파일 존재 여부 체크 (시작 시)
-            if not Path(settings_instance.model_path).exists():
-                logger.warning(f"MODEL_PATH file ({settings_instance.model_path}) does not exist yet. Ensure it's downloaded before use.")
-                # 여기서 에러를 발생시킬 수도 있지만, 다운로드 로직이 별도로 있다면 경고만 남길 수 있음
-                # raise FileNotFoundError(f"Model file does not exist: {settings_instance.model_path}. Download the model file before running the application.")
-        elif settings_instance.model_filename:
-            # 환경변수 없고 filename 있으면 계산된 경로 사용
-            calculated = settings_instance.calculated_model_path
-            settings_instance.model_path = str(calculated)
-            logger.info(f"MODEL_PATH not set. Using calculated path based on MODEL_FILENAME: {settings_instance.model_path}")
-            # 계산된 경로 파일 존재 여부 체크 (시작 시)
-            if not calculated.exists():
-                logger.warning(f"Calculated model path file ({calculated}) does not exist yet. Ensure it's downloaded before use.")
+        # Use the properties which return Path objects
+        model_dir_path = settings_instance.calculated_model_dir_path
+        model_path_obj = settings_instance.calculated_model_path
+        mcp_config_path_obj = settings_instance.calculated_mcp_config_path
+        log_dir_path = settings_instance.calculated_log_dir_path
+
+        # 1. 모델 경로 유효성 검사 및 로깅
+        if model_path_obj:
+            logger.info(f"Using model path: {model_path_obj}")
+            if not model_path_obj.exists():
+                logger.warning(f"Model file ({model_path_obj}) does not exist yet. Ensure it's downloaded.")
         else:
-            # 둘 다 없으면 오류
-             logger.error("Neither MODEL_PATH environment variable nor MODEL_FILENAME is set. Cannot determine model path.")
-             raise ValueError("Model path configuration is missing. Set either MODEL_PATH or MODEL_FILENAME.")
+             logger.error("Model path configuration is missing or invalid.")
+             raise ValueError("Model path configuration could not be determined.")
              
-        # 2. MCP 설정 파일 경로 결정
-        settings_instance.mcp_config_path = settings_instance.calculated_mcp_config_path
-        logger.info(f"Using MCP config path: {settings_instance.mcp_config_path}")
-        if not settings_instance.mcp_config_path.exists():
-            logger.warning(f"MCP config file ({settings_instance.mcp_config_path}) does not exist.")
-            # mcp.json이 필수적인 경우 여기서 에러 발생
-            # raise FileNotFoundError(f"MCP config file not found: {settings_instance.mcp_config_path}")
+        # 2. MCP 설정 파일 경로 유효성 검사
+        logger.info(f"Using MCP config path: {mcp_config_path_obj}")
+        if not mcp_config_path_obj.exists():
+            logger.warning(f"MCP config file ({mcp_config_path_obj}) does not exist.")
 
-        # 3. 로그 디렉토리 생성
-        log_path = Path(settings_instance.log_dir)
-        if not log_path.exists():
-            try:
-                log_path.mkdir(parents=True, exist_ok=True)
-                logger.info(f"Created log directory: {log_path}")
-            except Exception as e:
-                logger.error(f"Failed to create log directory {log_path}: {e}", exc_info=True)
+        # 3. 로그 디렉토리 확인 (이미 __init__에서 생성 시도됨)
+        logger.info(f"Using log directory: {log_dir_path}")
+        if not log_dir_path.is_dir(): # Check if it's actually a directory
+             logger.error(f"Log path ({log_dir_path}) exists but is not a directory.")
+             # Or attempt to recreate/handle error
 
-        logger.info("Settings loaded successfully.")
+        logger.info("Settings loaded and paths validated successfully.")
         return settings_instance
     except Exception as e:
         logger.error(f"Fatal error loading settings: {e}", exc_info=True)
@@ -134,12 +175,12 @@ settings = get_settings()
 logger.info("--- Application Configuration ---")
 logger.info(f"API Title: {settings.api_title} v{settings.api_version}")
 logger.info(f"Log Level: {settings.log_level}")
-logger.info(f"Log Directory: {settings.log_dir}")
-logger.info(f"Model Path: {settings.model_path}")
+logger.info(f"Log Directory: {settings.calculated_log_dir_path}")
+logger.info(f"Model Path: {settings.calculated_model_path}")
 logger.info(f"Model Context (n_ctx): {settings.n_ctx}")
 logger.info(f"GPU Layers: {settings.gpu_layers}")
-logger.info(f"Grammar Path: {settings.grammar_path}")
-logger.info(f"MCP Config Path: {settings.mcp_config_path}")
+logger.info(f"Grammar Path: {settings.calculated_grammar_path}")
+logger.info(f"MCP Config Path: {settings.calculated_mcp_config_path}")
 logger.info(f"ReAct Max Iterations: {settings.react_max_iterations}")
 logger.info(f"Model Max Tokens: {settings.model_max_tokens}")
 logger.info(f"Model Temperature: {settings.model_temperature}")
