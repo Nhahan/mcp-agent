@@ -1,6 +1,6 @@
 # MCP Agent
 
-![ai](https://github.com/user-attachments/assets/f91fd874-b0dc-469f-b908-48e1a3ddc001)
+![aii-ezgif com-crop](https://github.com/user-attachments/assets/3a872acc-3bee-4762-a22c-a28432923f46)
 
 ## Introduction
 
