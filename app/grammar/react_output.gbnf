@@ -1,25 +1,42 @@
-root ::= json-object
-json-object ::= "{" ws* ( json-kv ( "," ws* json-kv )* )? ws* "}"
-json-kv ::= json-string ws* ":" ws* json-value
-json-value ::= json-object | json-array | json-string | json-number | json-bool | json-null
-json-array ::= "[" ws* ( json-value ( "," ws* json-value )* )? ws* "]"
-json-string ::= "\"" ( [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F]{4} )* "\""
-json-number ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [-+]? [0-9]+ )?
-json-bool ::= "true" | "false"
-json-null ::= "null"
-ws ::= [ \t\n\r]
+# react_output.gbnf - Grammar to enforce ReAct JSON structure
 
-# Required fields for using tools
-tool_call ::= "{" ws*
-    "\"thought\"" ws* ":" ws* json-string "," ws*
-    "\"tool_name\"" ws* ":" ws* json-string "," ws*
-    "\"arguments\"" ws* ":" ws* json-object "," ws*
-    "\"is_final\"" ws* ":" ws* "false"
-ws* "}"
+# Root must be a JSON code block
+root ::= code-block
 
-# Required fields for final answer
-final_answer ::= "{" ws*
-    "\"thought\"" ws* ":" ws* json-string "," ws*
-    "\"answer\"" ws* ":" ws* json-string "," ws*
-    "\"is_final\"" ws* ":" ws* "true"
-ws* "}"
+# A code block is a JSON object wrapped in ```json ... ```
+code-block ::= "```json" ws json-object ws "```" ws
+
+# Whitespace definition
+ws ::= [ \t\n\r]*
+
+# A JSON object must be either a ToolCallObject OR a FinalAnswerObject
+json-object ::= ToolCallObject | FinalAnswerObject
+
+# Tool call format (is_final: false)
+ToolCallObject ::= "{" ws
+                   "\"is_final\"" ws ":" ws "false" ws "," ws
+                   "\"thought\"" ws ":" ws JsonString ws "," ws
+                   "\"tool_name\"" ws ":" ws JsonString ws "," ws
+                   "\"arguments\"" ws ":" ws JsonObject ws
+                   "}"
+
+# Final answer format (is_final: true)
+FinalAnswerObject ::= "{" ws
+                     "\"is_final\"" ws ":" ws "true" ws "," ws
+                     "\"thought\"" ws ":" ws JsonString ws "," ws
+                     "\"answer\"" ws ":" ws JsonString ws
+                     "}"
+
+# JSON components
+JsonObject ::= "{" ws ( JsonMember ( ws "," ws JsonMember )* )? ws "}"
+JsonMember ::= JsonString ws ":" ws JsonValue
+JsonArray ::= "[" ws ( JsonValue ( ws "," ws JsonValue )* )? ws "]"
+JsonValue ::= JsonString | JsonNumber | JsonObject | JsonArray | "true" | "false" | "null"
+
+# String with proper escaping
+JsonString ::= "\"" ( EscapedChar | [^"\\] )* "\""
+EscapedChar ::= "\\" ( ["\\/bfnrt] | "u" Hex Hex Hex Hex )
+Hex ::= [0-9a-fA-F]
+
+# Number definition
+JsonNumber ::= "-"? ( "0" | [1-9] [0-9]* ) ( "." [0-9]+ )? ( [eE] [+-]? [0-9]+ )? ws 
