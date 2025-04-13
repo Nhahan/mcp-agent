@@ -1,24 +1,19 @@
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any, Union
-
-
-class ToolRequest(BaseModel):
-    tool_name: str
-    arguments: Dict[str, Any]
-    
-
-class ToolResponse(BaseModel):
-    content: List[Dict[str, Any]]
-
+from typing import Optional
+from pydantic import BaseModel
 
 class ChatRequest(BaseModel):
-    """Chat request from the user."""
-    message: str
-    conversation_id: Optional[str] = None
-    initial_prompt: Optional[str] = None
-    
-    
+    text: str
+    session_id: Optional[str] = None
+    # Remove language field
+    # language: Optional[str] = None # Optional: 'ko', 'en', etc. If not provided, will be detected.
+
 class ChatResponse(BaseModel):
-    """Response to a chat request."""
-    answer: str
-    conversation_id: str
+    response: str
+    error: Optional[ErrorDetail] = None
+    log_session_id: str
+    log_path: Optional[str] = None
+    # Remove detected_language field
+    # detected_language: Optional[str] = None
+
+class HealthResponse(BaseModel):
+    status: str 
