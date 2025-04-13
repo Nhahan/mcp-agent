@@ -1,8 +1,16 @@
 # MCP Agent
 
-![iamge](https://github.com/user-attachments/assets/e6d4ccc9-751e-44cf-bd3b-e2b4bd80e500)
+<div align="center">
+
+![logo_image](https://github.com/user-attachments/assets/e8928978-5d79-415f-b0d2-5d8a03dcb445)
+
+</div>
 
 ## Introduction
+
+![ai](https://github.com/user-attachments/assets/af60fd4f-26e8-4c1a-9065-0acae5b25867)
+
+> *(This demo uses the `QwQ` 7B model)*
 
 MCP Agent is an AI assistant that runs on your computer. This AI assistant understands natural language commands and can perform various tasks using different tools. Through connection with external programs, it provides various functions such as file system access, web search, terminal command execution, and more.
 
@@ -28,7 +36,7 @@ MCP Agent is an AI assistant that runs on your computer. This AI assistant under
 2. **Download AI Model:**
    * This project uses `QwQ` models.
    * The model needs to be downloaded manually (it's a large file).
-   * You can download it from Hugging Face Hub (search for QwQ models from the Qwen team).
+   * You can download it from Hugging Face Hub (search for `QwQ` models from the Qwen team).
    * Save the downloaded model file in the `./models` directory on your local system.
 
 3. **Environment Configuration (`.env`):**
@@ -37,13 +45,7 @@ MCP Agent is an AI assistant that runs on your computer. This AI assistant under
 
      ```
      MODEL_FILENAME=QwQ-LCoT-7B-Instruct-IQ4_NL.gguf
-     MODEL_DIR=./models
-     N_CTX=32768
-     GPU_LAYERS=-1
-     GRAMMAR_PATH=react_output.gbnf
-     REACT_MAX_ITERATIONS=10
-     LOG_LEVEL=INFO
-     LOG_DIR=logs
+     REACT_MAX_ITERATIONS=20
      ```
 
 4. **Tool Configuration (`mcp.json`):**
@@ -91,7 +93,7 @@ To expand the AI assistant's capabilities, you can add new MCP servers to the `m
 
 ## Recommended Models
 
-We recommend using QwQ or Qwen series models for this project. These models have excellent reasoning capabilities and are optimized for tool use.
+We recommend using `QwQ` or `Qwen` series models for this project. These models have excellent reasoning capabilities and are optimized for tool use.
 
 ### Model Size Recommendations:
 * **Recommended**: Models with 14B parameters or larger for optimal performance
