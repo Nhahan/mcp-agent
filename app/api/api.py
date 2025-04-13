@@ -1,16 +1,15 @@
 import logging
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, AsyncGenerator
 from datetime import datetime
-import traceback
+import json
 
-from app.utils.lang_utils import classify_language
-
-from app.services.mcp_service import MCPService
 from app.core.config import settings
 from app.services.inference_service import InferenceService
+from app.services.mcp_service import MCPService
 from app.utils.log_utils import async_save_meta_log, get_session_log_directory
 from app.dependencies import get_mcp_service, get_inference_service
 
@@ -18,50 +17,32 @@ api_router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
+async def _stream_json_data(data_generator):
+    """Helper function to properly format JSON data for Server-Sent Events (SSE)"""
+    if isinstance(data_generator, list):
+        # If data_generator is a list, convert it to an async generator
+        async def list_to_generator():
+            for item in data_generator:
+                yield item
+        data_generator = list_to_generator()
+    
+    try:
+        async for data in data_generator:
+            if isinstance(data, str):
+                # If data is already a JSON string, use it directly
+                json_str = data
+            else:
+                # Otherwise convert to JSON
+                json_str = json.dumps(data)
+            # Format according to SSE spec: each message prefixed with "data: " and ending with "\n\n"
+            yield f"data: {json_str}\n\n"
+    except Exception as e:
+        logger.error(f"Error in _stream_json_data: {e}", exc_info=True)
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
 def get_session_id(request: Request) -> str:
     """Generates or retrieves a session ID."""
     return str(int(datetime.now().timestamp() * 1000))
-
-async def _translate_text(
-    text: str, 
-    target_language: str, 
-    source_language: str, 
-    inference_service: InferenceService
-) -> Optional[str]:
-    """Translates text between supported languages using the AI model."""
-    
-    # 1. Check if translation is necessary
-    if source_language == target_language:
-        logger.debug(f"Source and target languages are the same ({source_language}). No translation needed.")
-        return text
-
-    # 2. Define language names for the prompt
-    language_map = {"ko": "Korean", "en": "English"}
-    source_lang_name = language_map.get(source_language, source_language)
-    target_lang_name = language_map.get(target_language, target_language)
-
-    # 3. Construct the prompt
-    prompt = (
-        f"Translate the following {source_lang_name} text to {target_lang_name}. "
-        f"Output ONLY the translated {target_lang_name} text, without any introductory phrases, explanations, or quotation marks."
-        f"\n{source_lang_name} Text: {text}"
-        f"\n{target_lang_name} Translation:"
-    )
-    messages = [{"role": "user", "content": prompt}]
-        
-    translated_text = await inference_service.model_service.generate_chat(
-        messages=messages, 
-        grammar=None
-    )
-
-    # 4. Clean the response
-    cleaned_translation = translated_text.strip()
-    if cleaned_translation:
-        logger.debug(f"Translated {source_language} -> {target_language}: '{text}' -> '{cleaned_translation}'")
-        return cleaned_translation
-    else:
-        logger.warning(f"Translation result is empty after cleaning ({source_language}->{target_language}). Original response: '{translated_text}'. Returning None.")
-        return None
 
 # --- Pydantic Models ---
 class ChatRequest(BaseModel):
@@ -87,7 +68,6 @@ class ChatResponse(BaseModel):
     response: str
     error: Optional[ErrorDetail] = None
     log_session_id: str
-    detected_language: Optional[str] = None
     log_path: Optional[str] = None # Path to the meta.json log file
     # thoughts_and_actions field removed as it will be in meta.json
     full_response: Optional[Dict[str, Any]] = None # Keep for potential full debug output if needed
@@ -116,7 +96,6 @@ async def chat_endpoint(
     """
     Handle incoming chat requests, process them using the InferenceService with ReAct pattern,
     and return the final response.
-    Handles language detection and translation (KO <-> EN).
     Logs the interaction details to a session-specific meta.json file.
     """
     session_id = chat_request.session_id or get_session_id(request)
@@ -128,27 +107,19 @@ async def chat_endpoint(
 
     # Variables to store final results
     final_response_for_user = "An unexpected error occurred."
-    response_for_user_en = "An unexpected error occurred."
     error_detail_for_response: Optional[ErrorDetail] = None
 
     try:
         logger.debug(f"Received raw request body: {chat_request}")
 
-        # --- Language Handling (Input) ---
+        # --- Remove Language Handling --- 
         user_input = chat_request.text
-        detected_lang = chat_request.language or classify_language(user_input)
-        logger.info(f"Detected language: {detected_lang} for session {session_id}")
         
-        prompt_for_llm = user_input
-        if detected_lang == 'ko':
-            prompt_for_llm = await _translate_text(user_input, 'en', 'ko', inference_service)
-
-        # --- Initial Logging ---
+        prompt_for_llm = user_input 
         initial_meta = {
             "session_id": session_id,
             "start_time": datetime.now().isoformat(),
             "initial_request": user_input,
-            "language_detected": detected_lang,
             "model_info": { 
                 "name": Path(settings.model_path).name if settings.model_path else "unknown",
                 "path": settings.model_path,
@@ -176,7 +147,7 @@ async def chat_endpoint(
                     message="ReAct processing failed",
                     details=result.get("error")
                 )
-                response_for_user_en = f"Error processing your request: {error_detail_for_response.details}"
+                final_response_for_user = f"Error processing your request: {error_detail_for_response.details}"
                 await async_save_meta_log(
                     session_log_dir,
                     {"errors": [f"{error_detail_for_response.message}: {error_detail_for_response.details}"], "event_type": "react_error"},
@@ -185,7 +156,7 @@ async def chat_endpoint(
                 )
             else:
                 # ReAct processing successful
-                response_for_user_en = result.get("response", "No response generated.")
+                final_response_for_user = result.get("response", "No response generated.")
                 error_detail_for_response = None # No error
 
         except Exception as react_exc:
@@ -195,7 +166,7 @@ async def chat_endpoint(
                 message="Internal server error during ReAct processing",
                 details=str(react_exc)
             )
-            response_for_user_en = f"Sorry, an error occurred: {error_detail_for_response.details}"
+            final_response_for_user = f"Sorry, an error occurred: {error_detail_for_response.details}"
             await async_save_meta_log(
                 session_log_dir,
                 {"errors": [f"Unhandled ReAct error: {str(react_exc)}"], "event_type": "unhandled_react_error"},
@@ -210,7 +181,7 @@ async def chat_endpoint(
             message="Internal server error",
             details=str(e)
         )
-        response_for_user_en = f"Sorry, an unexpected error occurred: {error_detail_for_response.details}"
+        final_response_for_user = f"Sorry, an unexpected error occurred: {error_detail_for_response.details}"
         try:
             await async_save_meta_log(
                 session_log_dir,
@@ -220,20 +191,6 @@ async def chat_endpoint(
             )
         except Exception as log_err:
             logger.error(f"Failed to log unhandled endpoint error for session {session_id}: {log_err}")
-
-    # --- Final Response Translation (if needed) ---
-    final_response_for_user = response_for_user_en
-    if detected_lang == 'ko':
-        logger.info(f"Translating final EN response back to Korean for session {session_id}: {response_for_user_en[:100]}...")
-        try:
-            translated_response = await _translate_text(response_for_user_en, 'ko', 'en', inference_service)
-            if translated_response:
-                final_response_for_user = translated_response
-                logger.info(f"Response translated EN -> KO for session {session_id}")
-            else:
-                logger.warning(f"EN -> KO translation failed for final response. Returning English for session {session_id}")
-        except Exception as trans_e:
-            logger.error(f"Error during final response translation for session {session_id}: {trans_e}", exc_info=True)
 
     # --- Final Logging --- 
     logger.debug(f"Final response content being logged for session {session_id}: {final_response_for_user[:100]}...")
@@ -247,13 +204,14 @@ async def chat_endpoint(
     except Exception as log_err:
          logger.error(f"Failed to save final api_response log for session {session_id}: {log_err}")
 
-    # --- Return Response --- 
+    # --- Return Response (remove detected_language) --- 
+    log_file_path = session_log_dir / "meta.json"
     return ChatResponse(
         response=final_response_for_user,
         error=error_detail_for_response, 
         log_session_id=session_id,
         log_path=str(log_file_path) if log_file_path.exists() else None,
-        detected_language=detected_lang
+        # detected_language=detected_lang # Removed
     )
 
 @api_router.get("/health", response_model=HealthResponse, tags=["Status"])
@@ -286,4 +244,137 @@ async def health_check(
         model_exists=model_exists,
         mcp_servers=mcp_servers,
         version=settings.api_version # Use settings directly
+    ) 
+
+@api_router.post("/stream", tags=["Chat"])
+async def stream_chat(
+    chat_request: ChatRequest,
+    request: Request = None,
+    inference_service: InferenceService = Depends(get_inference_service),
+):
+    """
+    Stream the AI reasoning process and final answer using Server-Sent Events via POST.
+    Shows thinking responses during reasoning and only shows the final answer at the end.
+    """
+    # Extract text and session_id from the request body
+    text = chat_request.text
+    session_id = chat_request.session_id
+
+    if not session_id:
+        session_id = str(int(datetime.now().timestamp() * 1000))
+    
+    base_log_dir = Path(settings.log_dir)
+    session_log_dir = get_session_log_directory(base_log_dir, session_id)
+    session_log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Validate the input text is not empty
+    if not text.strip():
+        return StreamingResponse(
+            _stream_json_data([{"error": "Input text cannot be empty", "type": "error"}]),
+            media_type="text/event-stream"
+        )
+    
+    # Log the incoming request
+    logger.info(f"[Stream] Starting processing for {session_id}: {text[:50]}...")
+    
+    async def event_generator() -> AsyncGenerator[str, None]:
+        iterations_log = [] # Store detailed iteration logs
+        try:
+            prompt_for_llm = text
+            initial_meta = {
+                "session_id": session_id,
+                "start_time": datetime.now().isoformat(),
+                "initial_request": text,
+                "model_info": { 
+                     "name": Path(settings.model_path).name if settings.model_path else "unknown",
+                     "path": settings.model_path,
+                     "parameters": { "n_ctx": settings.n_ctx, "gpu_layers": settings.gpu_layers }
+                },
+                "iterations": [],
+                "errors": [],
+                "request_timestamp": datetime.now().isoformat(),
+                "event_type": "api_request"
+            }
+            await async_save_meta_log(session_log_dir, initial_meta, session_id)
+
+            # Stream the ReAct process
+            async for step in inference_service.stream_react_pattern(
+                initial_prompt=prompt_for_llm,
+                session_id=session_id,
+                session_log_dir=session_log_dir
+            ):
+                # Store iteration log from the step if available
+                if step.get("iteration_log"): 
+                    iterations_log.append(step["iteration_log"])
+                
+                # Determine step type
+                if "step_type" in step:
+                    step_type = step["step_type"]
+                elif "thought" in step:
+                    step_type = "thinking"
+                elif "response" in step and "error" not in step:
+                    step_type = "final_response"
+                elif "error" in step:
+                    step_type = "error"
+                else:
+                    # Log unknown step type for debugging
+                    logger.warning(f"[Stream] Received unknown step type from generator for {session_id}: {step}")
+                    step_type = "unknown"
+                
+                event_data = {}
+                
+                # Process based on step_type
+                if step_type == "thinking":
+                    # Thinking steps
+                    thought_for_user = step.get("thought", "")
+                    event_data = {"type": "thinking", "content": thought_for_user}
+                    
+                    # Include other potential fields
+                    if "tool" in step: event_data["tool"] = step["tool"]
+                    if "observation" in step: event_data["observation"] = step["observation"]
+                    if "error" in step: event_data["error"] = step["error"]
+                    if "feedback_provided" in step: event_data["feedback_provided"] = step["feedback_provided"]
+                    
+                elif step_type == "final_response":
+                    # Final response
+                    final_answer_for_user = step.get("response", "")                    
+                    event_data = {"type": "final", "content": final_answer_for_user}
+                    
+                    # Log final response details
+                    final_log_event = {
+                        "event_type": "api_streaming_complete",
+                        "final_response": final_answer_for_user,
+                        "iterations": iterations_log,
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    await async_save_meta_log(session_log_dir, final_log_event, session_id, merge=True)
+                    
+                elif step_type == "error" or step_type == "error_response":
+                    # Error processing
+                    error_msg = step.get("error", "Unknown error")
+                    error_content = step.get("response", f"Error: {error_msg}")
+                    event_data = {"type": "error", "content": error_content, "error": error_msg}
+                    
+                else:
+                    # Fallback for other types
+                    event_data = {"type": step_type, "data": step}
+                
+                # Yield the event data
+                yield json.dumps(event_data)
+
+        except Exception as e:
+            logger.error(f"Error during stream generation for session {session_id}: {e}", exc_info=True)
+            error_data = {"type": "error", "content": f"Server error during streaming: {str(e)}"}
+            yield json.dumps(error_data)
+            # Log the final error
+            final_error_log = {
+                "event_type": "api_streaming_error",
+                "error_details": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+            await async_save_meta_log(session_log_dir, final_error_log, session_id, merge=True)
+            
+    return StreamingResponse(
+        _stream_json_data(event_generator()),
+        media_type="text/event-stream"
     ) 
