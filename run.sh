@@ -1,77 +1,85 @@
 #!/bin/bash
 
-# Function to clean up background processes
+# MCP Agent 실행 스크립트
+# 백엔드 서버와 프론트엔드 개발 서버를 동시에 실행합니다.
+
+# 스크립트 종료 시 백그라운드 프로세스 정리
 cleanup() {
-    echo "Cleaning up..."
-    # Kill backend and frontend if they're running
-    if [ ! -z "$BACKEND_PID" ]; then
-        echo "Stopping backend server (PID: $BACKEND_PID)"
-        kill $BACKEND_PID 2>/dev/null
-    fi
-    
-    if [ ! -z "$FRONTEND_PID" ]; then
-        echo "Stopping frontend server (PID: $FRONTEND_PID)"
-        kill $FRONTEND_PID 2>/dev/null
-    fi
-    
-    exit 0
+  echo "프로세스 정리 중..."
+  if [ ! -z "$BACKEND_PID" ]; then
+    echo "백엔드 서버 종료 (PID: $BACKEND_PID)"
+    kill $BACKEND_PID 2>/dev/null
+  fi
+  if [ ! -z "$FRONTEND_PID" ]; then
+    echo "프론트엔드 서버 종료 (PID: $FRONTEND_PID)"
+    kill $FRONTEND_PID 2>/dev/null
+  fi
+  exit 0
 }
 
-# Set up trap to call cleanup function when script is interrupted
-trap cleanup INT TERM
+# Ctrl+C 등 인터럽트 신호 처리
+trap cleanup SIGINT SIGTERM
 
-# Check if required directories exist
+# 필요한 디렉토리가 있는지 확인
 if [ ! -d "app" ]; then
-    echo "Error: 'app' directory not found. Please run this script from the project root."
-    exit 1
+  echo "Error: 'app' 디렉토리를 찾을 수 없습니다. 루트 디렉토리에서 실행하세요."
+  exit 1
 fi
 
 if [ ! -d "frontend" ]; then
-    echo "Error: 'frontend' directory not found. Please run this script from the project root."
-    exit 1
+  echo "Error: 'frontend' 디렉토리를 찾을 수 없습니다. 루트 디렉토리에서 실행하세요."
+  exit 1
 fi
 
-# Start backend server
-echo "Starting backend server..."
-cd app
+# 로고 출력
+echo "---------------------------------------------"
+echo "  MCP Agent 개발 서버 시작"
+echo "---------------------------------------------"
+
+# 백엔드 서버 시작
+echo "백엔드 서버 시작 중..."
 python -m app.main &
 BACKEND_PID=$!
-cd ..
 
-# Wait a moment to ensure backend starts properly
+# 백엔드 서버가 제대로 시작되었는지 확인
 sleep 2
-
-# Check if backend is still running
-if ! kill -0 $BACKEND_PID 2>/dev/null; then
-    echo "Error: Backend server failed to start"
-    cleanup
-    exit 1
+if ! ps -p $BACKEND_PID > /dev/null; then
+  echo "Error: 백엔드 서버 실행 실패"
+  cleanup
+  exit 1
 fi
+echo "백엔드 서버 실행 중 (PID: $BACKEND_PID)"
+echo "백엔드 API 주소: http://localhost:8000"
 
-echo "Backend server running with PID: $BACKEND_PID"
-echo "API available at: http://localhost:8000/api/v1"
+# 프론트엔드 서버 시작
+echo "프론트엔드 서버 시작 중..."
+cd frontend 
 
-# Start frontend server
-echo "Starting frontend server..."
-cd frontend
+# npm install 추가 (필요한 경우에만 실행되도록 개선 가능)
+echo "프론트엔드 의존성 확인 및 설치 중..."
+npm install 
+
+echo "프론트엔드 개발 서버 실행 중..."
 npm run dev &
 FRONTEND_PID=$!
-cd ..
 
-# Wait a moment to ensure frontend starts properly
-sleep 2
-
-# Check if frontend is still running
-if ! kill -0 $FRONTEND_PID 2>/dev/null; then
-    echo "Error: Frontend server failed to start"
-    cleanup
-    exit 1
+# 프론트엔드 서버가 제대로 시작되었는지 확인
+sleep 5
+if ! ps -p $FRONTEND_PID > /dev/null; then
+  echo "Error: 프론트엔드 서버 실행 실패"
+  cleanup
+  exit 1
 fi
+echo "프론트엔드 서버 실행 중 (PID: $FRONTEND_PID)"
 
-echo "Frontend server running with PID: $FRONTEND_PID"
-echo "Frontend available at: http://localhost:5173"
+# 모든 서버가 실행된 후 정보 출력
+echo "---------------------------------------------"
+echo "MCP Agent 서버 실행 완료!"
+echo "프론트엔드: http://localhost:5173"
+echo "백엔드 API: http://localhost:8000"
+echo "백엔드 API 문서: http://localhost:8000/docs"
+echo "종료하려면 Ctrl+C를 누르세요."
+echo "---------------------------------------------"
 
-echo "MCP Agent is now running. Press Ctrl+C to stop."
-
-# Wait for user to press Ctrl+C
-wait
+# 백그라운드 프로세스가 종료될 때까지 대기
+wait 
