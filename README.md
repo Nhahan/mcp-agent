@@ -1,10 +1,11 @@
 # MCP Agent
 
 ![aii-ezgif com-crop](https://github.com/user-attachments/assets/3a872acc-3bee-4762-a22c-a28432923f46)
+> *(This demo uses the `QwQ` 7B model)*
+
+<br>
 
 ## Introduction
-
-> *(This demo uses the `QwQ` 7B model)*
 
 MCP Agent is an AI assistant that runs on your computer. This AI assistant understands natural language commands and can perform various tasks using different tools. Through connection with external programs, it provides various functions such as file system access, web search, terminal command execution, and more.
 
