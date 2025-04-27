@@ -16,12 +16,15 @@ class ToolResult(TypedDict):
 # ReWOO step-specific data structures
 class PlanStep(TypedDict):
     """ Represents a single step in the reasoning plan. """
+    step_index: int # Added: The sequential index of this step in the plan
     thought: str # The reasoning/thought process for this step
     tool_call: Optional[ToolCall] # The tool call planned for this step, if any
+    expected_outcome: Optional[str] = None # Added: What this step is expected to achieve
+    status: str = "pending" # Added: Execution status (e.g., pending, success, failed)
 
 class Evidence(TypedDict):
     """ Represents the evidence gathered from a tool execution, linked to a plan step. """
-    step_index: int # The index of the plan step this evidence corresponds to
+    step_index: int # The index of the plan step this evidence corresponds to (matches PlanStep.step_index)
     tool_result: ToolResult # The result of the tool execution
     processed_evidence: str # A summary or processed form of the tool output (potentially LLM generated)
 
