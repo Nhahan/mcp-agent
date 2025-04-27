@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-agent"
+version = "0.1.0"
+description = "A ReWOO agent using Langchain/Langgraph and MCP tools"
+authors = [
+  { name = "Nhahan", email = "kisy324@naver.com" },
+]
+requires-python = ">=3.9"
+# Add dependencies here if using pyproject.toml for dependency management
+# dependencies = [
+#     "langchain",
+#     "langgraph",
+#     "llama-cpp-python",
+#     "python-dotenv",
+# ]
+
+[tool.ruff]
+line-length = 120
+select = ["E", "F", "W", "I", "UP"] # 기본 규칙 + isort + pyupgrade
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = false
+disallow_untyped_defs = true 
