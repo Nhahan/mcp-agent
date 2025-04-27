@@ -1,0 +1,13 @@
+# Core Langchain libraries
+langchain
+langgraph
+
+# LLM support (for local GGUF model)
+llama-cpp-python
+
+# Environment variable management
+python-dotenv
+
+# Development tools
+ruff
+mypy 
