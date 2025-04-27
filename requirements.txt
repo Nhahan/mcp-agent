@@ -10,4 +10,7 @@ python-dotenv
 
 # Development tools
 ruff
-mypy 
+mypy
+
+# Testing
+pytest 
