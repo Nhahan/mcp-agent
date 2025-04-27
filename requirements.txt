@@ -1,6 +1,12 @@
 # Core Langchain libraries
+langchain-core
 langchain
 langgraph
+langchain-community
+
+# MCP Integration
+langchain-mcp-adapters
+mcp # Required by langchain-mcp-adapters for server definitions
 
 # LLM support (for local GGUF model)
 llama-cpp-python
