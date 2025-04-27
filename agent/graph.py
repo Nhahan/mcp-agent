@@ -1,16 +1,35 @@
 # agent/graph.py
-from typing import List, Dict, Any, Optional, AsyncGenerator
+from typing import List, Dict, Any, Optional, AsyncGenerator, Tuple
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.tools import BaseTool
 from langgraph.graph import StateGraph, END
 from functools import partial
+import asyncio
+import json
+import re # Import re for parsing in final_answer_node
+import logging # Import logging
+from contextlib import asynccontextmanager # Import asynccontextmanager
 
 # Import state definition and component functions
 from .state import ReWOOState, PlanStep, Evidence, ToolResult, ToolCall
-from .planner import generate_plan
+from .planner import generate_plan, parse_plan, _format_plan_to_string, _format_tool_descriptions
 from .solver import generate_final_answer
 # Import MCP client from adapter library
 from langchain_mcp_adapters.client import MultiServerMCPClient
+
+from agent.prompts.plan_prompts import PLANNER_PROMPT_TEMPLATE, PLANNER_REFINE_PROMPT_TEMPLATE
+from agent.prompts.answer_prompts import FINAL_ANSWER_PROMPT_TEMPLATE
+from agent.validation import PlanValidator
+from agent.tools.registry import ToolRegistry
+
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.language_models import BaseChatModel
+
+# --- Logging Setup --- #
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
+logger = logging.getLogger(__name__)
+# --- End Logging Setup --- #
 
 # Helper function to find a tool by name from the list
 def find_tool_by_name(tools: List[BaseTool], name: str) -> Optional[BaseTool]:
@@ -21,109 +40,231 @@ def find_tool_by_name(tools: List[BaseTool], name: str) -> Optional[BaseTool]:
 
 # --- LangGraph Nodes ---
 
-async def planner_node(state: ReWOOState, llm: BaseLanguageModel, tools: List[BaseTool]) -> Dict[str, Any]:
-    """ Generates the plan based on the input query. """
-    print("\n--- Running Planner Node ---")
-    query = state['input_query']
-    try:
-        plan_steps = await generate_plan(llm, tools, query)
-        # Initialize state fields needed for the graph execution
-        return {
-            "plan": plan_steps,
-            "current_step_index": 0,
-            "evidence": [],
-            "final_answer": None,
-            "error": None
-        }
-    except Exception as e:
-        print(f"Error in Planner Node: {e}")
-        return {"error": f"Planner failed: {e}", "plan": [], "evidence": []} # Ensure keys exist even on error
+async def planning_node(state: ReWOOState, llm: BaseLanguageModel, tools: List[BaseTool]) -> Dict[str, Any]:
+    """
+    Generates the initial plan based on the user query using planner functions.
+    Sets workflow_status to 'route_to_selector' on success, 'failed' on error.
+    """
+    logger.info("--- Starting Planning Node ---")
+    query = state["original_query"]
+    max_retries = state.get("max_retries", 1)
+    current_retries = 0
+    last_error_list = None
+    last_plan = None
 
-async def worker_node(state: ReWOOState, tools: List[BaseTool]) -> Dict[str, Any]:
-    """ Executes the tool call for the current plan step or advances index. """
-    current_step_index = state.get('current_step_index', 0)
-    plan = state.get('plan', [])
-    evidence = state.get('evidence', [])
-    print(f"\n--- Running Worker Node (Step {current_step_index + 1}/{len(plan)}) ---")
+    validator = PlanValidator() # Assume no tool names needed for basic validation here
+    tool_descriptions = _format_tool_descriptions(tools) # Format tool descriptions
 
+    while current_retries <= max_retries:
+        logger.info(f"Planning attempt {current_retries + 1}/{max_retries + 1}")
+        try:
+            # Correct the keys for the prompt template
+            prompt_args = {
+                "query": query, # Use 'query' key
+                "tool_descriptions": tool_descriptions # Add tool descriptions
+            }
+            if current_retries > 0 and last_plan is not None and last_error_list is not None:
+                logger.info("Refining previous plan due to validation errors.")
+                prompt_template = PLANNER_REFINE_PROMPT_TEMPLATE
+                prompt_args['previous_plan'] = _format_plan_to_string(last_plan)
+                prompt_args['validation_errors'] = "\n".join([f"- {err}" for err in last_error_list])
+            else:
+                logger.info("Generating initial plan.")
+                prompt_template = PLANNER_PROMPT_TEMPLATE
+
+            # Chain the prompt and LLM
+            plan_chain = prompt_template | llm
+            response = await plan_chain.ainvoke(prompt_args)
+            response_content = response.content if hasattr(response, 'content') else str(response)
+            logger.debug(f"Raw LLM Response:\n{response_content}")
+
+            # Use the imported parse_plan function
+            current_plan = parse_plan(response_content)
+            logger.info(f"Parsed Plan: {current_plan}")
+
+            if not current_plan:
+                 # If parsing returns empty list, even if LLM returned content, consider it an error
+                 if response_content.strip():
+                     raise ValueError("LLM returned content but parsing resulted in an empty plan.")
+                 else:
+                     raise ValueError("LLM returned empty content.")
+
+            # Validate the plan
+            is_valid, errors = validator.validate(current_plan)
+
+            if is_valid:
+                logger.info("Plan validation successful.")
+                return {
+                    "plan": current_plan,
+                    "current_step_index": 0,
+                    "evidence": [],
+                    "workflow_status": "route_to_selector", # Explicit routing instruction
+                    "error_message": None
+                }
+            else:
+                # Extract error messages for refinement prompt
+                last_error_list = [f"Step {idx if idx >=0 else 'N/A'}: {desc[1]}" for idx, desc in enumerate(errors)]
+                logger.warning(f"Plan validation failed: {last_error_list}")
+                last_plan = current_plan
+                current_retries += 1
+
+        except Exception as e:
+            logger.error(f"Error during planning attempt {current_retries + 1}", exc_info=True)
+            last_error_list = [f"Unexpected planning error: {e}"]
+            # Keep the last plan if it exists, otherwise it remains None
+            last_plan = current_plan if current_plan else last_plan
+            current_retries += 1
+
+    logger.error(f"Max retries ({max_retries + 1}) reached for planning.")
+    # Explicitly set workflow status to failed
+    return {
+        "error_message": f"Planning failed after {max_retries + 1} attempts. Last errors: {last_error_list}",
+        "workflow_status": "failed",
+        "plan": last_plan or [],
+        "evidence": []
+    }
+
+async def tool_selection_node(state: ReWOOState) -> Dict[str, Any]:
+    """
+    Selects the tool for the current step based on the plan.
+    Routes to final answer generation if the plan is complete or an error occurred.
+    Updates workflow_status to 'tool_input_preparation', 'final_answer', or 'tool_selection' (loop).
+    """
+    logger.info("--- Starting Tool Selection Node ---")
+    # Check for prior errors first - THIS CHECK IS REDUNDANT if planner routes correctly
+    # if state.get("error_message") and state.get("workflow_status") == "failed":
+    #     logger.warning("Previous node failed. Routing to END.")
+    #     return {"workflow_status": "failed"} # Let routing handle failed status
+
+    plan = state["plan"]
+    current_step_index = state["current_step_index"]
+
+    # Handle empty plan (should have been caught by planner routing, but defensive check)
+    if not plan:
+        logger.error("Tool selector called with empty plan. Routing to END.")
+        return {"workflow_status": "failed", "error_message": "Tool selector called with empty plan."} 
 
     if current_step_index >= len(plan):
-        print("Worker Node: Plan already finished according to index.")
-        # This path shouldn't be reached if routing logic is correct, but handle defensively
-        return {}
+        logger.info("Plan finished. Moving to final answer generation.")
+        return {"workflow_status": "final_answer"} # Signal to route to final answer
 
-    current_step: PlanStep = plan[current_step_index]
-    tool_call: Optional[ToolCall] = current_step.get('tool_call')
+    current_step = plan[current_step_index]
+    tool_call_data = current_step.get("tool_call") # This is now a dict or None
+    step_number = current_step_index + 1
 
-    if not tool_call:
-        print(f"Worker Node: No tool call required for step {current_step_index + 1}. Advancing index.")
-        # Just advance the index if no tool is needed for this step
-        return {"current_step_index": current_step_index + 1}
+    if not tool_call_data or not isinstance(tool_call_data, dict):
+        logger.info(f"No tool call required for step {step_number}. Considering step complete (thought only).")
+        # Collect thought as evidence and move to the next step
+        thought_evidence = f"Step {step_number} Thought: {current_step.get('thought', '(No thought provided)')}"
+        logger.debug(f"Adding thought as evidence: {thought_evidence}")
+        current_evidence = state.get("evidence", [])
+        return {
+            "current_step_index": current_step_index + 1,
+            "evidence": current_evidence + [thought_evidence],
+            "tool_name": None, # Ensure tool_name is None for thought-only step
+            "workflow_status": "tool_selection" # Loop back to select for the *next* step
+        }
 
-    tool_name = tool_call['tool_name']
-    tool_args = tool_call['arguments']
+    # Extract tool name
+    tool_name = tool_call_data.get("tool_name")
+    if not tool_name:
+        logger.error(f"Tool name missing in tool_call data for step {step_number}: {tool_call_data}")
+        # Treat as failure for this step
+        return {
+            "error_message": f"Tool name missing for step {step_number}.",
+            "workflow_status": "failed",
+            "current_step_index": current_step_index + 1 # Increment index to avoid infinite loop
+        }
 
-    # Substitute evidence variables (#E<n>) in arguments
+    logger.info(f"Selected tool: '{tool_name}' for step {step_number}")
+    # Set tool_name and signal to prepare input
+    return {"tool_name": tool_name, "workflow_status": "tool_input_preparation"}
+
+async def tool_input_preparation_node(state: ReWOOState) -> Dict[str, Any]:
+    """
+    Prepares the input arguments for the selected tool based on the current plan step.
+    Handles substituting evidence placeholders like #E1, #E2 etc.
+    Sets workflow_status to 'tool_execution' on success, 'failed' on error.
+    """
+    logger.info("--- Starting Tool Input Preparation Node ---")
+    plan = state["plan"]
+    current_step_index = state["current_step_index"]
+    tool_name = state.get("tool_name")
+    evidence_list = state.get("evidence", []) # Get collected evidence
+    step_number = current_step_index + 1
+
+    # --- Defensive Checks --- #
+    if tool_name is None:
+         logger.error(f"Tool name is None in state at step {step_number}. Aborting preparation.")
+         return {"workflow_status": "failed", "error_message": f"Tool name missing at step {step_number}"}
+    if current_step_index >= len(plan):
+        logger.error(f"Index out of bounds ({current_step_index}) at step {step_number}. Aborting preparation.")
+        return {"workflow_status": "failed", "error_message": "Tool input preparation called after plan finished."}
+    # --- End Defensive Checks --- #
+
+    current_step = plan[current_step_index]
+    tool_call_data = current_step.get("tool_call") # dict or None
+
+    # Defensive check (should be caught by selection node)
+    if not tool_call_data or not isinstance(tool_call_data, dict) or tool_call_data.get("tool_name") != tool_name:
+        logger.error(f"Tool call data mismatch or missing for step {step_number}. Expected tool: '{tool_name}', got: {tool_call_data}")
+        return {"workflow_status": "failed", "error_message": f"Tool call data mismatch for step {step_number}."}
+
+    # Get arguments from the parsed tool_call dictionary
+    raw_args = tool_call_data.get("arguments", {})
+    if not isinstance(raw_args, dict):
+        logger.warning(f"Arguments for step {step_number} are not a dict: {raw_args}. Attempting to use anyway.")
+        # If it's not a dict, how to substitute? Treat as error or single arg?
+        # Let's treat as error for now, planner should ensure args are dict.
+        return {"workflow_status": "failed", "error_message": f"Invalid argument format (not a dict) for step {step_number}."}
+
     try:
-        print(f"Worker Node: Attempting to substitute evidence in args: {tool_args}")
-        substituted_args = _substitute_evidence(tool_args, evidence)
-        print(f"Worker Node: Substituted args: {substituted_args}")
+        # Substitute evidence placeholders (#E1, #E2, ...)
+        logger.debug(f"Raw parsed input args for step {step_number}: {raw_args}")
+        substituted_input = _substitute_evidence_in_args(raw_args, evidence_list, step_number)
+        logger.info(f"Prepared input for '{tool_name}' (Step {step_number}): {substituted_input}")
+
+        return {"tool_input": substituted_input, "workflow_status": "tool_execution"}
     except Exception as e:
-        print(f"Error substituting evidence for step {current_step_index + 1}: {e}")
-        # Record the error as evidence for this step
-        error_result = ToolResult(tool_name=tool_name, output=None, error=f"Evidence substitution failed: {e}")
-        new_evidence = Evidence(step_index=current_step_index + 1, tool_result=error_result, processed_evidence=f"Error: {e}")
-        return {"evidence": evidence + [new_evidence], "current_step_index": current_step_index + 1}
+        logger.error(f"Error substituting arguments for tool call at step {step_number}", exc_info=True)
+        return {"workflow_status": "failed", "error_message": f"Failed to substitute arguments for step {step_number}: {e}"}
 
-
-    print(f"Worker Node: Executing tool '{tool_name}' with args: {substituted_args}")
-    target_tool = find_tool_by_name(tools, tool_name)
-
-    if not target_tool:
-        print(f"Worker Node: Tool '{tool_name}' not found.")
-        error_result = ToolResult(tool_name=tool_name, output=None, error=f"Tool '{tool_name}' not found.")
-        new_evidence = Evidence(step_index=current_step_index + 1, tool_result=error_result, processed_evidence=f"Error: Tool not found")
-    else:
-        try:
-            # Execute the tool (Langchain Tool's coroutine handles execution, adapter handles MCP call)
-            tool_output = await target_tool.arun(substituted_args)
-            print(f"Worker Node: Tool '{tool_name}' output: {tool_output}")
-            tool_result = ToolResult(tool_name=tool_name, output=tool_output, error=None)
-            # TODO: Implement 'processed_evidence' generation (potentially another LLM call)
-            # For now, just use the raw output or a summary
-            processed_evidence_str = f"Executed {tool_name}, output: {str(tool_output)[:200]}..." # Simple summary
-            new_evidence = Evidence(step_index=current_step_index + 1, tool_result=tool_result, processed_evidence=processed_evidence_str)
-        except Exception as e:
-            import traceback
-            print(f"Worker Node: Error executing tool '{tool_name}': {e}")
-            traceback.print_exc() # Print stack trace for debugging
-            error_result = ToolResult(tool_name=tool_name, output=None, error=str(e))
-            new_evidence = Evidence(step_index=current_step_index + 1, tool_result=error_result, processed_evidence=f"Error executing tool: {e}")
-
-    # Add the new evidence and move to the next step index
-    return {"evidence": evidence + [new_evidence], "current_step_index": current_step_index + 1}
-
-
-def _substitute_evidence(args: Dict[str, Any], evidence_list: List[Evidence]) -> Dict[str, Any]:
-    """ Substitutes #E<n> placeholders in args with actual evidence output. Handles nested structures. """
-    # Create a map from placeholder (e.g., #E1) to the corresponding tool output
-    evidence_map = {f"#E{e['step_index']}": e['tool_result']['output'] 
-                    for e in evidence_list if not e['tool_result'].get('error')}
-    print(f"Evidence map for substitution: {evidence_map}")
+def _substitute_evidence_in_args(args: Dict[str, Any], evidence_list: List[Any], step_number_for_log: int) -> Dict[str, Any]:
+    """ Substitutes #E<n> placeholders in args values with actual evidence. """
+    # Create a map from placeholder (e.g., #E1) to the corresponding evidence
+    # Assuming evidence_list stores the direct output/error string for simplicity now
+    evidence_map = {f"#E{i+1}": evidence for i, evidence in enumerate(evidence_list)}
+    logger.debug(f"(Step {step_number_for_log}) Evidence map for substitution: {evidence_map}")
 
     def recursive_substitute(value: Any) -> Any:
         if isinstance(value, str):
-            if value.startswith("#E"):
-                if value in evidence_map:
-                    print(f"Substituting placeholder '{value}'")
-                    return evidence_map[value]
+            # Use regex to find all #E<n> occurrences
+            def replace_match(match):
+                placeholder = match.group(0)
+                if placeholder in evidence_map:
+                    # Replace with the actual evidence
+                    # Return the evidence directly (could be string, dict, list...)
+                    # Be careful if downstream tool expects only strings!
+                    logger.debug(f"(Step {step_number_for_log}) Substituting placeholder '{placeholder}'")
+                    return evidence_map[placeholder]
                 else:
-                    # Allow missing evidence for flexibility, return placeholder
-                    print(f"Warning: Evidence placeholder '{value}' not found in collected evidence: {list(evidence_map.keys())}. Keeping placeholder.")
-                    # raise ValueError(f"Evidence placeholder '{value}' not found in collected evidence: {list(evidence_map.keys())}")
-                    return value
+                    # Allow missing evidence, return placeholder or raise error?
+                    logger.warning(f"(Step {step_number_for_log}) Evidence placeholder '{placeholder}' not found. Keeping placeholder.")
+                    return placeholder # Keep placeholder if not found
+
+            # Substitute all occurrences in the string
+            # We need to handle the case where the evidence itself is not a string
+            # This simple regex substitution assumes we want string replacement
+            # If evidence can be other types, this needs more complex handling
+            new_value_str, num_subs = re.subn(r"#E\d+", replace_match, value)
+
+            # If the *entire* string was a placeholder and replaced with non-string, return the object
+            if num_subs == 1 and value in evidence_map and not isinstance(evidence_map[value], str):
+                 logger.debug(f"(Step {step_number_for_log}) Placeholder '{value}' replaced with non-string object.")
+                 return evidence_map[value]
             else:
-                return value
+                 return new_value_str
+
         elif isinstance(value, dict):
             return {k: recursive_substitute(v) for k, v in value.items()}
         elif isinstance(value, list):
@@ -133,286 +274,361 @@ def _substitute_evidence(args: Dict[str, Any], evidence_list: List[Evidence]) ->
 
     return recursive_substitute(args)
 
+async def tool_execution_node(state: ReWOOState, tool_registry: ToolRegistry) -> Dict[str, Any]:
+    """
+    Executes the selected tool with the prepared input and stores the output as evidence.
+    Increments the step index.
+    Sets workflow_status to 'tool_selection' on success, 'failed' on error.
+    """
+    logger.info("--- Starting Tool Execution Node ---")
+    tool_name = state.get("tool_name")
+    tool_input = state.get("tool_input", {})
+    current_step_index = state.get("current_step_index", 0)
+    current_evidence = state.get("evidence", [])
+    step_number = current_step_index + 1
 
-async def solver_node(state: ReWOOState, llm: BaseLanguageModel) -> Dict[str, Any]:
-    """ Generates the final answer based on the collected evidence. """
-    print("\n--- Running Solver Node ---")
-    if state.get("error"): # If there was an error earlier, skip solving
-         print("Solver Node: Skipping due to previous error.")
-         # Even if skipping, ensure final_answer key exists if graph expects it
-         return {"final_answer": state.get("final_answer")}
+    if not tool_name:
+        logger.error("Tool name missing.")
+        return {
+            "error_message": "Tool name not found in state for execution.",
+            "workflow_status": "failed",
+            "evidence": current_evidence + ["Error: Tool name missing."],
+            "current_step_index": current_step_index + 1 # Increment index
+        }
+
+    output_evidence = None
+    next_status = "tool_selection" # Default next step is selecting tool for next step
+
     try:
-        final_answer = await generate_final_answer(llm, state)
-        return {"final_answer": final_answer}
+        tool_callable = tool_registry.get_tool(tool_name)
+        if not tool_callable:
+            error_msg = f"Error: Tool '{tool_name}' not found in registry."
+            logger.error(f"(Step {step_number}) {error_msg}")
+            output_evidence = error_msg # Store error as evidence
+            next_status = "failed" # Mark workflow as failed
+        else:
+            logger.info(f"(Step {step_number}) Executing tool: {tool_name} with input: {tool_input}")
+            # Execute the tool - assuming synchronous for now
+            tool_output = tool_callable(**tool_input) # Pass input as keyword arguments
+            logger.info(f"(Step {step_number}) Raw Tool '{tool_name}' output: {str(tool_output)[:500]}...")
+            output_evidence = tool_output # Store the actual output
+
     except Exception as e:
-        print(f"Error in Solver Node: {e}")
-        # Return error state, but ensure keys graph expects are present
-        return {"error": f"Solver failed: {e}", "final_answer": state.get("final_answer")}
+        error_msg = f"Error executing tool '{tool_name}' (Step {step_number}): {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        output_evidence = error_msg # Store error as evidence
+        next_status = "failed" # Mark workflow as failed
 
-# --- Conditional Edge Logic ---
+    # Increment step index for the next iteration
+    next_step_index = current_step_index + 1
 
-def should_continue(state: ReWOOState) -> str:
-    """ Determines whether to continue the plan execution or move to the solver. """
-    print("\n--- Checking Condition: Should Continue? ---")
-    if state.get("error"): # Check if any node set an error
-         print("Condition: Error detected in state, routing to END.")
-         return "__end__" # Use LangGraph's END sentinel
+    # Append the evidence (could be successful output or error message)
+    updated_evidence = current_evidence + [output_evidence]
+    logger.debug(f"(Step {step_number}) Evidence collected: {str(output_evidence)[:100]}...")
 
-    plan = state.get('plan', [])
-    current_step_index = state.get('current_step_index', 0)
+    return {
+        "current_step_index": next_step_index,
+        "evidence": updated_evidence,
+        "workflow_status": next_status, # Either 'tool_selection' or 'failed'
+        "error_message": state.get("error_message") if next_status == "failed" else None # Keep/set error if failed
+    }
 
-    if not plan: # Handle case where planner failed to produce a plan
-        print("Condition: No plan found, routing to END.")
-        return "__end__"
+async def final_answer_node(state: ReWOOState, llm: BaseLanguageModel) -> Dict[str, Any]:
+    """
+    Generates the final answer based on the original query and collected evidence.
+    Sets workflow_status to 'finished' on success, 'failed' on error.
+    """
+    logger.info("--- Starting Final Answer Node ---")
+    # Check for errors from previous steps before proceeding
+    if state.get("workflow_status") == "failed":
+        logger.warning("Skipping final answer generation due to previous failure.")
+        # Return existing state, ensuring final_answer is None and evidence is preserved
+        return {**state, "final_answer": None, "evidence": state.get("evidence", [])}
 
-    if current_step_index >= len(plan):
-        print(f"Condition: Plan finished (Index {current_step_index} >= Plan length {len(plan)}), routing to Solver.")
-        return "solve"
-    else:
-        # Always route to worker if plan is not finished
-        print(f"Condition: Plan not finished (Index {current_step_index} < Plan length {len(plan)}), routing to Worker.")
-        return "work"
+    original_query = state["original_query"]
+    evidence_list = state.get("evidence", [])
+    max_retries = state.get("max_retries", 1)
+    current_retries = 0
+    last_error = None
 
+    # Format evidence for the prompt
+    formatted_evidence = "\n".join([
+        f"- Evidence from Step {i+1}: {json.dumps(ev) if isinstance(ev, (dict, list)) else str(ev)}"
+        for i, ev in enumerate(evidence_list)
+    ])
+    if not formatted_evidence:
+        formatted_evidence = "No evidence was collected."
+    logger.debug(f"Evidence for prompt:\n{formatted_evidence}")
 
-# --- Graph Construction ---
-
-def create_rewoo_graph(llm: BaseLanguageModel, tools: List[BaseTool]) -> StateGraph:
-    """ Creates and configures the LangGraph StateGraph for the ReWOO agent. """
-    builder = StateGraph(ReWOOState)
-
-    # Bind the tools list to the worker node using partial
-    # Planner also needs tools to inform the plan generation
-    bound_planner_node = partial(planner_node, llm=llm, tools=tools)
-    bound_worker_node = partial(worker_node, tools=tools) # Pass tools here
-    bound_solver_node = partial(solver_node, llm=llm)
-
-    builder.add_node("planner", bound_planner_node)
-    builder.add_node("worker", bound_worker_node)
-    builder.add_node("solver", bound_solver_node)
-
-    # Define edges
-    builder.set_entry_point("planner")
-
-    # After planner, decide where to go (usually worker or end if planner failed)
-    builder.add_conditional_edges(
-        "planner",
-        lambda state: "__end__" if state.get("error") else "worker",
-        {"worker": "worker", "__end__": END}
+    # Use the prompt template
+    prompt = FINAL_ANSWER_PROMPT_TEMPLATE.format(
+        original_query=original_query,
+        collected_evidence=formatted_evidence
     )
 
-    # Conditional edge after worker
-    builder.add_conditional_edges(
-        "worker",
-        should_continue, # Function determines the next step
+    while current_retries <= max_retries:
+        logger.info(f"Final Answer generation attempt {current_retries + 1}/{max_retries + 1}")
+        try:
+            # Invoke LLM
+            response = await llm.ainvoke(prompt)
+            response_content = response.content if hasattr(response, 'content') else str(response)
+            logger.debug(f"Raw LLM Response:\n{response_content}")
+            final_answer = response_content.strip()
+            if not final_answer:
+                raise ValueError("LLM returned an empty final answer.")
+
+            logger.info(f"Generated Final Answer: {final_answer}")
+            # *** Ensure evidence is preserved on success ***
+            return {
+                "final_answer": final_answer,
+                "workflow_status": "finished",
+                "error_message": None,
+                "evidence": state.get("evidence", [])
+            }
+        except Exception as e:
+            logger.error(f"Error during final answer generation attempt {current_retries + 1}", exc_info=True)
+            last_error = e
+            current_retries += 1
+
+    # If loop finishes without success
+    logger.error(f"Max retries ({max_retries + 1}) reached for final answer generation.")
+    error_msg = f"Final answer generation failed after {max_retries + 1} attempts: {last_error}"
+    # *** Preserve evidence on failure too ***
+    return {
+        "final_answer": None,
+        "error_message": error_msg,
+        "workflow_status": "failed",
+        "evidence": state.get("evidence", [])
+    }
+
+# --- Conditional Edge Logic (Routing based on workflow_status) ---
+
+def route_workflow(state: ReWOOState) -> str:
+    """Determines the next node based on the workflow_status set by the previous node."""
+    status = state.get("workflow_status")
+    logger.info(f"--- Routing based on status: '{status}' ---")
+
+    if status == "failed":
+        logger.info("Routing -> END (Workflow Failed)")
+        return "__end__"
+    elif status == "route_to_selector": # Check for the new explicit status
+        logger.info("Routing -> tool_selector")
+        return "tool_selector" # Return the node name directly
+    elif status == "tool_input_preparation":
+        logger.info("Routing -> tool_input_preparer")
+        return "tool_input_preparer"
+    elif status == "tool_execution":
+        logger.info("Routing -> tool_executor")
+        return "tool_executor"
+    elif status == "final_answer": # Status set by tool_selector when plan is done
+        logger.info("Routing -> final_answer_node")
+        return "final_answer_node"
+    elif status == "finished": # Status set by final_answer_node on success
+        logger.info("Routing -> END (Workflow Finished)")
+        return "__end__"
+    # Handle the loop back for thought-only steps from tool_selector
+    elif status == "tool_selection": # This status should now only be set by tool_selector for looping
+        logger.info("Routing -> tool_selector (Looping back for next step/thought)")
+        return "tool_selector"
+    else:
+        # Default/fallback: if status is unexpected or None, end the graph
+        logger.warning(f"Routing -> END (Unknown or missing status: '{status}')")
+        return "__end__"
+
+# --- Graph Construction --- #
+
+def build_rewoo_graph(llm: BaseLanguageModel, tools: List[BaseTool], tool_registry: ToolRegistry) -> StateGraph:
+    """ Creates and configures the LangGraph StateGraph for the ReWOO agent. """
+    workflow = StateGraph(ReWOOState)
+
+    # Bind components to nodes
+    bound_planning_node = partial(planning_node, llm=llm, tools=tools)
+    bound_tool_executor_node = partial(tool_execution_node, tool_registry=tool_registry)
+    bound_final_answer_node = partial(final_answer_node, llm=llm)
+
+    # Add nodes (use descriptive names)
+    workflow.add_node("planner", bound_planning_node)
+    workflow.add_node("tool_selector", tool_selection_node)
+    workflow.add_node("tool_input_preparer", tool_input_preparation_node)
+    workflow.add_node("tool_executor", bound_tool_executor_node)
+    workflow.add_node("final_answer_node", bound_final_answer_node) # Corrected node name
+
+    # Set entry point
+    workflow.set_entry_point("planner")
+
+    # Define edges using the route_workflow function
+    # Each node (except entry) should decide the *next* intended status
+
+    # Planner routes based on its success/failure
+    workflow.add_conditional_edges(
+        "planner",
+        route_workflow, # Uses status set by planner node ('route_to_selector' or 'failed')
         {
-            "work": "worker",   # Loop back to worker for the next step
-            "solve": "solver",  # Finish plan, go to solver
-            "__end__": END    # Go to end if error occurred or condition dictates
+            "tool_selector": "tool_selector", # If route_workflow returns 'tool_selector'
+            "__end__": END                  # If route_workflow returns '__end__'
         }
     )
 
-    builder.add_edge("solver", END) # Go to end after solving
+    # Tool selector routes based on its decision
+    workflow.add_conditional_edges(
+        "tool_selector",
+        route_workflow, # Uses status set by tool_selector ('tool_input_preparation', 'final_answer', 'tool_selection', 'failed')
+        {
+            "tool_input_preparer": "tool_input_preparer",
+            "final_answer_node": "final_answer_node",
+            "tool_selector": "tool_selector", # For looping back
+            "__end__": END
+        }
+    )
+
+    # Tool input preparer routes based on its success/failure
+    workflow.add_conditional_edges(
+        "tool_input_preparer",
+        route_workflow, # Uses status set by preparer ('tool_execution' or 'failed')
+        {
+            "tool_executor": "tool_executor", # Corrected: Map status 'tool_execution' to node 'tool_executor'
+            "__end__": END                 # Map status 'failed' to END
+        }
+    )
+
+    # Tool executor routes based on its success/failure
+    workflow.add_conditional_edges(
+        "tool_executor",
+        route_workflow, # Uses status set by executor ('tool_selection' or 'failed')
+        {
+            "tool_selector": "tool_selector", # Corrected: Map status/return value 'tool_selector' to node 'tool_selector'
+            "__end__": END                 # Map status 'failed' to END
+        }
+    )
+
+    # Final answer node routes based on its success/failure
+    workflow.add_conditional_edges(
+        "final_answer_node",
+        route_workflow, # Uses status set by final answer node ('finished' or 'failed')
+        {
+            "__end__": END
+        }
+    )
 
     # Compile the graph
-    graph = builder.compile()
-    print("ReWOO graph compiled successfully.")
-    return graph
+    app = workflow.compile()
+    logger.info("ReWOO graph compiled successfully with updated routing.")
+    return app
 
-# --- MCP Client and Tool Loading Context Manager ---
-
-# Define your MCP server configurations here
-# IMPORTANT: Replace placeholders like '/path/to/' with actual absolute paths
-#            or use environment variables / configuration files.
-# Example using taskmaster-ai via npx (adjust based on your setup)
-# NOTE: The 'command' and 'args' will depend heavily on how taskmaster-ai
-#       is installed and intended to be run as an MCP server.
-#       This example assumes it can be run directly via npx.
-#       If it needs specific flags to run in MCP server mode, add them to 'args'.
-MCP_SERVER_CONFIG = {
-    "taskmaster": {
-        "command": "npx", # Or 'node', 'python', etc. depending on taskmaster
-        "args": ["task-master-ai", "--mcp-stdio"], # Assuming a flag like --mcp-stdio exists
-         # If taskmaster needs to run from a specific directory:
-        # "cwd": "/Users/sunningkim/Developer/mcp-agent",
-        "transport": "stdio",
-    },
-    # Add other MCP servers here if needed
-    # "another_server": { ... }
-}
-
-@asynccontextmanager
-async def make_graph_with_mcp_tools(llm: BaseLanguageModel) -> AsyncGenerator[StateGraph, None]:
-    """ Context manager to handle MCP client lifecycle and graph creation. """
-    print("Initializing MultiServerMCPClient...")
-    async with MultiServerMCPClient(MCP_SERVER_CONFIG) as client:
-        print("MCP Client Initialized. Loading tools...")
-        try:
-            # Fetch tools from the active client session
-            tools = await client.get_tools()
-            print(f"Loaded {len(tools)} tools from MCP servers:")
-            for tool in tools:
-                print(f" - {tool.name}: {tool.description}") # Tool name includes server prefix
-
-            if not tools:
-                print("Warning: No tools loaded from MCP servers. Agent may lack capabilities.")
-
-            # Create the graph instance using the loaded tools
-            graph = create_rewoo_graph(llm, tools)
-            yield graph # Yield the compiled graph to be used
-
-        except Exception as e:
-            print(f"Error loading MCP tools or creating graph: {e}")
-            import traceback
-            traceback.print_exc()
-            # Handle error appropriately, maybe raise or yield None/error state
-            raise # Re-raise the exception to signal failure
-
-        finally:
-            print("MCP Client context exited.") # Cleanup is handled by MultiServerMCPClient context
-
-
-# --- Get Compiled Graph ---
-_compiled_graph = None
-_graph_context_active = False # Flag to prevent re-entry if used incorrectly
-
-async def get_agent_executor(llm: Optional[BaseLanguageModel] = None, force_reload: bool = False):
-    """
-    Loads dependencies (LLM), manages MCP tools, and returns the compiled LangGraph executor.
-
-    Args:
-        llm: Optional language model instance. If None, loads using core.llm_loader.
-        force_reload: If True, forces recompiling the graph (MCP client restarts on each call now).
-
-    Returns:
-        A compiled LangGraph runnable instance.
-    """
-    # Note: Caching the graph instance (_compiled_graph) is tricky now because
-    # the MCP client and tools are live within the context manager.
-    # Each call to get_agent_executor will likely need to recreate the client and graph.
-    # Consider managing the client lifecycle at a higher level if performance is critical.
-    global _compiled_graph, _graph_context_active
-    # Simple re-entry check
-    if _graph_context_active:
-        raise RuntimeError("Graph context is already active. Ensure proper async handling.")
-
-
-    print("Initializing agent executor...")
-    # 1. Load LLM
-    if llm is None:
-        try:
-             from core.llm_loader import load_llm as core_load_llm
-             llm = core_load_llm()
-        except ImportError:
-            print("Error: Could not import core.llm_loader. Make sure it exists and path is correct.")
-            raise
-        except Exception as e:
-            print(f"Fatal Error: Could not load LLM. {e}")
-            raise
-
-    # 2. Load Tools and Create Graph using Context Manager
-    try:
-        _graph_context_active = True
-        # Use the async context manager to get the graph with live tools
-        # This part needs careful handling in the application's main async loop
-        # We return the context manager itself or handle it here.
-        # For simplicity in this function, we'll enter the context and return the graph,
-        # but the caller needs to be aware the context needs managing.
-        # A better pattern might be to return the *async generator* from make_graph_with_mcp_tools
-        # and let the caller manage the `async for graph in ...:` loop.
-
-        # Let's return the graph directly after creating it within the context
-        # This implies the client lives only during this call - likely incorrect for agent execution.
-        # ----
-        # Revised approach: get_agent_executor should return the ready-to-run graph *instance*.
-        # The context management needs to happen *around* the agent's invocation.
-        # How to achieve this?
-        # Option A: Pass the client around. Complicates node signatures.
-        # Option B: Use the context manager (`make_graph_with_mcp_tools`) higher up in the application entry point.
-
-        # Let's assume Option B is implemented by the caller.
-        # This function will now just return the *context manager function*.
-        # The caller will do: `async with make_graph_with_mcp_tools(llm) as agent_executor:`
-        # return make_graph_with_mcp_tools(llm) # Return the async context manager function
-
-        # --- OR --- Modify to return the compiled graph directly for now, assuming caller manages context
-        # This requires running the context manager here temporarily.
-        async with make_graph_with_mcp_tools(llm) as graph:
-             _compiled_graph = graph # Store the graph instance
-             print("Agent executor initialized with MCP tools.")
-             _graph_context_active = False
-             return _compiled_graph # Return the graph compiled with live tools
-
-    except Exception as e:
-        _graph_context_active = False
-        print(f"Fatal Error: Could not initialize agent executor with MCP tools. {e}")
-        raise
-
-
-# Example Usage - Needs significant changes due to async context management
-if __name__ == "__main__":
-    # import asyncio # Already imported
+# --- Example Usage (run_test) remains largely the same --- #
+async def run_test():
+    # Mock LLM (as before)
     from langchain_community.llms.fake import FakeListLLM
+    # Define fake plan string matching the expected output format from the prompt
+    # Using Step X: format for the corrected parser
+    fake_plan_str = """
+Step 1:
+Thought: Search for LangGraph.
+Tool Call: search(query='LangGraph')
+Expected Outcome: Link to LangGraph documentation.
 
-    async def run_graph_example():
-        print("--- Running Graph Example with MCP Adapters (Conceptual) ---")
-        # --- Setup Fake LLM ---
-        # Note: Mocking MCP tool calls is complex as they happen via the client.
-        # For a real test, you'd need mock MCP servers or skip tool execution testing here.
-        # Define the fake plan and final answer carefully, ensuring valid syntax
-        fake_plan_response = (
-            'Plan: Use taskmaster to list tasks.\\n'
-            '#E1 = taskmaster/mcp_taskmaster-ai_get_tasks[{\"projectRoot\": \"/Users/sunningkim/Developer/mcp-agent\"}]'
-        )
-        fake_solver_response = 'Final Answer: Got tasks from taskmaster (Evidence 1).'
+Step 2:
+Thought: Summarize the main concepts using the search result from Step 1.
+Tool Call: summarize(content=#E1)
+Expected Outcome: A brief summary.
+"""
 
-        fake_llm = FakeListLLM(responses=[
-            fake_plan_response,
-            fake_solver_response
-        ])
+    fake_search_result = "LangGraph is a library..."
+    fake_summary = "LangGraph helps build complex apps..."
+    fake_final_answer = "LangGraph is a library for building stateful LLM applications..."
 
-        try:
-            print("Getting agent executor context manager...")
-            # The executor is now obtained via the context manager
-            async with make_graph_with_mcp_tools(fake_llm) as agent_executor:
-                print("Agent executor obtained within context.")
-                if agent_executor is None:
-                     raise RuntimeError("Failed to create agent executor.")
+    # Correct responses sequence for FakeListLLM: Plan, Final Answer
+    fake_llm = FakeListLLM(responses=[
+        fake_plan_str, # Planner response string
+        fake_final_answer # Final Answer response string
+    ])
 
-                print("\nInvoking agent graph...")
-                initial_state = {"input_query": "List tasks using taskmaster"}
-                # Initialize state keys
-                initial_state.setdefault('plan', [])
-                initial_state.setdefault('current_step_index', 0)
-                initial_state.setdefault('evidence', [])
-                initial_state.setdefault('final_answer', None)
-                initial_state.setdefault('error', None)
+    # Mock Tool Registry and register mock tools
+    tool_registry = ToolRegistry()
+    def mock_search(query: str):
+        logger.info(f"MOCK SEARCH CALLED with query: {query}")
+        if query == 'LangGraph': return fake_search_result
+        return "No results found."
+    def mock_summarize(content: str):
+        logger.info(f"MOCK SUMMARIZE CALLED with content: {str(content)[:50]}...")
+        if content == fake_search_result: return fake_summary
+        return "Could not summarize."
+    tool_registry.register_tool("search", mock_search, "Mock search tool")
+    tool_registry.register_tool("summarize", mock_summarize, "Mock summarize tool")
+
+    # Mock BaseTool list for planner description formatting
+    # Need BaseTool structure for _format_tool_descriptions
+    class MockTool(BaseTool):
+        name: str
+        description: str
+        def _run(self, *args, **kwargs): pass
+        async def _arun(self, *args, **kwargs): pass
+
+    mock_tools_for_planner = [
+        MockTool(name="search", description="Mock search tool"),
+        MockTool(name="summarize", description="Mock summarize tool")
+    ]
+
+    logger.info("\n--- Building ReWOO Graph (within test) ---")
+    app = build_rewoo_graph(llm=fake_llm, tools=mock_tools_for_planner, tool_registry=tool_registry)
+
+    logger.info("\n--- Invoking Graph ---")
+    # Corrected initial state with original_query
+    initial_state = ReWOOState(
+        original_query="What is LangGraph and what is it used for?",
+        plan=[],
+        current_step_index=0,
+        tool_name=None,
+        tool_input=None,
+        # tool_output=None, # Removed as output is stored in evidence
+        evidence=[],
+        final_answer=None,
+        error_message=None,
+        max_retries=1,
+        # current_retry=0, # Removed as retry logic is within nodes now
+        workflow_status='planning' # Start with planning status
+    )
+    final_state = None
+    try:
+        # Use astream to capture intermediate states
+        async for event in app.astream(initial_state, {"recursion_limit": 15}): # Increased limit slightly
+             for key, value in event.items():
+                 logger.info(f"\n--- State after Node '{key}' --- Workflow Status: '{value.get('workflow_status')}'")
+                 # Log only key fields for brevity
+                 log_state = {
+                     k: v for k, v in value.items()
+                     if k in ["workflow_status", "current_step_index", "tool_name", "final_answer", "error_message", "evidence"]
+                 }
+                 # Truncate evidence for logging
+                 log_state["evidence"] = [str(e)[:100] + "..." if isinstance(e, str) and len(e) > 100 else e for e in log_state.get("evidence", [])]
+                 logger.info(json.dumps(log_state, indent=2, default=str))
+                 final_state = value # Keep track of the latest state
+        logger.info("\n--- Graph Execution Complete ---")
+    except Exception as e:
+        logger.error("Graph execution failed", exc_info=True)
+
+    logger.info("\n--- Final State ---")
+    if final_state:
+         # More detailed final state logging
+         final_log_state = {k: v for k, v in final_state.items() if k != 'plan'} # Exclude potentially long plan
+         final_log_state["plan_step_count"] = len(final_state.get("plan", []))
+         logger.info(json.dumps(final_log_state, indent=2, default=str))
+
+         # Activate and adjust assertions
+         assert final_state.get("final_answer") == fake_final_answer, f"Expected final answer '{fake_final_answer}', got '{final_state.get('final_answer')}'"
+         assert final_state.get("workflow_status") == "finished", f"Expected status 'finished', got '{final_state.get('workflow_status')}'"
+         assert final_state.get("error_message") is None, f"Expected no error, got '{final_state.get('error_message')}'"
+         # Check collected evidence
+         evidence = final_state.get("evidence", [])
+         assert len(evidence) == 2, f"Expected 2 pieces of evidence, got {len(evidence)}"
+         assert evidence[0] == fake_search_result, f"Evidence 1 mismatch. Got: {evidence[0]}"
+         assert evidence[1] == fake_summary, f"Evidence 2 mismatch. Got: {evidence[1]}"
+         logger.info("\nAssertions Passed!")
+    else:
+        logger.error("Graph did not return a final state.")
 
 
-                # IMPORTANT: This example assumes the 'taskmaster' MCP server defined
-                # in MCP_SERVER_CONFIG is running and accessible via npx.
-                # If not, the tool call within the graph will fail.
-                final_state = await agent_executor.ainvoke(initial_state)
-
-                print("\n--- Final State --- ")
-                import json
-                print(json.dumps({
-                    "input_query": final_state.get('input_query'),
-                    "plan_steps": len(final_state.get('plan', [])),
-                    "evidence_collected": len(final_state.get('evidence', [])),
-                    "final_answer": final_state.get('final_answer'),
-                    "error": final_state.get('error')
-                }, indent=2))
-
-                # Add assertions based on expected flow (may fail if MCP server isn't running)
-                # assert final_state.get('final_answer') is not None
-                # assert final_state.get('error') is None
-
-        except Exception as e:
-            print(f"\nAn error occurred during graph example: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # Run the async example
-    asyncio.run(run_graph_example())
-
-    # Removed old example using ToolRegistry 
+# Remove the old run_graph_example which depends on the context manager logic
+# Keep run_test as the primary test function for now
+if __name__ == "__main__":
+     asyncio.run(run_test()) 

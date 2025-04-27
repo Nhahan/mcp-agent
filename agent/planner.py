@@ -2,6 +2,7 @@
 import re
 import json
 from typing import List, Optional
+import logging
 
 from langchain_core.language_models import BaseLanguageModel
 # from langchain_core.prompts import PromptTemplate # Use the one from prompts module
@@ -13,22 +14,18 @@ from .prompts.plan_prompts import PLANNER_PROMPT_TEMPLATE, PLANNER_REFINE_PROMPT
 # Import the validator
 from .validation import PlanValidator, ValidationIssue
 
+# Configure logging at the module level
+logger = logging.getLogger(__name__)
+
 # Remove old template definition
 # PLANNER_TEMPLATE = """..."""
 
-# Regular expression to parse the plan steps and tool calls based on the new prompt format
-# It needs to capture Thought, optional Tool Call (#E<n> = Tool[Input]), and optional Expected Outcome
-# Example Step:
-# 1. Thought: I need to find the capital.
-#    Tool Call: #E1 = search/web_search[{"query": "capital of France"}]
-#    Expected Outcome: The capital city of France.
-# Simpler Regex: Extract thought first, then look for optional Tool Call and Expected Outcome lines
-# PLAN_STEP_REGEX = re.compile(r"Thought:\s*(.*?)(?:\n\s*Tool Call:\s*#E(\d+)\s*=\s*([\w_/]+)\[(.*)\])?(?:\n\s*Expected Outcome:\s*(.*?))?", re.DOTALL | re.IGNORECASE | re.MULTILINE)
-# More robust parsing might be needed depending on LLM output variations.
-# Let's try parsing line by line or using a dedicated parsing LLM if regex becomes too fragile.
-# For now, stick to a simpler approach assuming the LLM follows instructions closely.
+# Updated Regex to capture tool_name and arguments (JSON or string) more reliably
+# Captures: #E<num> = tool_name[ <arguments_json_or_string> ]
+# Group 1: Evidence Num, Group 2: Tool Name, Group 3: Arguments String
+TOOL_CALL_REGEX = re.compile(r"(\w+)\((.*)\)", re.DOTALL)
+# Regex for Thought and Expected Outcome remain the same
 THOUGHT_REGEX = re.compile(r"Thought:\s*(.*)", re.IGNORECASE)
-TOOL_CALL_REGEX = re.compile(r"Tool Call:\s*#E(\d+)\s*=\s*([\w_/]+)\[(.*)\]", re.IGNORECASE)
 EXPECTED_OUTCOME_REGEX = re.compile(r"Expected Outcome:\s*(.*)", re.IGNORECASE)
 
 
@@ -59,84 +56,92 @@ def _format_plan_to_string(plan: List[PlanStep]) -> str:
         plan_str += "\n" # Add blank line between steps
     return plan_str.strip()
 
-def parse_plan(plan_string: str) -> List[PlanStep]:
-    """ Parses the LLM's plan string into a list of PlanStep objects based on the new format. """
-    steps: List[PlanStep] = []
-    current_step_index = 0 # Start step index at 0
+def parse_plan(plan_str: str) -> List[PlanStep]:
+    """Parses the LLM output string into a list of PlanStep dictionaries."""
+    steps = []
+    # Split the plan string into potential steps based on "Step X:"
+    potential_steps = re.split(r"Step \d+:", plan_str)[1:] # Skip the part before the first "Step 1:"
 
-    print(f"\n--- Raw Plan String ---\n{plan_string}\n----------------------") # Debugging raw output
-
-    # Split into potential steps (e.g., based on step numbers or keywords like "Thought:")
-    # A simple split by lines containing "Thought:" might work if format is consistent
-    potential_step_blocks = re.split(r'\n(?=Thought:)', plan_string.strip(), flags=re.IGNORECASE)
-
-    for block in potential_step_blocks:
-        if not block.strip():
+    for i, step_text in enumerate(potential_steps):
+        step_text = step_text.strip()
+        if not step_text:
             continue
 
-        thought_match = THOUGHT_REGEX.search(block)
-        tool_call_match = TOOL_CALL_REGEX.search(block)
-        expected_outcome_match = EXPECTED_OUTCOME_REGEX.search(block)
+        thought = re.search(r"Thought: (.*?)\n", step_text, re.DOTALL)
+        tool_call_match = re.search(r"Tool Call: (.*?)\n", step_text, re.DOTALL)
+        expected_outcome = re.search(r"Expected Outcome: (.*?)$", step_text, re.DOTALL)
 
-        thought = thought_match.group(1).strip() if thought_match else "" # Default to empty if not found
-        tool_call = None
-        expected_outcome = expected_outcome_match.group(1).strip() if expected_outcome_match else None
+        thought_text = thought.group(1).strip() if thought else ""
+        tool_call_str = tool_call_match.group(1).strip() if tool_call_match else ""
+        expected_outcome_text = expected_outcome.group(1).strip() if expected_outcome else ""
 
-        if tool_call_match:
-            step_num_str, tool_name, tool_input_str = tool_call_match.groups()
-            tool_name = tool_name.strip()
-            tool_input_str = tool_input_str.strip()
-            try:
-                # Attempt to parse input as JSON
-                arguments = json.loads(tool_input_str)
-                if not isinstance(arguments, dict):
-                    print(f"Warning: Parsed non-dict JSON input for {tool_name}: {arguments}. Using raw string.")
-                    arguments = {"input": tool_input_str} # Fallback
-            except json.JSONDecodeError:
-                # Treat as single string argument
-                arguments = {"input": tool_input_str}
-            except Exception as e:
-                print(f"Error parsing tool arguments for {tool_name}: {e}. Input: {tool_input_str}")
-                arguments = {"error": f"Argument parsing failed: {e}", "raw_input": tool_input_str}
+        tool_name = None
+        arguments = {}
 
-            tool_call = ToolCall(tool_name=tool_name, arguments=arguments)
+        if tool_call_str:
+            match = TOOL_CALL_REGEX.match(tool_call_str)
+            if match:
+                tool_name = match.group(1)
+                args_str = match.group(2).strip()
+                try:
+                    # First, try parsing as JSON
+                    arguments = json.loads(args_str)
+                    if not isinstance(arguments, dict):
+                        # Handle cases where JSON parsing results in a non-dict (e.g., just a string)
+                        logger.warning(f"Parsed JSON arguments for tool '{tool_name}' is not a dict: {arguments}. Treating as single 'input' arg.")
+                        arguments = {'input': args_str}
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, try simple key=value parsing (for test cases)
+                    try:
+                        parsed_args = {}
+                        # Regex to find key=value pairs, handling simple quotes
+                        # Example: query='LangGraph', content=#E1
+                        for arg_match in re.finditer(r"(\w+)\s*=\s*('([^']*)'|\"([^\"]*)\"|([^,]+))", args_str):
+                            key = arg_match.group(1)
+                            # Prioritize quoted values, then unquoted
+                            value = arg_match.group(3) or arg_match.group(4) or arg_match.group(5)
+                            parsed_args[key] = value.strip()
+                        
+                        if parsed_args:
+                             arguments = parsed_args
+                        else:
+                             # If key=value parsing also fails, treat the whole string as a single 'input' argument
+                            logger.warning(f"Could not parse arguments as key-value pairs for tool '{tool_name}'. Input: '{args_str}'. Treating as single 'input' arg.")
+                            arguments = {'input': args_str}
+                    except Exception as e:
+                        logger.warning(f"Error during key-value argument parsing for tool '{tool_name}'. Input: '{args_str}'. Error: {e}. Treating as single 'input' arg.")
+                        arguments = {'input': args_str}
+                except Exception as e:
+                    # Catch any other unexpected errors during parsing
+                    logger.error(f"Unexpected error parsing arguments for tool '{tool_name}'. Input: '{args_str}'. Error: {e}. Treating as single 'input' arg.")
+                    arguments = {'input': args_str}
+            else:
+                # If regex doesn't match tool_name(args) format, treat as thought
+                 logger.warning(f"Tool call string '{tool_call_str}' did not match expected format. Treating step as thought-only.")
+                 thought_text += f" (Tool Call Failed: {tool_call_str})" # Append failed call to thought
+                 tool_call_str = "" # Clear tool call
 
-        if thought: # Only add a step if there is a thought process described
-            steps.append(PlanStep(
-                step_index=current_step_index,
-                thought=thought,
-                tool_call=tool_call,
-                expected_outcome=expected_outcome,
-                status="pending" # Initial status
-            ))
-            current_step_index += 1
-        elif tool_call:
-             # If there's a tool call but no thought, maybe log a warning or use a default thought?
-             print(f"Warning: Tool call found without preceding thought in block: {block}")
-             # Optionally add the step anyway, or skip?
-             steps.append(PlanStep(
-                step_index=current_step_index,
-                thought="(Thought missing)", # Placeholder
-                tool_call=tool_call,
-                expected_outcome=expected_outcome,
-                status="pending" # Initial status
-            ))
-             current_step_index += 1
 
+        step_data = {
+            "step_index": i,
+            "thought": thought_text,
+            "tool_call": {"tool_name": tool_name, "arguments": arguments} if tool_name else None,
+            "expected_outcome": expected_outcome_text,
+            "status": "pending" # Initial status
+        }
+        steps.append(step_data)
 
-    print(f"\n--- Parsed Plan Steps ({len(steps)} steps) ---") # Debugging parsed output
-    for step in steps:
-        print(f"Step {step.step_index}:")
-        print(f"  Thought: {step.thought}")
-        if step.tool_call:
-            print(f"  Tool Call: {step.tool_call.tool_name}[{step.tool_call.arguments}]")
-        if step.expected_outcome:
-            print(f"  Expected Outcome: {step.expected_outcome}")
-    print("--------------------------")
+    if steps:
+        logger.info(f"--- Parsed Plan Steps ({len(steps)} steps) ---")
+        for i, step in enumerate(steps):
+            logger.info(f"Step {i}:")
+            logger.info(f"  Thought: {step['thought']}")
+            logger.info(f"  Tool Call: {step['tool_call']}")
+            logger.info(f"  Expected Outcome: {step['expected_outcome']}")
+        logger.info("--------------------------")
+    else:
+        logger.warning("Plan parsing resulted in zero steps.")
 
-    if not steps and plan_string.strip():
-         print("Warning: Could not parse any steps from the plan string. Returning empty plan.")
-         # Consider adding raw string as a single thought step or raising error
 
     return steps
 
