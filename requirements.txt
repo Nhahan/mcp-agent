@@ -13,4 +13,7 @@ ruff
 mypy
 
 # Testing
-pytest 
+pytest
+
+# Data validation and parsing
+pydantic 
