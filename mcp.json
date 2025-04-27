@@ -1,5 +1,25 @@
 {
     "mcpServers": {
-
+        "web_search_placeholder": {
+            "description": "A placeholder tool that simulates web search.",
+            "tools": {
+                "search": {
+                    "description": "Performs a mock web search for the given query.",
+                    "parameters": {
+                        "query": {
+                            "description": "The search query.",
+                            "type": "string",
+                            "required": true
+                        }
+                    },
+                    "returns": {
+                        "results": {
+                            "description": "Mock search results.",
+                            "type": "string"
+                        }
+                    }
+                }
+            }
+        }
     }
 }
