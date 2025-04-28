@@ -1,4 +1,4 @@
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any
 import logging
 from langsmith import traceable
 from langchain_core.runnables import RunnableConfig
@@ -7,7 +7,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain.output_parsers import OutputFixingParser
 import re
 import json
-from agent.state import ReWOOState, ParsedPlanStep, PlanOutputPydantic, PlanStepPydantic, ToolCallPydantic
+from agent.state import ReWOOState, ParsedPlanStep, PlanOutputPydantic
 from ..prompts.plan_prompts import PLANNER_PROMPT_TEMPLATE, PLANNER_REFINE_PROMPT_TEMPLATE
 
 # --- Placeholder for PlanValidator --- #
@@ -37,17 +37,6 @@ from langgraph.graph import END
 logger = logging.getLogger(__name__)
 # --- End Logging Setup --- #
 
-# --- Helper function moved from deleted agent/planner.py --- #
-def _format_plan_to_string(plan_steps: List[ParsedPlanStep]) -> str:
-    """Formats the plan steps (list of tuples) into a numbered string for the prompt."""
-    formatted = ""
-    for i, step_tuple in enumerate(plan_steps):
-        reasoning, evidence_var, tool_name, tool_input_str = step_tuple
-        formatted += f"Step {i+1}:\nPlan: {reasoning.strip()}\nTool Call: {evidence_var} = {tool_name}[{tool_input_str}]\n\n"
-    return formatted.strip()
-# --- End Helper function --- #
-
-# Regex to find the JSON block within the LLM response (still needed)
 JSON_BLOCK_REGEX = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL) # Use non-greedy match for content
 
 @traceable(name="Planning Node")

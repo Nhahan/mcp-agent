@@ -1,18 +1,15 @@
-import langchain
 from langchain_community.cache import InMemoryCache
 import asyncio
-import logging # Add logging import
-import json # Import json for parsing mcp.json
-from pathlib import Path # Import Path for file handling
-from typing import List, Dict, Any
+import logging
+import json
+from pathlib import Path
+from typing import Dict, Any
 from langchain_core.globals import set_llm_cache
-# Import END from langgraph
 from langgraph.graph import END
 
-# Import necessary components
 from core.llm_loader import load_llm
 from agent.graph import build_rewoo_graph
-from langchain_mcp_adapters.client import MultiServerMCPClient # Import MCP client
+from langchain_mcp_adapters.client import MultiServerMCPClient
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(name)s:%(funcName)s] - %(message)s')
@@ -42,11 +39,7 @@ def load_mcp_servers_from_config(config_path: Path = Path("mcp.json")) -> Dict[s
                     config["transport"] = "stdio"
                     logger.info(f"Inferred 'stdio' transport for server '{server_name}'.")
                 elif "url" in config:
-                    # Assuming SSE or Websocket based on URL presence, let MultiServerMCPClient handle specifics later if needed
-                    # Or be more specific if possible, e.g., checking protocol in URL
                     logger.warning(f"Transport not specified for server '{server_name}' with URL. Relying on MultiServerMCPClient or later connection logic.")
-                    # If necessary, could default to sse or websocket here, but might be risky
-                    # config["transport"] = "sse" # Example default if needed
                 else:
                      logger.warning(f"Cannot infer transport type for server '{server_name}'. Skipping or check config.")
                      # Optionally remove this config or raise an error
@@ -91,8 +84,6 @@ async def main():
             tool_names = [tool.name for tool in available_tools_raw]
             logger.info(f"MCP Client initialized. Discovered tools: {tool_names}")
 
-            # --- [REMOVED TEMPORARY DIAGNOSTIC CODE for current_time tool] ---
-
             # 3. Build the agent graph/executor using the initialized tools
             try:
                 logger.info("Building agent graph...")
@@ -106,8 +97,7 @@ async def main():
                 return # Exit if graph building fails
 
             # 4. Start interaction loop or process a single query
-            # query = "What is the current time in Seoul?" # Example query
-            query = "How do I bake a simple cake?" # Changed query for sequential-thinking
+            query = "How do I bake a simple cake?"
 
             logger.info(f"Starting agent execution with query: '{query}'")
             try:
@@ -140,18 +130,14 @@ async def main():
 
                 # Use the compiled_app object for streaming with the correct initial state and config
                 async for event in compiled_app.astream_events(
-                    initial_state, # Pass the complete initial state dictionary
-                    config=config, # Pass the configuration dictionary
+                    initial_state,
+                    config=config,
                     version="v1",
-                    # types=["transform"], # Optional: filter event types
-                    # tags=["some_tag"],  # Optional: filter by tags
                 ):
                     kind = event['event']
                     if kind == "on_chat_model_stream":
                         content = event["data"]["chunk"].content
                         if content:
-                            # Empty content in the context of OpenAI means no delta text
-                            # print(content, end="|") # For direct streaming output
                             pass # We are logging steps, not streaming output directly for now
                     elif kind == "on_tool_start":
                         tool_name = event['name']
@@ -162,38 +148,12 @@ async def main():
                         tool_output = event['data'].get('output')
                         logger.info(f"Tool {tool_name} finished.")
                         logger.info(f"Tool output was: {tool_output}")
-                        logger.info("-" * 40) # Separator after tool use
-                    # Optional: Add more specific event handling if needed
-                    # elif kind == "on_chain_start":
-                    #     logger.debug(f"Chain started: {event['name']}")
-                    # elif kind == "on_chain_end":
-                    #     logger.debug(f"Chain finished: {event['name']}")
-                    # elif kind == "on_chat_model_start":
-                    #     logger.debug("Chat model started.")
-                    # elif kind == "on_chat_model_end":
-                    #     logger.debug("Chat model finished.")
-                    # elif kind == "on_llm_start":
-                    #     logger.debug("LLM started.")
-                    # elif kind == "on_llm_end":
-                    #     logger.debug("LLM finished.")
-                    # elif kind == "on_llm_new_token":
-                    #     logger.debug(f"New token: {event['data']}")
-                    else:
-                        # Catch-all for other event types for debugging
-                        # logger.debug(f"Unhandled event type: {kind} | Data: {event['data']}")
-                        pass # Keep log clean for now
-
-                # After the stream, the full interaction is logged above.
-                # If you need the final accumulated state, LangGraph typically provides it,
-                # but the exact way depends on the graph's output node configuration.
-                # For now, logging the stream events provides detailed insight.
+                        logger.info("-" * 40)
                 logger.info("Agent execution stream finished.")
-
             except Exception as e:
                 logger.error(f"Error during agent execution: {e}", exc_info=True)
 
     except Exception as e:
-        # Catch exceptions during MCP client initialization or within the async with block
         logger.error(f"Failed to initialize or use MultiServerMCPClient: {e}", exc_info=True)
         return # Exit if client fails
 
