@@ -35,34 +35,15 @@ PLANNER_PROMPT_TEMPLATE = PromptTemplate.from_template(
 
     Query: {query}
 
-    Required JSON Output Schema:
-    {{
-      "steps": [ // MUST be a list of step objects
-        {{ // Example Step using a tool
-          "plan": "<Your reasoning for this step>",
-          "tool_call": {{ // Object if using a tool
-            "evidence_variable": "#E<n>",
-            "tool_name": "<tool_name_from_available_tools>",
-            "arguments": {{ "<arg_name>": "<arg_value>", ... }} // Arguments as a JSON object
-          }}
-        }}, // <-- IMPORTANT: Comma needed between step objects in the list!
-        {{ // Example Step *without* using a tool (providing a known fact)
-          \"plan\": \"The capital of France is Paris.\", // Actual factual content in 'plan'
-          \"tool_call\": null // <-- MUST be null if no tool is needed
-        }}
-        // ... more steps possible, remember the comma between them!
-      ]
-    }}
-
     Constraints & Instructions:
-    - The JSON object MUST contain a single key "steps" which is a list of step objects.
-    - **Each step object in the "steps" list MUST be separated by a comma (,) except for the last one.**
+    - Respond **ONLY** with a valid JSON object that conforms to the schema described below.
+    - **Each step object in the \"steps\" list MUST be separated by a comma (,) except for the last one.**
     - **Inside each object, key-value pairs MUST be separated by a comma (,) except for the last pair.**
     - Each step object MUST contain a "plan" key with your reasoning as a string.
     - Each step object MUST contain a "tool_call" key.
     - **Query Relevance:** Critically evaluate if a tool is genuinely necessary and **relevant** to answer the specific 'Query: {query}'. Do **NOT** use tools that are unrelated (e.g., time tools for a cooking query).
     - **Prioritize `null`:** If the step involves reasoning, summarizing, or can be answered from general knowledge without external data, strongly prefer setting `tool_call` to `null`.
-    - **Content for `null` tool_call:** If `tool_call` is `null` because the step can be answered using general knowledge (like providing instructions, definitions, or summaries), the "plan" field for that step **MUST contain the actual instructional text or information** that contributes directly to the final answer. Do not just describe *what* you will do (e.g., "List the ingredients"); instead, *provide* the information (e.g., "The ingredients are: flour, sugar, eggs...").
+    - **Content for `null` tool_call:** If `tool_call` is `null` because the step can be answered using general knowledge (like providing instructions, definitions, or summaries), the \"plan\" field for that step **MUST contain the actual instructional text or information** that contributes directly to the final answer. Do not just describe *what* you will do (e.g., \"List the ingredients\"); instead, *provide* the information (e.g., \"The ingredients are: flour, sugar, eggs...\").
     - If a tool is used, "tool_call" MUST be an object containing:
         - \"evidence_variable\": A string like \"#E1\", \"#E2\", etc., incrementing for each tool call step.
         - \"tool_name\": The exact name of the tool from the 'Available Tools' list.
@@ -72,6 +53,8 @@ PLANNER_PROMPT_TEMPLATE = PromptTemplate.from_template(
     - **Crucially, ensure the entire output is a single, valid JSON object.** Pay EXTREME attention to quotes (\"), commas (,), braces ({{}}), and brackets ([]).
     - Extract necessary entities from the 'Query: {query}' to use as arguments in the "arguments" object.
     - The plan should logically progress towards answering the query.
+
+    {format_instructions}
 
     Begin! Output the JSON plan now.
     """
@@ -104,7 +87,7 @@ Respond ONLY with the revised plan in the correct format.
 # Updated PLANNER_REFINE_PROMPT_TEMPLATE for standard JSON output
 PLANNER_REFINE_PROMPT_TEMPLATE = PromptTemplate.from_template(
     """The previous attempt to create a plan for the task failed parsing or validation. 
-    You MUST generate a revised plan adhering to the ORIGINAL query and the JSON schema provided below.
+    You MUST generate a revised plan adhering to the ORIGINAL query and the schema provided below.
     Respond **ONLY** with a single, valid JSON object enclosed in a ```json ... ``` block. 
     Do **NOT** include any other text, comments, or explanations.
 
@@ -115,7 +98,7 @@ PLANNER_REFINE_PROMPT_TEMPLATE = PromptTemplate.from_template(
 
     Previous Plan Attempt (May contain errors or be incomplete):
     ------
-    {previous_plan} 
+    {previous_plan}
     ------
 
     Validation/Parsing Errors from Previous Attempt:
@@ -123,28 +106,10 @@ PLANNER_REFINE_PROMPT_TEMPLATE = PromptTemplate.from_template(
     {validation_errors}
     ------
 
-    Required JSON Output Schema:
-    {{
-      "steps": [ // MUST be a list of step objects
-        {{
-          "plan": "<Your reasoning for this step>",
-          "tool_call": {{ // Object if using a tool
-            "evidence_variable": "#E<n>", 
-            "tool_name": "<tool_name_from_available_tools>",
-            "arguments": {{ "<arg_name>": "<arg_value>", ... }} // Arguments as a JSON object
-          }}
-        }}, // <-- IMPORTANT: Comma needed between step objects!
-        {{
-          "plan": "<Reasoning for the final answer construction>",
-          "tool_call": null // null for the final step
-        }}
-        // ... more steps possible, remember the comma between them!
-      ]
-    }}
-
     Revised Plan Instructions:
     - Carefully analyze the 'Original Query', 'Previous Plan Attempt', and 'Validation/Parsing Errors'.
     - Generate a COMPLETELY NEW plan in the specified JSON format that addresses the errors and solves the original query.
+    - **Ensure the new plan follows all JSON syntax rules precisely AND conforms to the schema described below.**
     - **Correct Tool Usage:** Pay special attention to selecting tools that are **directly relevant** to the 'Original Query'. Avoid using unrelated tools even if they appear in the available list. Ensure **all required arguments** for chosen tools are provided correctly in the `arguments` JSON object.
     - **Prioritize `null`:** If a step in the revised plan involves reasoning or summarizing without needing external data, prefer setting `tool_call` to `null`.
     - **Ensure the new plan follows all JSON syntax rules precisely:**
@@ -154,6 +119,8 @@ PLANNER_REFINE_PROMPT_TEMPLATE = PromptTemplate.from_template(
         - Ensure all brackets ([]) and braces ({{}}) are correctly matched and placed.
     - Follow all constraints mentioned in the initial planning instructions (correct tool names, arguments as JSON objects, `null` for final step tool_call, etc.).
     - **DOUBLE-CHECK the final JSON for syntax errors, especially missing commas, before outputting.**
+
+    {format_instructions}
 
     Begin! Output the revised JSON plan now.
     """

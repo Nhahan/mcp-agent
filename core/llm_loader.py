@@ -27,7 +27,7 @@ if not logger.handlers:
 load_dotenv()
 
 # Default parameters
-DEFAULT_N_CTX = 4096
+DEFAULT_N_CTX = 8192
 DEFAULT_N_GPU_LAYERS = -1
 DEFAULT_N_BATCH = 512
 DEFAULT_TEMPERATURE = 0.7

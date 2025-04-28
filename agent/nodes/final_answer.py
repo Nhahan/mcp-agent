@@ -28,41 +28,35 @@ async def final_answer_node(state: ReWOOState, llm: BaseLanguageModel) -> Dict[s
 
     original_query = state["original_query"]
     evidence_dict = state.get("evidence", {}) # Get evidence as dictionary
-    plan_steps = state.get("plan", []) # Get the plan steps (List[ParsedPlanStep])
+    # plan_steps = state.get("plan", []) # Get the plan steps (List[ParsedPlanStep]) - Not directly used for context
     max_retries = state.get("max_retries", 1)
     current_retries = 0
     last_error = None
 
-    # Format context for the prompt: Use evidence if available, otherwise use plan
+    # Format context for the prompt: Use evidence if available, otherwise use plan_pydantic
     if evidence_dict:
         formatted_context = "\n".join([
             f"- Evidence {key}: {json.dumps(value) if isinstance(value, (dict, list)) else str(value)}"
             for key, value in evidence_dict.items()
         ])
         logger.debug(f"Using collected evidence for prompt:\n{formatted_context}")
-    elif state.get("all_parsed_steps"): # Check 'all_parsed_steps' instead of 'plan'
-        all_steps = state["all_parsed_steps"]
-        # Format plan steps if evidence is empty
+    elif state.get("plan_pydantic") and state["plan_pydantic"].steps: # Check plan_pydantic
+        plan_output = state["plan_pydantic"]
+        # Format plan steps from Pydantic model if evidence is empty
         formatted_context = "Based on the generated plan (no tools were executed):\n"
-        valid_steps_context = []
-        for i, step_dict in enumerate(all_steps):
-            plan_text = step_dict.get("plan") # Extract 'plan' text from each dict
-            if plan_text:
-                valid_steps_context.append(f"- Step {i+1}: {plan_text}")
-            else:
-                logger.warning(f"Step {i+1} in all_parsed_steps is missing 'plan' key.")
-        
-        if valid_steps_context:
-            formatted_context += "\n".join(valid_steps_context)
-            logger.debug(f"Using plan steps from all_parsed_steps for prompt (no evidence collected):\n{formatted_context}")
+        plan_steps_context = [f"- Step {i+1}: {step.plan}" for i, step in enumerate(plan_output.steps)]
+
+        if plan_steps_context:
+            formatted_context += "\n".join(plan_steps_context)
+            logger.debug(f"Using plan steps from plan_pydantic for prompt (no evidence collected):\n{formatted_context}")
         else:
-             # Handle case where all_parsed_steps exists but contains no valid plan text
-            formatted_context = "No evidence was collected and the generated plan steps were invalid or empty."
-            logger.warning("Plan steps found in all_parsed_steps, but they lack valid 'plan' content.")
+             # Should not happen if plan_pydantic.steps is not empty, but as safeguard
+            formatted_context = "No evidence was collected and the generated plan steps were empty."
+            logger.warning("Plan steps found in plan_pydantic, but they seem empty.")
     else:
-        # Handle case where both evidence and plan are empty
-        formatted_context = "No evidence was collected and no plan was generated."
-        logger.warning("Neither evidence nor plan steps are available for final answer generation.")
+        # Handle case where both evidence and plan_pydantic are empty/missing
+        formatted_context = "No evidence was collected and no plan was generated or parsed."
+        logger.warning("Neither evidence nor plan_pydantic are available for final answer generation.")
 
 
     # Use the prompt template
