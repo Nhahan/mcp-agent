@@ -68,10 +68,8 @@ async def final_answer_node(state: ReWOOState, llm: BaseLanguageModel) -> Dict[s
     while current_retries <= max_retries:
         logger.info(f"Final Answer generation attempt {current_retries + 1}/{max_retries + 1}")
         try:
-            # Invoke LLM with specific temperature for final answer
-            answer_config = {"configurable": {"temperature": 0.5}}
-            logger.debug(f"Using config for final answer LLM call: {answer_config}")
-            response = await llm.ainvoke(prompt, config=answer_config)
+            # Invoke LLM
+            response = await llm.ainvoke(prompt)
             response_content = response.content if hasattr(response, 'content') else str(response)
             logger.debug(f"Raw LLM Response:\n{response_content}")
             final_answer = response_content.strip()
