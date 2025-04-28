@@ -2,21 +2,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_community.llms import LlamaCpp
-from llama_cpp import LlamaGrammar # Keep this import just in case
 import logging
-
-# Removed dynamic grammar generation imports and logic
-# try:
-#     from pydantic_gbnf_grammar_generator import generate_gbnf_grammar_and_documentation
-#     PYDANTIC_GBNF_AVAILABLE = True
-# except ImportError:
-#     PYDANTIC_GBNF_AVAILABLE = False
-#     generate_gbnf_grammar_and_documentation = None
-#     logger = logging.getLogger("LLM-Loader") # Initialize logger early for warning
-#     logger.warning("pydantic-gbnf-grammar-generator not found. Proceeding without dynamic grammar generation.")
-
-# Removed model import as it's no longer needed for grammar generation here
-# from core.schemas.plan_output import PlanOutput 
 
 # --- Logging Setup --- #
 logger = logging.getLogger("LLM-Loader")
@@ -30,7 +16,7 @@ load_dotenv()
 DEFAULT_N_CTX = 8192
 DEFAULT_N_GPU_LAYERS = -1
 DEFAULT_N_BATCH = 512
-DEFAULT_TEMPERATURE = 0.7
+DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TOP_P = 0.95
 DEFAULT_TOP_K = 40
@@ -38,8 +24,6 @@ DEFAULT_VERBOSE = False
 
 # --- LLM Singleton Loader --- #
 llm_instance = None
-# Removed grammar instance caching
-# grammar_instance = None 
 
 def load_llm():
     global llm_instance
@@ -86,13 +70,6 @@ if __name__ == "__main__":
     try:
         llm = load_llm()
         logger.info("LLM loaded successfully via load_llm().")
-
-        # Removed grammar check as grammar is disabled
-        # if grammar_instance:
-        #     logger.info("Dynamically generated grammar object is present in the loaded LLM instance.")
-        # else:
-        #     logger.warning("No grammar object found or generated for the LLM instance.")
-        logger.info("Grammar constraints are disabled for this LLM instance.")
 
     except (ValueError, FileNotFoundError) as e:
         logger.error(f"Test failed: {e}")
