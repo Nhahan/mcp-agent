@@ -176,24 +176,39 @@ async def planning_node(state: ReWOOState, config: RunnableConfig) -> Dict[str, 
 
                 # Only process steps with actual tool calls for parsed_plan_tuples
                 if tool_call_data is not None:
+                    # --- Added robustness check --- #
                     if not isinstance(tool_call_data, dict):
+                        # If tool_call is not null and not a dict, it's an error (e.g., string, list)
                         logger.warning(f"Step {i+1}: 'tool_call' is not a dictionary or null: {tool_call_data}")
-                        errors.append(f"Step {i+1}: Invalid 'tool_call' format.")
+                        errors.append(f"Step {i+1}: Invalid 'tool_call' format (must be an object or null).")
                         continue # Skip this invalid step
+                    
+                    tool_name = tool_call_data.get("tool_name")
+                    # Treat tool_call object with missing or null tool_name as if tool_call was null
+                    if not tool_name:
+                         logger.info(f"Step {i+1}: Found tool_call object but 'tool_name' is missing or null. Treating as no tool call.")
+                         # Check if reasoning exists even when treating as null tool call
+                         if not reasoning or not isinstance(reasoning, str):
+                             logger.warning(f"Step {i+1} (treated as no tool call) missing reasoning ('plan' key).")
+                             errors.append(f"Step {i+1} missing reasoning ('plan' key).")
+                         continue # Proceed to next step, don't add to parsed_plan_tuples
+                    # --- End added robustness check --- #
+
+                    # --- Original tool_call processing (now only runs if tool_name is valid) ---
+                    # if not isinstance(tool_call_data, dict): # This check is now done above
+                    #     logger.warning(f"Step {i+1}: 'tool_call' is not a dictionary or null: {tool_call_data}")
+                    #     errors.append(f"Step {i+1}: Invalid 'tool_call' format.")
+                    #     continue # Skip this invalid step
 
                     evidence_var = tool_call_data.get("evidence_variable")
-                    tool_name = tool_call_data.get("tool_name")
+                    # tool_name = tool_call_data.get("tool_name") # tool_name already fetched and validated
                     tool_arguments = tool_call_data.get("arguments")
 
-                    # Validate tool call structure
+                    # Validate tool call structure (tool_name already validated)
                     valid_tool_call = True
                     if not evidence_var or not isinstance(evidence_var, str) or not evidence_var.startswith("#E"):
                         logger.warning(f"Step {i+1}: Missing or invalid 'evidence_variable': {evidence_var}")
                         errors.append(f"Step {i+1}: Missing/invalid 'evidence_variable'.")
-                        valid_tool_call = False
-                    if not tool_name or not isinstance(tool_name, str):
-                        logger.warning(f"Step {i+1}: Missing or invalid 'tool_name': {tool_name}")
-                        errors.append(f"Step {i+1}: Missing/invalid 'tool_name'.")
                         valid_tool_call = False
                     if tool_arguments is None or not isinstance(tool_arguments, dict):
                         if tool_arguments is not None:
