@@ -1,0 +1,135 @@
+# agent/nodes/tool_executor.py
+from typing import Dict, Any, List, Optional
+import logging
+import asyncio
+
+# Update state import if EvidenceDict is defined there
+from ..state import ReWOOState, EvidenceDict
+# Removed MCPClient import as we use BaseTool objects now
+# from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.tools import BaseTool # Import BaseTool
+from langgraph.graph import END
+from langchain_core.runnables import RunnableConfig # Import RunnableConfig
+
+# --- Logging Setup --- #
+logger = logging.getLogger(__name__)
+# --- End Logging Setup --- #
+
+# Helper function to find a tool by name from the list
+def find_tool_by_name(tools: List[BaseTool], name: str) -> Optional[BaseTool]:
+    for tool in tools:
+        if tool.name == name:
+            return tool
+    return None
+
+async def tool_execution_node(state: ReWOOState, config: RunnableConfig) -> Dict[str, Any]:
+    """
+    Executes the selected tool with the prepared input using BaseTool objects.
+    Retrieves tool name, input, and evidence var from state.
+    Retrieves the list of BaseTool objects from the config.
+    Stores output/error in the evidence dictionary.
+    Sets workflow_status to route to 'evidence_processor' on success, 'failed' on error.
+    """
+    logger.info("--- Starting Tool Execution Node ---")
+    current_tool_call_info = state.get("current_tool_call")
+    prepared_input = state.get("prepared_tool_input")
+    current_evidence_dict = state.get("evidence", {})
+    current_step_index = state.get("current_step_index", 0)
+    step_number = current_step_index + 1
+
+    # Retrieve tools list from config
+    configurable = config.get("configurable", {})
+    tools_list = configurable.get("tools", [])
+
+    # --- Defensive Checks --- #
+    if not current_tool_call_info:
+        logger.error(f"Missing current_tool_call info at step {step_number}.")
+        return {
+            "error_message": f"Internal error: Missing tool call info at step {step_number}.",
+            "workflow_status": "failed",
+            "next_node": END
+        }
+
+    tool_name = current_tool_call_info.get("tool_name")
+    evidence_var = current_tool_call_info.get("evidence_var")
+
+    if not tool_name or not evidence_var:
+        logger.error(f"Tool name ('{tool_name}') or evidence variable ('{evidence_var}') missing in current_tool_call at step {step_number}.")
+        return {
+            "error_message": f"Internal error: Missing tool name or evidence var at step {step_number}.",
+            "workflow_status": "failed",
+            "evidence": current_evidence_dict,
+            "next_node": END
+        }
+
+    # Find the actual tool object from the list passed in config
+    tool_to_execute = find_tool_by_name(tools_list, tool_name)
+
+    if not tool_to_execute:
+        logger.error(f"Tool '{tool_name}' specified in plan (Step {step_number}) not found in the provided tools list: {[t.name for t in tools_list]}")
+        return {
+            "error_message": f"Tool '{tool_name}' not available for execution at step {step_number}.",
+            "workflow_status": "failed",
+            "evidence": current_evidence_dict,
+            "next_node": END
+        }
+    # --- End Defensive Checks --- #
+
+    output_evidence: Any = None
+    next_status = "routing_complete"
+    next_node = "evidence_processor"
+    error_message = None
+
+    try:
+        logger.info(f"(Step {step_number}) Executing tool: {tool_name} with input: {prepared_input}")
+
+        # Invoke the tool with the prepared input (which might be {})
+        tool_result = await tool_to_execute.ainvoke(prepared_input, config=config)
+
+        # --- Check if the result itself is an error message --- #
+        if isinstance(tool_result, str) and (
+            tool_result.startswith("Error:") or 
+            tool_result.startswith("Invalid arguments") or
+            "fail" in tool_result.lower() # Add other common error indicators if needed
+        ):
+            error_message = f"Tool {tool_name} returned an error string: {tool_result}"
+            logger.error(error_message)
+            output_evidence = error_message # Store error string as evidence
+            next_status = "failed"
+            next_node = END # Halt on tool execution errors
+            # Skip the successful execution logs below
+        else:
+            # Store the raw result (likely string or dict) as evidence
+            logger.debug(f"(Step {step_number}) Raw tool result type: {type(tool_result)}, value: {tool_result}") # Log raw result before str()
+            output_evidence = str(tool_result) # Convert result to string for consistency
+            logger.info(f"(Step {step_number}) Tool '{tool_name}' executed successfully.")
+            logger.debug(f"(Step {step_number}) Raw tool result as string: {output_evidence[:500]}...") # Log after str()
+            # Keep success status and node
+            next_status = "routing_complete"
+            next_node = "evidence_processor"
+            error_message = None
+
+    except Exception as e:
+        error_message = f"Exception during tool execution for {tool_name} (Step {step_number}): {e}"
+        logger.error(error_message, exc_info=True)
+        output_evidence = error_message # Store exception string as evidence
+        next_status = "failed"
+        next_node = END # Halt on tool execution errors
+
+    # Store the evidence (output or error message string) in the dictionary
+    logger.debug(f"Before update - current_evidence_dict type: {type(current_evidence_dict)}, value: {current_evidence_dict}")
+    logger.debug(f"Before update - evidence_var type: {type(evidence_var)}, value: {evidence_var}")
+    logger.debug(f"Before update - output_evidence type: {type(output_evidence)}, value: {str(output_evidence)[:100]}...")
+    current_evidence_dict[evidence_var] = output_evidence
+
+    logger.debug(f"After update - current_evidence_dict: {current_evidence_dict}") # Add after update log
+
+    next_step_index = current_step_index + 1
+
+    return {
+        "evidence": current_evidence_dict,
+        "workflow_status": next_status,
+        "error_message": error_message,
+        "next_node": next_node,
+        "current_step_index": next_step_index
+    } 

@@ -51,5 +51,38 @@
 *   **구체적인 예외:** `except Exception:` 보다는 가능한 한 구체적인 예외 타입을 명시하여 처리합니다.
 *   **적절한 로깅:** 오류 발생 시 관련 정보를 로그로 남겨 디버깅을 돕습니다.
 
----
-이 가이드라인은 프로젝트 진행 중 필요에 따라 수정되거나 보완될 수 있습니다. 
+## 8. 테스트
+
+*  모킹 테스트는 진행하지 않으며, .env.test에 실제 프로덕션 환경변수가 포함되어있으니, 이 환경변수를 이용하여 실제 프로덕션 환경과 동일한 통합테스트만 진행합니다.
+
+## 9. LLM 출력 제어 (GBNF 문법)
+
+*   **구조화된 출력 강제:** LlamaCpp 모델과 같이 GBNF(Grammar-Based Sampling with Backtracking)를 지원하는 LLM을 사용할 경우, GBNF 문법을 활용하여 LLM 출력을 원하는 JSON 스키마나 특정 형식으로 강제하는 것을 권장합니다. 이는 후속 처리 단계에서의 안정성을 높이고 오류를 줄이는 데 매우 효과적입니다.
+*   **문법 정의 위치:** GBNF 문법은 LLM 로더 (`core/llm_loader.py` 참고) 내부 또는 별도의 `.gbnf` 파일로 정의할 수 있습니다. 현재 프로젝트에서는 `core/llm_loader.py` 내부에 파이썬 raw string으로 정의되어 있습니다.
+    ```python
+    # core/llm_loader.py
+    PLAN_OUTPUT_GBNF = r"""
+    root ::= object
+    # ... (전체 GBNF 문법) ...
+    """
+    ```
+*   **문법 적용:** 정의된 GBNF 문법은 `LlamaGrammar.from_string()`을 통해 파싱되고, `LlamaCpp` 모델 초기화 시 `grammar` 파라미터로 전달되어 적용됩니다.
+    ```python
+    # core/llm_loader.py
+    try:
+        PLAN_OUTPUT_GRAMMAR = LlamaGrammar.from_string(PLAN_OUTPUT_GBNF)
+        # ...
+    except Exception as e:
+        # ... 오류 처리 ...
+
+    llm_instance = LlamaCpp(
+        # ... other params ...
+        grammar=PLAN_OUTPUT_GRAMMAR # 적용
+    )
+    ```
+*   **문법 검증 및 디버깅:** GBNF 문법은 구문이 매우 엄격하며, 작은 실수로도 `llama.cpp` 백엔드에서 파싱 오류(`llama_grammar_init_impl: failed to parse grammar`)를 일으킬 수 있습니다.
+    *   **오류 메시지 확인:** 테스트 또는 실행 로그에서 `stderr`에 출력되는 `parse: error parsing grammar:` 메시지를 주의 깊게 확인하여 오류 위치를 파악합니다.
+    *   **단순화:** 문제가 발생하면 문법을 극도로 단순화(예: `root ::= "{}"`)하여 로딩 자체가 성공하는지 확인하고, 점진적으로 규칙을 추가하며 오류 지점을 찾아냅니다.
+    *   **표준 참조:** 공식 GBNF 문서나 `llama.cpp` 리포지토리의 예제를 참조하여 올바른 구문을 확인합니다. 특히 JSON 관련 표준 정의(문자열 이스케이프, 숫자 형식 등)를 따르는 것이 중요합니다.
+    *   **공백 및 줄바꿈:** GBNF는 공백과 줄바꿈에 민감할 수 있으므로 규칙 정의의 끝맺음 등을 주의해야 합니다. `ws ::= [ \t\n]*` 규칙을 적절히 활용합니다.
+*   **유지보수:** LLM 출력 요구사항이 변경되면 관련 GBNF 문법도 함께 업데이트해야 합니다.

@@ -1,78 +1,117 @@
-# core/llm_loader.py
 import os
+from pathlib import Path
 from dotenv import load_dotenv
-# from llama_cpp import Llama # No longer needed directly
-from langchain_community.llms import LlamaCpp # Import Langchain wrapper
-from typing import Optional
+from langchain_community.llms import LlamaCpp
+from llama_cpp import LlamaGrammar # Keep this import just in case
+import logging
 
-# Load environment variables from .env file
+# Removed dynamic grammar generation imports and logic
+# try:
+#     from pydantic_gbnf_grammar_generator import generate_gbnf_grammar_and_documentation
+#     PYDANTIC_GBNF_AVAILABLE = True
+# except ImportError:
+#     PYDANTIC_GBNF_AVAILABLE = False
+#     generate_gbnf_grammar_and_documentation = None
+#     logger = logging.getLogger("LLM-Loader") # Initialize logger early for warning
+#     logger.warning("pydantic-gbnf-grammar-generator not found. Proceeding without dynamic grammar generation.")
+
+# Removed model import as it's no longer needed for grammar generation here
+# from core.schemas.plan_output import PlanOutput 
+
+# --- Logging Setup --- #
+logger = logging.getLogger("LLM-Loader")
+if not logger.handlers:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(name)s] - %(message)s')
+# --- End Logging Setup --- #
+
 load_dotenv()
 
-# Global variable to hold the loaded Langchain LLM instance
-llm_instance: Optional[LlamaCpp] = None
+# Default parameters
+DEFAULT_N_CTX = 8192
+DEFAULT_N_GPU_LAYERS = -1
+DEFAULT_N_BATCH = 512
+DEFAULT_TEMPERATURE = 0.7
+DEFAULT_MAX_TOKENS = 2048
+DEFAULT_TOP_P = 0.95
+DEFAULT_TOP_K = 40
+DEFAULT_VERBOSE = False
 
-# Define default parameters for LlamaCpp - consider moving to config or env vars
-DEFAULT_LLAMA_PARAMS = {
-    "n_ctx": 2048,
-    "n_gpu_layers": -1, # Use -1 to offload all possible layers to GPU
-    "verbose": True, # Set to False for less output in production
-    # Add other LlamaCpp parameters as needed (e.g., temperature, top_p)
-    "temperature": 0.7,
-    "max_tokens": 512, # Limit response length
-}
+# --- LLM Singleton Loader --- #
+llm_instance = None
+# Removed grammar instance caching
+# grammar_instance = None 
 
-def load_llm() -> LlamaCpp:
-    """
-    Loads the LlamaCpp model instance compatible with Langchain.
-    Uses the path from the environment variable MODEL_PATH.
-    Initializes the model only once and returns the existing instance on subsequent calls.
-
-    Returns:
-        LlamaCpp: The loaded LlamaCpp model instance for Langchain use.
-
-    Raises:
-        ValueError: If the MODEL_PATH environment variable is not set or the file does not exist.
-    """
+def load_llm():
     global llm_instance
-    if llm_instance is None:
-        model_path = os.getenv("MODEL_PATH")
-        if not model_path:
-            raise ValueError("MODEL_PATH environment variable not set.")
-        if not os.path.exists(model_path):
-            raise ValueError(f"Model file not found at path: {model_path}")
+    if llm_instance is not None:
+        logger.info("Returning existing LLM instance.")
+        return llm_instance
 
-        print(f"Loading model from: {model_path} with params: {DEFAULT_LLAMA_PARAMS}...")
-        try:
-            llm_instance = LlamaCpp(
-                model_path=model_path,
-                **DEFAULT_LLAMA_PARAMS # Unpack parameters
-            )
-            print("Langchain LlamaCpp model loaded successfully.")
-        except Exception as e:
-            print(f"Error loading LlamaCpp model: {e}")
-            raise # Re-raise the exception after logging
-    return llm_instance
+    # --- Grammar generation logic removed --- 
+    # grammar = None
+    # if PYDANTIC_GBNF_AVAILABLE:
+    #     logger.info("Attempting to generate GBNF grammar dynamically from PlanOutput model...")
+    #     try:
+    #         grammar_str, _ = generate_gbnf_grammar_and_documentation([PlanOutput])
+    #         grammar = LlamaGrammar.from_string(grammar_str)
+    #         logger.info("GBNF grammar generated dynamically and loaded successfully.")
+    #     except Exception as e:
+    #         logger.error(f"Failed to generate or load dynamic grammar: {e}. Proceeding without grammar.", exc_info=True)
+    #         grammar = None
+    # else:
+    #     logger.warning("Cannot generate grammar because pydantic-gbnf-grammar-generator is not installed.")
+    #     grammar = None
+    # --- End Grammar Generation --- #
 
-if __name__ == '__main__':
-    # Example usage: Load the LlamaCpp model and test invocation
+    logger.info("Initializing new LLM instance...")
+    model_path_str = os.getenv("MODEL_PATH")
+    if not model_path_str:
+        logger.error("MODEL_PATH environment variable not set.")
+        raise ValueError("MODEL_PATH environment variable not set.")
+
+    model_path = Path(model_path_str)
+    if not model_path.exists():
+        logger.error(f"Model file not found at path: {model_path}")
+        raise FileNotFoundError(f"Model file not found at path: {model_path}")
+
+    logger.info(f"Loading model: {model_path}")
+
+    try:
+        llm_instance = LlamaCpp(
+            model_path=str(model_path),
+            n_ctx=int(os.getenv("N_CTX", DEFAULT_N_CTX)),
+            n_gpu_layers=int(os.getenv("N_GPU_LAYERS", DEFAULT_N_GPU_LAYERS)),
+            n_batch=int(os.getenv("N_BATCH", DEFAULT_N_BATCH)),
+            temperature=float(os.getenv("TEMPERATURE", DEFAULT_TEMPERATURE)),
+            max_tokens=int(os.getenv("MAX_TOKENS", DEFAULT_MAX_TOKENS)),
+            top_p=float(os.getenv("TOP_P", DEFAULT_TOP_P)),
+            top_k=int(os.getenv("TOP_K", DEFAULT_TOP_K)),
+            verbose=os.getenv("VERBOSE", str(DEFAULT_VERBOSE)).lower() == 'true',
+            grammar=None, # Explicitly set grammar to None
+        )
+        logger.info("Model ready (Grammar constraints disabled).")
+        return llm_instance
+    except Exception as e:
+        logger.error(f"Failed to load the LLM: {e}", exc_info=True)
+        raise
+
+# --- CLI Test Section --- #
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    logger.info("--- LLM Loader Test ---")
     try:
         llm = load_llm()
-        print(f"Model Path: {llm.model_path}")
-        print("LLM Loader (LlamaCpp) is working.")
+        logger.info("LLM loaded successfully via load_llm().")
 
-        # Test loading again to check singleton pattern
-        llm_again = load_llm()
-        print(f"Is it the same instance? {llm is llm_again}")
+        # Removed grammar check as grammar is disabled
+        # if grammar_instance:
+        #     logger.info("Dynamically generated grammar object is present in the loaded LLM instance.")
+        # else:
+        #     logger.warning("No grammar object found or generated for the LLM instance.")
+        logger.info("Grammar constraints are disabled for this LLM instance.")
 
-        # Example invocation (requires model to be downloaded and path set correctly)
-        # print("\nTesting model invocation...")
-        # try:
-        #     response = llm.invoke("Explain the concept of ReWOO in one sentence.")
-        #     print(f"Model Response:\n{response}")
-        # except Exception as invoke_error:
-        #     print(f"Error during model invocation: {invoke_error}")
-
-    except ValueError as e:
-        print(f"Configuration error: {e}")
+    except (ValueError, FileNotFoundError) as e:
+        logger.error(f"Test failed: {e}")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}") 
+        logger.error(f"An unexpected error occurred during testing: {e}", exc_info=True)
+# --- End CLI Test Section ---
