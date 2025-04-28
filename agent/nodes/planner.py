@@ -3,27 +3,11 @@ import logging
 from langsmith import traceable
 from langchain_core.runnables import RunnableConfig
 from langchain_core.language_models import BaseLanguageModel
-import re # Import re for regex parsing
-import json # Import json for parsing
-
-# from ..state import ReWOOState, PlanOutput, PlanStepPydantic, ToolCallPydantic # This import might cause circular dependency if state imports planner node
-# Let's try importing state directly
-from agent.state import ReWOOState, PlanStep, PlanOutput # Adjusted import based on potential structure
-# Define Pydantic models locally if needed or ensure state has them
-# from pydantic import BaseModel, Field
-# class ToolCallPydantic(BaseModel):
-#     tool_name: str
-#     arguments: Dict[str, Any]
-# class PlanStepPydantic(BaseModel):
-#     thought: str
-#     tool_call: Optional[ToolCallPydantic] = None
-#     expected_outcome: str
-
-# Removed import from deleted planner
-# from ..planner import _format_plan_to_string # Keep formatting helper for refinement
+import re
+import json
+from agent.state import ReWOOState
 from ..prompts.plan_prompts import PLANNER_PROMPT_TEMPLATE, PLANNER_REFINE_PROMPT_TEMPLATE
-# Import PlanValidator locally if needed or adjust path
-# from ..validation import PlanValidator # Needs to exist or be moved
+
 # --- Placeholder for PlanValidator --- #
 class PlanValidator:
     def validate(self, plan_dicts: List[Dict[str, Any]]) -> tuple[bool, list]:

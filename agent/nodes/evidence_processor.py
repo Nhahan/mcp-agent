@@ -40,26 +40,8 @@ async def evidence_processor_node(state: ReWOOState) -> Dict[str, Any]:
         return {"workflow_status": "routing_complete", "next_node": "tool_selector"}
 
     logger.info(f"Retrieved evidence for step {completed_step_index + 1} ('{evidence_var_key}'): {str(latest_evidence)[:200]}...")
-
-    # Placeholder: Actual processing logic (e.g., LLM summarization) would go here.
-    # For now, we just use the raw evidence fetched.
-    # processed_info = f"Processed: {str(latest_evidence)[:100]}..."
-    # logger.info("Evidence processing complete (Placeholder).")
-
-    # No state update needed here as we are just using the raw evidence for now.
-    # If we were creating processed_info, we might update the dict:
-    # evidence_dict[evidence_var_key] = processed_info # Or use a different key structure
-
     logger.debug(f"Evidence dictionary remains: {evidence_dict}")
     # --- End Corrected Logic ---
-
-
-    # Update state (This logic needs to be revised based on how evidence is structured)
-    # Example: update the evidence dict with processed info if needed
-    # evidence_dict[f"#E{current_step_index}"] = processed_info # This assumes #E key matches step index
-
-    #logger.debug(f"Evidence dictionary after processing attempt: {evidence_dict}")
-
     return {
         "evidence": evidence_dict, # Return the potentially updated dictionary
         "workflow_status": "routing_complete",

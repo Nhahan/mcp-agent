@@ -1,15 +1,11 @@
 # agent/nodes/tool_executor.py
 from typing import Dict, Any, List, Optional
 import logging
-import asyncio
 
-# Update state import if EvidenceDict is defined there
-from ..state import ReWOOState, EvidenceDict
-# Removed MCPClient import as we use BaseTool objects now
-# from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_core.tools import BaseTool # Import BaseTool
+from ..state import ReWOOState
+from langchain_core.tools import BaseTool
 from langgraph.graph import END
-from langchain_core.runnables import RunnableConfig # Import RunnableConfig
+from langchain_core.runnables import RunnableConfig
 
 # --- Logging Setup --- #
 logger = logging.getLogger(__name__)

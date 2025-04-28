@@ -64,12 +64,12 @@ PLANNER_PROMPT_TEMPLATE = PromptTemplate.from_template(
     - **Prioritize `null`:** If the step involves reasoning, summarizing, or can be answered from general knowledge without external data, strongly prefer setting `tool_call` to `null`.
     - **Content for `null` tool_call:** If `tool_call` is `null` because the step can be answered using general knowledge (like providing instructions, definitions, or summaries), the "plan" field for that step **MUST contain the actual instructional text or information** that contributes directly to the final answer. Do not just describe *what* you will do (e.g., "List the ingredients"); instead, *provide* the information (e.g., "The ingredients are: flour, sugar, eggs...").
     - If a tool is used, "tool_call" MUST be an object containing:
-        - "evidence_variable": A string like "#E1", "#E2", etc., incrementing for each tool call step.
-        - "tool_name": The exact name of the tool from the 'Available Tools' list.
-        - "arguments": A JSON object containing the arguments for the tool. If a tool takes no arguments, use an empty object {{}}. Ensure keys and string values within arguments are enclosed in double quotes.
+        - \"evidence_variable\": A string like \"#E1\", \"#E2\", etc., incrementing for each tool call step.
+        - \"tool_name\": The exact name of the tool from the 'Available Tools' list.
+        - \"arguments\": **MUST be a valid JSON object**. If a tool takes no arguments, use an empty JSON object: `{{}}`. **Do NOT use the string `\"{{}}\"`**. Ensure keys and string values within the arguments object are enclosed in double quotes.
             - **Argument Accuracy:** You MUST provide accurate and necessary arguments based on the tool's description and the query context. Do not guess arguments. If required arguments are missing in the query, set `tool_call` to `null` or use a tool to find the missing information first.
-    - If **NO external tool is required** for a step (e.g., simple reasoning, summarizing information already gathered, providing instructions based on general knowledge like preheating an oven), you **MUST set the value of "tool_call" directly to `null`**. Do **NOT** create a `tool_call` object with null/empty values inside in this case.
-    - **Crucially, ensure the entire output is a single, valid JSON object.** Pay EXTREME attention to quotes ("), commas (,), braces ({{}}), and brackets ([]).
+    - If **NO external tool is required** for a step (e.g., simple reasoning, summarizing information already gathered, providing instructions based on general knowledge like preheating an oven), you **MUST set the value of \"tool_call\" directly to `null`**. Do **NOT** create a `tool_call` object with null/empty values inside in this case.
+    - **Crucially, ensure the entire output is a single, valid JSON object.** Pay EXTREME attention to quotes (\"), commas (,), braces ({{}}), and brackets ([]).
     - Extract necessary entities from the 'Query: {query}' to use as arguments in the "arguments" object.
     - The plan should logically progress towards answering the query.
 
