@@ -47,22 +47,6 @@ def load_llm():
         logger.info("Returning existing LLM instance.")
         return llm_instance
 
-    # --- Grammar generation logic removed --- 
-    # grammar = None
-    # if PYDANTIC_GBNF_AVAILABLE:
-    #     logger.info("Attempting to generate GBNF grammar dynamically from PlanOutput model...")
-    #     try:
-    #         grammar_str, _ = generate_gbnf_grammar_and_documentation([PlanOutput])
-    #         grammar = LlamaGrammar.from_string(grammar_str)
-    #         logger.info("GBNF grammar generated dynamically and loaded successfully.")
-    #     except Exception as e:
-    #         logger.error(f"Failed to generate or load dynamic grammar: {e}. Proceeding without grammar.", exc_info=True)
-    #         grammar = None
-    # else:
-    #     logger.warning("Cannot generate grammar because pydantic-gbnf-grammar-generator is not installed.")
-    #     grammar = None
-    # --- End Grammar Generation --- #
-
     logger.info("Initializing new LLM instance...")
     model_path_str = os.getenv("MODEL_PATH")
     if not model_path_str:
