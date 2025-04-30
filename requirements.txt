@@ -23,4 +23,3 @@ pytest
 
 # Data validation and parsing
 pydantic 
-pydantic-gbnf-grammar-generator 
