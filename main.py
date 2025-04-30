@@ -97,7 +97,7 @@ async def main():
                 return # Exit if graph building fails
 
             # 4. Start interaction loop or process a single query
-            query = "How do I bake a simple cake?"
+            query = "How do I bake a simple cake? Write a recipe on '/Users/sunningkim/Developer' folder in markdown format as 'recipe.md'"
 
             logger.info(f"Starting agent execution with query: '{query}'")
             try:
