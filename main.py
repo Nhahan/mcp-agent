@@ -6,10 +6,18 @@ from pathlib import Path
 from typing import Dict, Any
 from langchain_core.globals import set_llm_cache
 from langgraph.graph import END
+import argparse
 
 from core.llm_loader import load_llm
 from agent.graph import build_rewoo_graph
 from langchain_mcp_adapters.client import MultiServerMCPClient
+
+# Try to import pygraphviz for visualization, but don't fail if it's not installed
+try:
+    # This import is only needed for visualization
+    import pygraphviz
+except ImportError:
+    pygraphviz = None # Set to None if not found
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(name)s:%(funcName)s] - %(message)s')
@@ -54,7 +62,7 @@ def load_mcp_servers_from_config(config_path: Path = Path("mcp.json")) -> Dict[s
         logger.error(f"Unexpected error loading MCP config {config_path}: {e}", exc_info=True)
         return {}
 
-async def main():
+async def main(visualize: bool = False):
     logger.info("Starting ReWOO Agent...")
 
     # 1. Load LLM
@@ -90,6 +98,28 @@ async def main():
                 # build_rewoo_graph now returns (compiled_app, base_graph_config)
                 compiled_app, base_graph_config = build_rewoo_graph(llm, mcp_client)
                 logger.info(f"Agent graph built successfully.") # Removed entry node log
+
+                # --- Visualization Logic ---
+                if visualize:
+                    if pygraphviz is None:
+                        logger.error("Cannot visualize graph: 'pygraphviz' library is not installed.")
+                        logger.error("Please install it (e.g., 'pip install pygraphviz' or 'poetry add pygraphviz')")
+                        logger.error("Note: 'pygraphviz' may require the system library 'graphviz' to be installed first (e.g., 'brew install graphviz' on macOS).")
+                    else:
+                        try:
+                            logger.info("Generating graph visualization...")
+                            # Define the output path
+                            output_path = Path("graph_visualization.png")
+                            # Use the compiled app to get the graph and draw it
+                            compiled_app.get_graph().draw_mermaid_png(output_file_path=str(output_path))
+                            logger.info(f"Graph visualization saved to {output_path.resolve()}")
+                        except Exception as e:
+                            logger.error(f"Failed to generate graph visualization: {e}", exc_info=True)
+                    # Exit after visualization if needed, or let it continue
+                    logger.info("Visualization attempted. Exiting as requested by --visualize flag.")
+                    return # Exit after visualization
+                # --- End Visualization Logic ---
+
             except Exception as e:
                 logger.error(f"Failed to build agent graph: {e}", exc_info=True)
                 return # Exit if graph building fails
@@ -154,4 +184,13 @@ async def main():
     logger.info("Agent main function finished.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Run the ReWOO Agent with optional graph visualization.")
+    parser.add_argument(
+        "--visualize",
+        action="store_true",
+        help="Generate a visualization of the LangGraph graph and save it as graph_visualization.png, then exit."
+    )
+    args = parser.parse_args()
+
+    # Pass the visualize flag to the main function
+    asyncio.run(main(visualize=args.visualize))
