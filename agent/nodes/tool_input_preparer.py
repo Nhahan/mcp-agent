@@ -6,11 +6,9 @@ import json
 from ..state import ReWOOState, EvidenceDict
 from langgraph.graph import END
 
-# --- Logging Setup --- #
 logger = logging.getLogger(__name__)
-# --- End Logging Setup --- #
 
-# Simple evidence substitution function for string inputs
+
 def substitute_evidence(input_str: str, evidence: EvidenceDict, step_number_for_log: int) -> str:
     """ Substitutes #E<n> placeholders in the input string with evidence. """
     # Pattern to find all #E<n> placeholders

@@ -5,20 +5,33 @@ import json
 from ..state import ReWOOState
 from ..prompts.answer_prompts import FINAL_ANSWER_PROMPT_TEMPLATE
 from langchain_core.language_models import BaseLanguageModel
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END
 
-# --- Logging Setup --- #
 logger = logging.getLogger(__name__)
-# --- End Logging Setup --- #
 
 
-async def final_answer_node(state: ReWOOState, llm: BaseLanguageModel) -> Dict[str, Any]:
+async def final_answer_node(state: ReWOOState, node_config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Generates the final answer based on the original query and collected evidence.
     If evidence is empty, it uses the plan steps as context.
     Sets workflow_status to 'finished' on success, 'failed' on error.
     """
     logger.info("--- Starting Final Answer Node ---")
+
+    # Extract LLM from node_config
+    configurable = node_config.get("configurable", {})
+    llm = configurable.get("llm")
+    if not llm:
+        logger.error("LLM not found in config['configurable'] for final_answer_node.")
+        return {
+            "final_answer": None,
+            "error_message": "Final Answer Node Error: LLM not configured.",
+            "workflow_status": "failed",
+            "evidence": state.get("evidence", {}), # Preserve evidence
+            "next_node": END
+        }
+
     # Check for errors from previous steps before proceeding
     if state.get("workflow_status") == "failed":
         logger.warning("Skipping final answer generation due to previous failure.")

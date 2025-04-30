@@ -2,15 +2,13 @@ from typing import List, Dict, Any
 import logging
 from langsmith import traceable
 from langchain_core.runnables import RunnableConfig
-from langchain_core.language_models import BaseLanguageModel
-from langchain_core.output_parsers import PydanticOutputParser
-from langchain.output_parsers import OutputFixingParser
-import re
 import json
-from agent.state import ReWOOState, ParsedPlanStep, PlanOutputPydantic
+import yaml # Import yaml
+from ..state import ReWOOState
 from ..prompts.plan_prompts import PLANNER_PROMPT_TEMPLATE, PLANNER_REFINE_PROMPT_TEMPLATE
 
-# --- Placeholder for PlanValidator --- #
+
+# --- Placeholder for PlanValidator (Keep as is for now) --- #
 class PlanValidator:
     def validate(self, plan_dicts: List[Dict[str, Any]]) -> tuple[bool, list]:
         # Basic placeholder validation
@@ -21,153 +19,154 @@ class PlanValidator:
         errors = []
         for i, step in enumerate(plan_dicts):
             if not isinstance(step, dict):
-                 errors.append((i, f"Step {i+1} is not a dictionary"))
-                 continue
+                errors.append((i, f"Step {i+1} is not a dictionary"))
+                continue
             if "thought" not in step or not step["thought"]:
                 errors.append((i, f"Step {i+1} is missing a 'thought'"))
             if "expected_outcome" not in step or not step["expected_outcome"]:
-                 errors.append((i, f"Step {i+1} is missing an 'expected_outcome'"))
+                errors.append((i, f"Step {i+1} is missing an 'expected_outcome'"))
+            if "tool_call" not in step or not isinstance(step.get("tool_call"), dict):
+                errors.append((i, f"Step {i+1} has invalid tool_call structure"))
             # Add more checks (tool_call format, etc.) if needed
         return not errors, errors
 # --- End Placeholder for PlanValidator --- #
 
 from langgraph.graph import END
 
-# --- Logging Setup --- #
 logger = logging.getLogger(__name__)
-# --- End Logging Setup --- #
 
-JSON_BLOCK_REGEX = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL) # Use non-greedy match for content
 
 @traceable(name="Planning Node")
-async def planning_node(state: ReWOOState, config: RunnableConfig) -> Dict[str, Any]:
+async def planning_node(state: ReWOOState, node_config: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Generates or refines a plan using the LLM and Pydantic/OutputFixing parsers.
-    Sets workflow_status to 'routing_complete' on success, 'failed' on error.
+    Generates or refines a plan using the LLM, requesting YAML-like output.
+    Passes the raw output to the plan_parser node.
+    Sets workflow_status to 'planning_failed' on LLM error after retries.
     """
-    logger.info(f"--- Entering Planning Node (Attempt {state.get('current_retry', 0) + 1}) ---")
+    current_retry = state.get('current_retry', 0)
+    logger.info(f"--- Entering Planning Node (Attempt {current_retry + 1}) ---")
     max_retries = state.get('max_retries', 1)
-    llm_retries = 1
-    retries = state.get('current_retry', 0)
+    # llm_retries removed, handled by OutputFixingParser previously
 
-    if retries >= max_retries:
-        logger.error(f"Max retries ({max_retries}) reached for planning node.")
-        return {"workflow_status": "failed", "error_message": f"Planning failed after {max_retries} node retries.", "current_retry": retries, "next_node": END}
+    if current_retry >= max_retries:
+        logger.error(f"Max retries ({max_retries}) reached for planning node LLM invocation.")
+        # Keep error message simple, parser node handles detailed parsing errors
+        return {"workflow_status": "failed", "error_message": f"Planning failed after {max_retries} LLM retries.", "current_retry": current_retry, "next_node": END}
 
     logger.info(f"Generating plan for query: '{state['original_query']}'")
     logger.debug(f"Planning Node received state keys: {list(state.keys())}")
 
-    configurable = config.get("configurable", {})
-    llm = configurable.get("llm")
-    tools_str = configurable.get("tools_str")
-    if not llm or not tools_str:
-        logger.error(f"LLM or tools_str missing in config['configurable']: {configurable}")
-        return {"error_message": "LLM or tools_str missing in config", "workflow_status": "failed", "next_node": END}
+    # Use the passed node_config dictionary
+    configurable = node_config.get("configurable", {}) 
+    # Use the potentially grammar-bound planner_llm from config
+    llm = configurable.get("planner_llm") 
+    if not llm:
+        # Fallback to base llm if planner_llm is somehow not set
+        logger.warning("'planner_llm' not found in config, falling back to base 'llm'.")
+        llm = configurable.get("llm")
+    
+    # Get the filtered tools string from the state, not the config
+    filtered_tools_str = state.get("filtered_tools_str") 
+    if not filtered_tools_str:
+        logger.warning("Filtered tools string is missing or empty in state. Planner will operate without tool descriptions.")
+        # Optionally handle this case - maybe skip planning tools? For now, pass empty string.
+        filtered_tools_str = "No tools available for planning."
+
+    # === Log the actual tools string being used by the planner ===
+    logger.debug(f"Planner using the following tool descriptions:\n---\n{filtered_tools_str}\n---")
+    # ============================================================
 
     query = state["original_query"]
     last_error = state.get('error_message')
     previous_plan_pydantic = state.get('plan_pydantic')
     raw_llm_response_for_log = ""
 
+    # Check if LLM is None before proceeding
+    if not llm:
+        logger.error(f"LLM (base or planner) missing in config['configurable']: {configurable}")
+        return {"error_message": "LLM missing in config", "workflow_status": "failed", "current_retry": current_retry, "next_node": END}
+
     try:
         # --- Initialize Parsers --- #
-        pydantic_parser = PydanticOutputParser(pydantic_object=PlanOutputPydantic)
-        output_parser = OutputFixingParser.from_llm(
-            parser=pydantic_parser,
-            llm=llm,
-            max_retries=llm_retries
-        )
-        format_instructions = output_parser.get_format_instructions()
+        
+            
 
         # --- Prepare Prompt --- #
-        if retries > 0 and previous_plan_pydantic is not None and last_error is not None:
+        # Re-enable refinement logic
+        if current_retry > 0 and previous_plan_pydantic is not None and last_error is not None:
             logger.info("Refining previous plan due to errors.")
             prompt_template = PLANNER_REFINE_PROMPT_TEMPLATE
-            previous_plan_str = json.dumps(previous_plan_pydantic.dict(), indent=2)
+            # Try to serialize Pydantic model, fallback to raw string if needed
+            try:
+                previous_plan_str = previous_plan_pydantic.model_dump_json(indent=2)
+            except AttributeError: # Handle cases where it might be a dict from earlier versions
+                 previous_plan_str = json.dumps(previous_plan_pydantic, indent=2) if isinstance(previous_plan_pydantic, dict) else str(previous_plan_pydantic)
+                 logger.warning(f"Could not use model_dump_json on previous plan, using json.dumps. Type was: {type(previous_plan_pydantic)}")
+                 
             prompt_args = {
                 "query": query,
-                "tool_descriptions": tools_str,
-                "previous_plan": previous_plan_str,
-                "validation_errors": last_error,
-                "format_instructions": format_instructions
+                "tool_descriptions": filtered_tools_str,
+                "previous_plan": previous_plan_str, # Pass the possibly raw previous plan
+                "validation_errors": last_error
             }
         else:
-            logger.info("Generating initial plan using Pydantic prompt.")
+            logger.info("Generating initial plan using filtered tools.")
             prompt_template = PLANNER_PROMPT_TEMPLATE
             prompt_args = {
                 "query": query,
-                "tool_descriptions": tools_str,
-                "format_instructions": format_instructions
+                "tool_descriptions": filtered_tools_str # USE FILTERED STRING
             }
 
         # --- Define Chain --- #
-        plan_chain = prompt_template | llm | output_parser
+        plan_chain = prompt_template | llm
 
-        # --- Invoke Chain --- #
-        logger.info("Invoking LLM chain with output parser...")
-        parsed_plan_output: PlanOutputPydantic = await plan_chain.ainvoke(prompt_args, config=config)
-        logger.info(f"Successfully parsed plan using PydanticOutputParser. Found {len(parsed_plan_output.steps)} steps.")
+        # --- Invoke Chain --- #        
+        logger.debug(f"Prompt arguments sent to LLM: {prompt_args}") # Log prompt args
+        # Get raw response first for logging
+        raw_llm_response = await (prompt_template | llm).ainvoke(prompt_args, config=node_config)
+        raw_llm_response_content = raw_llm_response.content if hasattr(raw_llm_response, 'content') else str(raw_llm_response)
+        logger.debug(f"Raw LLM response received:\n{raw_llm_response_content}")
 
-        # --- Extract Tool Call Tuples --- #
-        parsed_plan_tuples: List[ParsedPlanStep] = []
-        for step in parsed_plan_output.steps:
-            if step.tool_call:
-                tool_input_str = json.dumps(step.tool_call.arguments)
-                parsed_plan_tuples.append((
-                    step.plan,
-                    step.tool_call.evidence_variable,
-                    step.tool_call.tool_name,
-                    tool_input_str
-                ))
-            else:
-                logger.info(f"Step: '{step.plan}' - No tool call.")
+        # Planner node now passes the raw YAML string to the parser node
+        logger.info("Planner finished generating raw YAML plan. Proceeding to parser.")
+        return {
+            "raw_plan_output": raw_llm_response_content, # Store raw output for parser
+            "workflow_status": "routing_complete",
+            "error_message": None,
+            "current_retry": current_retry,
+            "next_node": "plan_parser" # Explicitly route to parser
+        }
 
-        # --- Decide Next Node --- #
-        if parsed_plan_tuples:
-            logger.info(f"Plan contains {len(parsed_plan_tuples)} tool calls. Proceeding to tool execution.")
-            return {
-                "plan_pydantic": parsed_plan_output,
-                "plan": parsed_plan_tuples,
-                "current_step_index": 0,
-                "evidence": {},
-                "workflow_status": "routing_complete",
-                "error_message": None,
-                "current_retry": retries,
-                "next_node": "tool_selector"
-            }
-        else:
-            logger.info("Plan contains no tool calls. Proceeding directly to final answer generation.")
-            return {
-                "plan_pydantic": parsed_plan_output,
-                "plan": [],
-                "current_step_index": 0,
-                "evidence": {},
-                "workflow_status": "routing_complete",
-                "error_message": None,
-                "current_retry": retries,
-                "next_node": "generate_final_answer"
-            }
-
+    except ValueError as e: # Keep ValueError catch? Maybe specific exception from LLM?
+         # Catch parsing/validation errors specifically - MOVED TO PARSER
+         logger.error(f"Planning failed due to LLM error or unexpected output structure before parsing: {e}", exc_info=True)
+         error_msg = f"Planning failed: LLM Error - {e}"
+         current_retry += 1
     except Exception as e:
-        # Handle exceptions potentially raised by the parser or LLM
-        logger.error(f"Error during planning node attempt {retries + 1}", exc_info=True)
+        # Handle other exceptions (e.g., network issues during LLM call)
+        # Log the raw response content if available
+        if 'raw_llm_response_content' in locals():
+            logger.error(f"Error during planning node attempt {current_retry + 1}. Raw LLM response was:\n{raw_llm_response_content}", exc_info=True)
+        else:
+            logger.error(f"Error during planning node attempt {current_retry + 1} (before LLM response was received or during prompt generation).", exc_info=True)
+        
         error_msg = f"Planning failed: {e}"
-        retries += 1
-        if retries < max_retries:
-            logger.warning(f"Retrying planning node (attempt {retries + 1}/{max_retries})...")
+        current_retry += 1
+        if current_retry < max_retries:
+            logger.warning(f"Retrying planning node (attempt {current_retry + 1}/{max_retries})...")
             return {
                 "error_message": error_msg,
-                "plan_pydantic": previous_plan_pydantic,
-                "current_retry": retries
+                "plan_pydantic": state.get('plan_pydantic'), # Keep previous valid plan if exists
+                "current_retry": current_retry
             }
         else:
             logger.error(f"Max node retries ({max_retries}) reached. Failing workflow.")
             return {
                 "error_message": error_msg,
                 "workflow_status": "failed",
-                "plan_pydantic": previous_plan_pydantic,
+                "plan_pydantic": state.get('plan_pydantic'), # Keep previous valid plan if exists
                 "plan": None,
                 "evidence": {},
-                "current_retry": retries,
+                "current_retry": current_retry,
                 "next_node": END
-            } 
+            }

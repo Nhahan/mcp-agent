@@ -7,9 +7,7 @@ from langchain_core.tools import BaseTool
 from langgraph.graph import END
 from langchain_core.runnables import RunnableConfig
 
-# --- Logging Setup --- #
 logger = logging.getLogger(__name__)
-# --- End Logging Setup --- #
 
 # Helper function to find a tool by name from the list
 def find_tool_by_name(tools: List[BaseTool], name: str) -> Optional[BaseTool]:
@@ -18,7 +16,7 @@ def find_tool_by_name(tools: List[BaseTool], name: str) -> Optional[BaseTool]:
             return tool
     return None
 
-async def tool_execution_node(state: ReWOOState, config: RunnableConfig) -> Dict[str, Any]:
+async def tool_execution_node(state: ReWOOState, node_config: Dict[str, Any]) -> Dict[str, Any]:
     """
     Executes the selected tool with the prepared input using BaseTool objects.
     Retrieves tool name, input, and evidence var from state.
@@ -33,9 +31,24 @@ async def tool_execution_node(state: ReWOOState, config: RunnableConfig) -> Dict
     current_step_index = state.get("current_step_index", 0)
     step_number = current_step_index + 1
 
-    # Retrieve tools list from config
-    configurable = config.get("configurable", {})
-    tools_list = configurable.get("tools", [])
+    # Retrieve filtered tools list from state
+    filtered_tools_list = state.get("filtered_tools", [])
+    if not filtered_tools_list:
+        # Correctly handle potential None for current_tool_call_info in log message
+        tool_name_for_log = current_tool_call_info.get('tool_name') if current_tool_call_info else 'unknown'
+        logger.warning(f"No tools found in state['filtered_tools'] at step {step_number}. Cannot execute tool '{tool_name_for_log}'.")
+        # Fallback to getting tools from config if state is empty (should not happen ideally)
+        # Use the passed node_config dictionary for fallback
+        configurable = node_config.get("configurable", {}) 
+        filtered_tools_list = configurable.get("tools", [])
+        if not filtered_tools_list:
+             logger.error(f"No tools found in state OR config at step {step_number}. Failing.")
+             return {
+                 "error_message": f"Internal error: No tools available for execution at step {step_number}.",
+                 "workflow_status": "failed",
+                 "next_node": END
+             }
+        logger.warning("Using full tool list from config as fallback.")
 
     # --- Defensive Checks --- #
     if not current_tool_call_info:
@@ -58,17 +71,21 @@ async def tool_execution_node(state: ReWOOState, config: RunnableConfig) -> Dict
             "next_node": END
         }
 
-    # Find the actual tool object from the list passed in config
-    tool_to_execute = find_tool_by_name(tools_list, tool_name)
+    # Find the actual tool object from the FILTERED list
+    tool_to_execute = find_tool_by_name(filtered_tools_list, tool_name)
 
     if not tool_to_execute:
-        logger.error(f"Tool '{tool_name}' specified in plan (Step {step_number}) not found in the provided tools list: {[t.name for t in tools_list]}")
+        logger.error(f"Tool '{tool_name}' specified in plan (Step {step_number}) not found in the filtered tools list: {[t.name for t in filtered_tools_list]}")
+        # --- Modify Error Handling to FAIL immediately --- #
+        error_msg = f"Tool '{tool_name}' not found in relevant tools at step {step_number}. Filtered list: {[t.name for t in filtered_tools_list]}"
+        logger.error(f"Failing workflow because invalid or non-filtered tool '{tool_name}' was specified.")
         return {
-            "error_message": f"Tool '{tool_name}' not available for execution at step {step_number}.",
+            "error_message": error_msg,
             "workflow_status": "failed",
             "evidence": current_evidence_dict,
-            "next_node": END
+            "next_node": END # Fail immediately
         }
+        # --- End Modification --- #
     # --- End Defensive Checks --- #
 
     output_evidence: Any = None
@@ -80,7 +97,8 @@ async def tool_execution_node(state: ReWOOState, config: RunnableConfig) -> Dict
         logger.info(f"(Step {step_number}) Executing tool: {tool_name} with input: {prepared_input}")
 
         # Invoke the tool with the prepared input (which might be {})
-        tool_result = await tool_to_execute.ainvoke(prepared_input, config=config)
+        # Pass the node_config dictionary to ainvoke
+        tool_result = await tool_to_execute.ainvoke(prepared_input, config=node_config)
 
         # --- Check if the result itself is an error message --- #
         if isinstance(tool_result, str) and (

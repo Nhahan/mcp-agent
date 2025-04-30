@@ -2,27 +2,27 @@
 from typing import List, Dict, Any, Optional, Tuple, cast
 from langchain_core.language_models import BaseLanguageModel
 from langchain_core.tools import BaseTool
-from langgraph.graph import StateGraph, END, START
+from langgraph.graph import StateGraph, END, START, MessagesState
 from functools import partial
-import asyncio
 import json
-import re
 import logging
 from langsmith import traceable
 from langchain_core.runnables import RunnableConfig
 
-# Import state definition
 from .state import ReWOOState # PlanStep, Evidence, ToolResult, ToolCall 등은 State 또는 노드에서 사용
 
-# 삭제된 import:
-# from .planner import generate_plan, _format_plan_to_string, _format_tool_descriptions, PlanStep
-# from .solver import generate_final_answer
+from .utils import format_tool_descriptions_with_schema, format_tool_descriptions_simplified # Import both formatters
+from langchain_community.llms import LlamaCpp # Import to check instance type
 
 # Import MCP client from adapter library
 from langchain_mcp_adapters.client import MultiServerMCPClient
+# Removed MCPToolAdapter import
 
 # Import node functions from the correct location
+from .nodes.tool_filter_node import tool_filter_node # Import the new node
 from .nodes.planner import planning_node
+from .nodes.plan_parser import plan_parser_node # Added plan_parser_node import
+from .nodes.plan_validator import plan_validator_node # Import the new validator node
 from .nodes.tool_selector import tool_selection_node
 from .nodes.tool_input_preparer import tool_input_preparation_node
 from .nodes.tool_executor import tool_execution_node
@@ -33,42 +33,30 @@ from .nodes.final_answer import final_answer_node
 from .prompts.plan_prompts import PLANNER_PROMPT_TEMPLATE, PLANNER_REFINE_PROMPT_TEMPLATE
 from .prompts.answer_prompts import FINAL_ANSWER_PROMPT_TEMPLATE
 
-# 삭제된 import:
-# from agent.validation import PlanValidator # Planner 노드 내부에서 import 해야 할 수 있음
-# from agent.tools.registry import ToolRegistry # MCP Client가 도구 제공
-
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.language_models import BaseChatModel
 
 # --- Logging Setup --- #
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s] - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s')
 logger = logging.getLogger(__name__)
 # --- End Logging Setup --- #
 
-# Helper function to find a tool by name from the list (MCP Client handles this now, maybe remove?)
-# def find_tool_by_name(tools: List[BaseTool], name: str) -> Optional[BaseTool]:
-#     for tool in tools:
-#         if tool.name == name:
-#             return tool
-#     return None
 
-# --- LangGraph Nodes (Definitions are in agent/nodes/*) ---
-# Make sure the node functions imported above are used in add_node calls below
-
-# --- Conditional Edges ---
+# --- Conditional Edges --- #
 def should_continue(state: ReWOOState) -> str:
-    """Determines the next node to route to based on the workflow status."""
+    """Determines the next node to route to based on the workflow status and next_node hint."""
     status = state.get("workflow_status")
     next_node_hint = state.get("next_node") # Get hint regardless of status first
     logger.debug(f"--- Determining Next Node --- State Status: {status}, Next Node Hint: {next_node_hint}")
 
-    # Check for explicit routing first
-    # Ensure the status is indeed 'routing_complete' before using the hint
-    if status == "routing_complete" and next_node_hint:
-        logger.info(f"Routing complete, explicit next node: '{next_node_hint}'. Returning hint.")
+    # Check for explicit routing hint first (most common case for successful steps)
+    if next_node_hint:
+        logger.info(f"Routing based on explicit next_node hint: '{next_node_hint}'.")
+        # Clear the hint after using it to prevent accidental reuse on loops/retries
+        # state["next_node"] = None # Modification of state dict directly is discouraged in conditional edges
         return next_node_hint
 
-    # Check for terminal states
+    # Check for terminal states if no hint
     elif status == "finished":
         logger.info("Workflow finished successfully. Routing to END.")
         return END
@@ -77,124 +65,127 @@ def should_continue(state: ReWOOState) -> str:
         logger.error(f"Workflow failed. Error: {error_msg}. Routing to END.")
         return END
     else:
-        # If status is not routing_complete, finished, or failed, it's an unexpected situation for routing
-        logger.error(f"Unexpected state encountered for routing decision (Status: '{status}', Hint: '{next_node_hint}'). Forcing END.")
+        # If no hint and not a terminal state, it's unexpected.
+        # This might happen if a node doesn't set next_node correctly.
+        logger.error(f"Unexpected state for routing: No next_node hint and status is '{status}'. Forcing END.")
         return END
 
-    # --- Old routing logic (commented out as new logic above handles it) ---
-    # if status == "planner_success":
-    #     return "tool_selector"
-    # elif status == "tool_input_preparation":
-    #     return "tool_input_preparer"
-    # elif status == "tool_execution":
-    #     return "tool_executor"
-    # elif status == "evidence_processing":
-    #     return "evidence_processor"
-    # elif status == "final_answer":
-    #     return "generate_final_answer"
-    # elif status == "tool_selection":
-    #      # This happens after a 'thought only' step or evidence processing
-    #     return "tool_selector"
-    # elif status == "finished":
-    #     return END
-    # elif status == "failed" or status == "failed_retryable": # Treat retryable as failed for routing now
-    #     logger.error(f"Workflow failed. Error: {state.get('error_message')}")
-    #     return END
-    # else:
-    #     logger.error(f"Unknown workflow status: {status}. Ending workflow.")
-    #     return END
-    # --- End Old routing logic ---
-
-# --- Build Graph ---
-async def build_rewoo_graph(llm: BaseLanguageModel, mcp_client: MultiServerMCPClient) -> Tuple[StateGraph, str]:
+# --- Build Graph --- #
+def build_rewoo_graph(base_llm: BaseLanguageModel, mcp_client: MultiServerMCPClient) -> Tuple[StateGraph, Dict[str, Any]]: # Changed first arg name
     """Builds the LangGraph StateGraph for the ReWOO agent."""
     logger.info("Building ReWOO agent graph...")
+
+    # --- Get Tools (Full List) --- #
+    logger.info("Fetching ALL tools from MCP client...")
+    all_tools: List[BaseTool] = mcp_client.get_tools()
+    
+    # -----> LOGGING: Initial tool names from client <-----
+    initial_tool_names = [t.name for t in all_tools] if all_tools else []
+    logger.info(f"INITIAL tool names received from MCP client: {initial_tool_names}")
+    # ---------------------------------------------------
+    
+    simplified_tools_str = "No tools available."
+    full_schema_tools_str = "No tools available." # For grammar generation if needed
+    if not all_tools:
+        logger.warning("No tools discovered via MCP client.")
+    else:
+        simplified_tools_str = format_tool_descriptions_simplified(all_tools)
+        # Generate full schema descriptions needed for GBNF generation
+        full_schema_tools_str = format_tool_descriptions_with_schema(all_tools)
+    # --- End Tool Fetching & Formatting --- #
+    
+    # --- Prepare Planner-Specific LLM (REMOVED GBNF) --- #
+    planner_llm = base_llm # Planner now always uses the base LLM without grammar
+    logger.info("GBNF is disabled. Planner will use the base LLM instance directly.")
+    # --- End Planner LLM Prep --- #
+
     workflow = StateGraph(ReWOOState)
 
-    # Add nodes using the imported functions
-    # The llm and mcp_client need to be passed to the nodes that require them.
-    # We can use functools.partial or pass them via config["configurable"]
+    # --- Prepare Base Config --- #
+    base_graph_config = {
+        "configurable": {
+            "llm": base_llm,
+            "planner_llm": planner_llm, # Now same as base_llm
+            "tools": all_tools,
+            "tool_names": [t.name for t in all_tools],
+            # Pass SIMPLIFIED descriptions for the filter node
+            "simplified_tool_descriptions": simplified_tools_str,
+            # Pass FULL schema descriptions for potential use in other nodes if needed
+            "full_schema_tool_descriptions": full_schema_tools_str
+        }
+    }
+    logger.debug(f"Base graph config created. Available tools: {[t.name for t in base_graph_config['configurable']['tools']]}")
 
-    # Pass LLM to planner and final_answer nodes
-    # Pass MCP client to tool_executor node
-    # Pass tool descriptions string via config["configurable"] to planner
-    workflow.add_node("planner", planning_node) # LLM passed via config
+    # Add nodes (Parser node needs config now for LLM call)
+    workflow.add_node("tool_filter", partial(tool_filter_node, node_config=base_graph_config))
+    workflow.add_node("planner", partial(planning_node, node_config=base_graph_config))
+    workflow.add_node("plan_parser", partial(plan_parser_node, node_config=base_graph_config)) # Pass config to parser
+    workflow.add_node("plan_validator", partial(plan_validator_node, node_config=base_graph_config)) # Pass config to validator
     workflow.add_node("tool_selector", tool_selection_node)
     workflow.add_node("tool_input_preparer", tool_input_preparation_node)
-    # Pass config to tool_executor, not mcp_client directly
-    workflow.add_node("tool_executor", tool_execution_node)
+    workflow.add_node("tool_executor", partial(tool_execution_node, node_config=base_graph_config))
     workflow.add_node("evidence_processor", evidence_processor_node)
-    workflow.add_node("generate_final_answer", partial(final_answer_node, llm=llm))
+    workflow.add_node("generate_final_answer", partial(final_answer_node, node_config=base_graph_config))
 
     # Define edges
-    workflow.add_edge(START, "planner")
+    workflow.add_edge(START, "tool_filter") # Start with filtering
+    workflow.add_edge("tool_filter", "planner") # Filter output goes to planner
+    workflow.add_edge("planner", "plan_parser") # Planner output goes to the parser (which might call LLM)
+    workflow.add_edge("plan_parser", "plan_validator") # Parser (potentially corrected) output goes to validator
 
-    # Use the single conditional edge function `should_continue`
+    # Conditional edges from Plan Validator
     workflow.add_conditional_edges(
-        "planner",
-        should_continue,
-        # Provide mapping from the hints returned by `should_continue` to actual node names
+        "plan_validator",
+        should_continue, # Re-use the same routing logic based on next_node hint
         {
-            "tool_selector": "tool_selector",
-            "generate_final_answer": "generate_final_answer",
-            END: END
-            # Add other potential routes from planner if needed
+            "planner": "planner", # If validation fails and retry needed
+            "tool_selector": "tool_selector", # If validation succeeds and plan has tools
+            "generate_final_answer": "generate_final_answer", # If validation succeeds and plan has no tools
+            END: END # If validation fails and max retries reached or critical error
         }
     )
+
+    # Conditional edges from Tool Selector
     workflow.add_conditional_edges(
         "tool_selector",
         should_continue,
         {
-            "tool_input_preparer": "tool_input_preparer",
-            "generate_final_answer": "generate_final_answer",
-            "tool_selector": "tool_selector", # Loop for thought-only steps
+            "tool_input_preparer": "tool_input_preparer", # If tool selected
+            "generate_final_answer": "generate_final_answer", # If no more steps/tools
+            "tool_selector": "tool_selector", # Should not happen if logic is correct, but acts as fallback
             END: END
         }
     )
+
+    # Conditional edges from Tool Input Preparer
     workflow.add_conditional_edges(
         "tool_input_preparer",
         should_continue,
         {
-            "tool_executor": "tool_executor",
-            END: END
+            "tool_executor": "tool_executor", # If input prep succeeds
+            "planner": "planner", # If input prep fails (e.g., missing evidence), retry planning
+            END: END # If critical error during input prep
         }
     )
-    workflow.add_conditional_edges(
-        "tool_executor",
-        should_continue,
-        {
-            "evidence_processor": "evidence_processor",
-            END: END
-            # Add retry logic routing here if needed
-        }
-    )
+
+    workflow.add_edge("tool_executor", "evidence_processor")
+
+    # Conditional edges from Evidence Processor
     workflow.add_conditional_edges(
         "evidence_processor",
         should_continue,
         {
-            "tool_selector": "tool_selector", # Loop back to select next tool
-            "generate_final_answer": "generate_final_answer", # Should not happen here ideally
-            END: END
+            "tool_selector": "tool_selector", # Loop back to select next tool/step
+            "generate_final_answer": "generate_final_answer", # If all steps done
+            END: END # If error during evidence processing
         }
     )
 
+    # Final Answer node leads to END
     workflow.add_edge("generate_final_answer", END)
 
     # Compile the graph
-    logger.info("Compiling the graph...")
-    app = workflow.compile()
-    logger.info("Graph compiled successfully.")
-    # Return the compiled app and the entry point node name (usually START)
-    entry_point_node = START # Or the first node if different
-    return app, entry_point_node
+    graph = workflow.compile()
+    logger.info("ReWOO agent graph built and compiled successfully (GBNF Disabled).")
 
-# Example usage (for testing individual components if needed)
-# async def run_test():
-#     # Setup mock LLM, MCP client, initial state etc.
-#     # ...
-#     app, entry_node = await build_rewoo_graph(mock_llm, mock_mcp_client)
-#     # Invoke the graph
-#     # ...
-
-# if __name__ == "__main__":
-#     asyncio.run(run_test()) 
+    return graph, base_graph_config
