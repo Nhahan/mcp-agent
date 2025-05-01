@@ -66,17 +66,19 @@ Available Tools:
 {tool_descriptions} # <-- Use the tool names EXACTLY as provided in this list.
 
 **CRITICAL INSTRUCTIONS for Revising:**
-1.  **Analyze Error & Query:** Understand the `Validation Errors` and the `Original Query`.
-2.  **Address Errors:**
-    *   **Invalid Tool:** RE-CHECK `Available Tools`, find the tool whose description **BEST MATCHES** the objective of the failed `plan` step, and use its **EXACT** correct name **as listed**. If none exists, `tool_call: null`.
-    *   **Invalid Arguments Format:** If the error indicates `arguments` was not a mapping (dictionary), **FIX the YAML structure** so `arguments:` is followed by **correctly indented key-value pairs**. Do NOT output `arguments` as a single string containing JSON.
-    *   **Mismatched/Missing Arguments:** **CONSULT the `Arguments Schema` for the specific tool in `Available Tools`**. Determine the correct information needed based on the `plan` step objective and the tool `description`. Provide this information using **ONLY the argument names defined in the schema** within the `arguments` YAML mapping. Get values from the `Original Query` or previous evidence (`#E...`) if applicable. Fix the keys/values in the mapping.
-    *   **Insufficient Content:** If the error indicates content was missing or just placeholders, AND the user query required specific content creation, **RE-GENERATE the FULL and DETAILED content** as the value for the appropriate argument in the `arguments` YAML mapping for the relevant tool.
-    *   **Logical Error:** Correct the plan logic/tool choices.
+1.  **Analyze Error & Query:** Understand the `Validation Errors` (structured below) and the `Original Query`.
+2.  **Address Errors:** Based on the specific `Error Type` and `Details` provided in `Validation Errors`:
+    *   **YAML Parsing Error:** Fix the YAML syntax (indentation, colons, quotes, list format) at the specified `Location`.
+    *   **Invalid Tool Error:** The `Tool Name` used in the plan step was not found in `Available Tools`. RE-CHECK `Available Tools`, find the tool whose description **BEST MATCHES** the objective of the failed `plan` step, and use its **EXACT** correct name **as listed**. If no suitable tool exists, set `tool_call: null` for that step.
+    *   **Invalid Arguments Format Error:** The `arguments` field was not a valid YAML mapping (dictionary). **FIX the YAML structure** so `arguments:` is followed by **correctly indented key-value pairs**. Do NOT output `arguments` as a single string containing JSON.
+    *   **Argument Validation Error (Schema Mismatch):** An argument provided for the `Tool Name` does not match its `Arguments Schema` (e.g., missing required argument, wrong type, unknown argument name). **CONSULT the `Arguments Schema` for the specific tool in `Available Tools`**. Determine the correct information needed based on the `plan` step objective and the tool `description`. Provide this information using **ONLY the argument names defined in the schema** within the `arguments` YAML mapping. Get values from the `Original Query` or previous evidence (`#E...`) if applicable. Fix the keys/values in the mapping.
+    *   **Insufficient Content Error:** The content generated for an argument was missing or just placeholders, but the user query required specific content creation. **RE-GENERATE the FULL and DETAILED content** as the value for the appropriate argument in the `arguments` YAML mapping for the relevant tool.
+    *   **Tool Execution Error:** The specified `Tool Name` failed during execution with the given `Error Message`. Re-evaluate the `plan` step, the chosen tool, and its `arguments`. Consider if a different tool or different arguments are needed.
+    *   **Logical Error:** Correct the plan logic, sequence of steps, or tool choices based on the `Error Message`.
     *   The YAML example below shows the **STRUCTURE**. **YOU MUST USE ACTUAL TOOL NAMES AND ARGUMENTS FROM THE SCHEMA.** **DO NOT include any comments (starting with #) inside the YAML output.**
 3.  **Distinguish Action Types:** Re-evaluate if steps need `tool_call: null` or a tool.
 4.  **Reflect Query Details:** Ensure query specifics map to the **CORRECT arguments identified from the tool's `Arguments Schema`** within the YAML mapping.
-5.  **Maintain Structure:** Follow YAML formatting rules.
+5.  **Maintain Structure:** Follow YAML formatting rules strictly.
 6.  **YAML Format:** Respond ONLY with the revised YAML plan. **NO COMMENTS (#) WITHIN THE YAML BLOCK.**
 
 Original Query: {query}
@@ -84,8 +86,26 @@ Original Query: {query}
 Previous Plan Attempt (YAML):
 {previous_plan}
 
-Validation Errors (from parsing or execution):
+Validation Errors (Structured):
+```yaml
+# Example Structure - Actual errors will vary
+- error_type: "Argument Validation Error"
+  details:
+    step_index: 1 # Index of the step in the previous plan (0-based)
+    tool_name: "knowledge/lookup"
+    message: "Missing required argument: 'entity'"
+- error_type: "YAML Parsing Error"
+  details:
+    location: "line 5, column 10"
+    message: "Invalid indentation"
+- error_type: "Tool Execution Error"
+  details:
+    step_index: 0
+    tool_name: "search/web_search"
+    message: "API connection failed"
+# Actual errors provided below:
 {validation_errors}
+```
 
 Example Output Format (Illustrative Structure ONLY - Use REAL tools/args based on `Available Tools` schema. **NO COMMENTS INSIDE**):
 ```yaml
