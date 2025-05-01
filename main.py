@@ -5,19 +5,11 @@ import json
 from pathlib import Path
 from typing import Dict, Any
 from langchain_core.globals import set_llm_cache
-from langgraph.graph import END
 import argparse
 
 from core.llm_loader import load_llm
 from agent.graph import build_rewoo_graph
 from langchain_mcp_adapters.client import MultiServerMCPClient
-
-# Try to import pygraphviz for visualization, but don't fail if it's not installed
-try:
-    # This import is only needed for visualization
-    import pygraphviz
-except ImportError:
-    pygraphviz = None # Set to None if not found
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(name)s:%(funcName)s] - %(message)s')
@@ -83,49 +75,41 @@ async def main(visualize: bool = False):
         mcp_servers_config_dict = {}
 
     try:
-        # Pass the dictionary directly to the client
         logger.info(f"Initializing MultiServerMCPClient with server configs: {mcp_servers_config_dict}")
         # Use async with for automatic resource management (including process termination)
         async with MultiServerMCPClient(mcp_servers_config_dict) as mcp_client:
-            available_tools_raw = mcp_client.get_tools() # This should return List[BaseTool]
-            # Log the names of discovered tools
+            available_tools_raw = mcp_client.get_tools()
             tool_names = [tool.name for tool in available_tools_raw]
             logger.info(f"MCP Client initialized. Discovered tools: {tool_names}")
 
             # 3. Build the agent graph/executor using the initialized tools
             try:
                 logger.info("Building agent graph...")
-                # build_rewoo_graph now returns (compiled_app, base_graph_config)
                 compiled_app, base_graph_config = build_rewoo_graph(llm, mcp_client)
-                logger.info(f"Agent graph built successfully.") # Removed entry node log
-
-                # --- Visualization Logic ---
-                if visualize:
-                    if pygraphviz is None:
-                        logger.error("Cannot visualize graph: 'pygraphviz' library is not installed.")
-                        logger.error("Please install it (e.g., 'pip install pygraphviz' or 'poetry add pygraphviz')")
-                        logger.error("Note: 'pygraphviz' may require the system library 'graphviz' to be installed first (e.g., 'brew install graphviz' on macOS).")
-                    else:
-                        try:
-                            logger.info("Generating graph visualization...")
-                            # Define the output path
-                            output_path = Path("graph_visualization.png")
-                            # Use the compiled app to get the graph and draw it
-                            compiled_app.get_graph().draw_mermaid_png(output_file_path=str(output_path))
-                            logger.info(f"Graph visualization saved to {output_path.resolve()}")
-                        except Exception as e:
-                            logger.error(f"Failed to generate graph visualization: {e}", exc_info=True)
-                    # Exit after visualization if needed, or let it continue
-                    logger.info("Visualization attempted. Exiting as requested by --visualize flag.")
-                    return # Exit after visualization
-                # --- End Visualization Logic ---
 
             except Exception as e:
                 logger.error(f"Failed to build agent graph: {e}", exc_info=True)
                 return # Exit if graph building fails
 
             # 4. Start interaction loop or process a single query
-            query = "How do I bake a chocolate milk with strawberry cake? Write a detailed recipe on '/Users/sunningkim/Developer' folder in markdown format as 'recipe.md'. And Please check the file is created successfully. Then read the file content to me."
+            query = """Generate a highly detailed and technically accurate recipe for a **'Strawberry Swirl Chocolate Milk Cake'**, aiming for the quality expected from an expert baker, according to the following stringent requirements:
+
+**Content Requirements:**
+* The recipe must describe a moist chocolate cake batter explicitly using **chocolate milk** as a primary liquid ingredient (instead of regular milk). Ensure this ingredient is clearly listed and used in the instructions.
+* It must detail the preparation of a **sweetened fresh strawberry puree** and the technique for **swirling** it into the batter before baking to create a visible marbled effect.
+* It is crucial that the instructions for the **cake batter** and the **strawberry puree swirl** are presented in two **completely separate sections**, each under its own specific H2 heading ('## Cake Instructions' and '## Puree Instructions') and containing its own numbered steps.
+* All measurements must be provided in **US customary units** (cups, tsp, tbsp, °F).
+* The recipe must conclude with a **'Notes'** section containing at least two **highly specific and practical** baking tips directly relevant to potential challenges or enhancements for this particular 'Strawberry Swirl Chocolate Milk Cake' (e.g., ensuring swirl visibility is maintained during baking, how the properties of chocolate milk might affect the batter, tips for achieving maximum moistness).
+
+**Formatting Requirements:**
+* Pay close attention to the following Markdown formatting rules, ensuring the output strictly adheres to them for the document intended for `/Users/sunningkim/Developer/recipe.md`.
+* The main title must be a level 1 heading (`#`).
+* Section headings ('Ingredients', 'Cake Instructions', 'Puree Instructions', 'Notes') must be level 2 headings (`##`).
+* The list of ingredients must use bullet points (`-`). Within each bullet point, the primary ingredient name *must* be formatted in **bold** text, followed by a colon, and then the quantity (Example: `- **All-purpose flour**: 2 cups`). Ensure this format is followed exactly for all ingredients.
+* All procedural steps within the 'Cake Instructions' and 'Puree Instructions' sections must be presented as numbered lists (`1.`).
+
+**Final Action Sequence:**
+After generating the content that meticulously follows all content and formatting requirements, hypothetically write this precise Markdown content to the file path `/Users/sunningkim/Developer/recipe.md`, confirm successful creation, and then read the exactly formatted Markdown content back to me."""
 
             logger.info(f"Starting agent execution with query: '{query}'")
             try:
