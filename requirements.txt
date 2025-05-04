@@ -3,6 +3,9 @@ langchain-core
 langchain
 langgraph
 langchain-community
+langchain-openai
+langchain-google-genai
+langchain-anthropic
 
 # MCP Integration
 langchain-mcp-adapters
@@ -22,4 +25,11 @@ mypy
 pytest
 
 # Data validation and parsing
-pydantic 
+pydantic
+
+# Additional libraries
+httpx
+openai
+pygraphviz
+fastapi
+uvicorn[standard] # Includes standard dependencies like websockets and http-tools 
