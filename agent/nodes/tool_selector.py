@@ -72,8 +72,7 @@ async def tool_selection_node(state: ReWOOState) -> Dict[str, Any]:
         "evidence_var": evidence_var # Pass the variable name for evidence storage
     }
     return {
-        "tool_name": tool_name, # Still useful for routing/logging maybe?
         "current_tool_call": current_tool_call_info,
         "workflow_status": "routing_complete",
         "next_node": "tool_input_preparer"
-    } 
+    }
