@@ -33,17 +33,17 @@ DEFAULT_N_CTX = 8192
 DEFAULT_N_GPU_LAYERS = -1
 DEFAULT_N_BATCH = 512
 
+# Default parameters for API models (and LlamaCpp where applicable)
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_TOKENS = 8192 # Increased default for API models
 DEFAULT_TOP_P = 0.95
-# DEFAULT_TOP_K is often not supported by OpenAI/OpenRouter compatible APIs
-# DEFAULT_TOP_K = 40
+# DEFAULT_TOP_K = 40 # Removed as often not supported
 DEFAULT_VERBOSE = False # LlamaCpp specific, keep default False
 
-# Default Model Names
-DEFAULT_GEMINI_MODEL = "gemini-2.0-flash-lite"
-DEFAULT_CLAUDE_MODEL = "claude-3-5-sonnet-20240620"
-DEFAULT_OPEN_ROUTER_MODEL = "qwen/qwen3-32b:free"
+# Default model names are removed as MODEL_NAME is now mandatory for APIs
+# DEFAULT_GEMINI_MODEL = "gemini-1.5-pro-latest"
+# DEFAULT_CLAUDE_MODEL = "claude-3-5-sonnet-20240620"
+# DEFAULT_OPEN_ROUTER_MODEL = "qwen/qwen3-14b:free"
 
 # --- LLM Singleton Loader --- #
 llm_instance = None
@@ -61,37 +61,38 @@ def load_llm():
     anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
     open_router_api_key = os.getenv("OPEN_ROUTER_API_KEY")
 
-    # --- Prioritize Environment Variable for Provider/Model --- #
+    # --- Get Provider Hint and MODEL_NAME --- #
     llm_provider = os.getenv("LLM_PROVIDER", "").lower()
-    model_name = os.getenv("MODEL_NAME")
+    # MODEL_NAME is now the ONLY source for the model ID for API providers
+    env_model_name = os.getenv("MODEL_NAME")
 
     # --- Determine which LLM to load based on keys and explicit provider setting --- #
 
-    # 1. OpenRouter Check (Explicit Hint OR Only OpenRouter Key Set)
+    # 1. OpenRouter Check (Requires Key AND MODEL_NAME)
+    # Use if explicit provider hint OR only OR key is set
     if open_router_api_key and (
         llm_provider == 'openrouter'
-        or (model_name and model_name.startswith("openrouter/"))
-        or not (google_api_key or anthropic_api_key) # Implicit: Use if only OpenRouter key exists
+        or not (google_api_key or anthropic_api_key) # Implicit selection if only OR key exists
     ):
+        if not env_model_name:
+             error_msg = "OPEN_ROUTER_API_KEY is set, but MODEL_NAME environment variable is missing. Cannot load OpenRouter LLM without a specified model name."
+             logger.error(error_msg)
+             raise ValueError(error_msg)
         if ChatOpenAI is None:
-            error_msg = "OPEN_ROUTER_API_KEY is set, but langchain-openai is not installed. Please install it (`pip install langchain-openai`)."
+            error_msg = "OPEN_ROUTER_API_KEY is set, but langchain-openai is not installed..." # Truncated for brevity
             logger.error(error_msg)
             raise ImportError(error_msg)
 
-        # Determine model name: Use explicit MODEL_NAME if it starts with openrouter/, else default
-        open_router_model = model_name if (model_name and model_name.startswith("openrouter/")) else DEFAULT_OPEN_ROUTER_MODEL
-        # Log if implicit selection is happening
-        if not (llm_provider == 'openrouter' or (model_name and model_name.startswith("openrouter/"))):
-            logger.info(f"Only OPEN_ROUTER_API_KEY found. Implicitly selecting OpenRouter.")
-        logger.info(f"Using OpenRouter model: {open_router_model}")
+        if not (llm_provider == 'openrouter'):
+             logger.info(f"Only OPEN_ROUTER_API_KEY found. Implicitly selecting OpenRouter.")
+        logger.info(f"Using OpenRouter model from MODEL_NAME: {env_model_name}")
 
         try:
             model_kwargs = {
                 "top_p": float(os.getenv("TOP_P", DEFAULT_TOP_P))
             }
-            
             llm_instance = ChatOpenAI(
-                model=open_router_model,
+                model=env_model_name, # Directly use MODEL_NAME
                 openai_api_key=open_router_api_key,
                 openai_api_base="https://openrouter.ai/api/v1",
                 temperature=float(os.getenv("TEMPERATURE", DEFAULT_TEMPERATURE)),
@@ -104,26 +105,29 @@ def load_llm():
             logger.error(f"Failed to load OpenRouter model: {e}", exc_info=True)
             raise
 
-    # 2. Gemini Check (Explicit Hint OR Only Google Key Set)
+    # 2. Gemini Check (Requires Key AND MODEL_NAME)
+    # Use if explicit provider hint OR only Google key is set
     elif google_api_key and (llm_provider == 'google' or not (anthropic_api_key or open_router_api_key)):
+        if not env_model_name:
+             error_msg = "GOOGLE_API_KEY is set, but MODEL_NAME environment variable is missing. Cannot load Gemini LLM without a specified model name."
+             logger.error(error_msg)
+             raise ValueError(error_msg)
         if ChatGoogleGenerativeAI is None:
-            error_msg = "GOOGLE_API_KEY is set, but langchain-google-genai is not installed. Please install it."
+            error_msg = "GOOGLE_API_KEY is set, but langchain-google-genai is not installed..." # Truncated
             logger.error(error_msg)
             raise ImportError(error_msg)
 
-        gemini_model_name = model_name if model_name else DEFAULT_GEMINI_MODEL
         if not (llm_provider == 'google'):
             logger.info(f"Only GOOGLE_API_KEY found. Implicitly selecting Google Gemini.")
-        logger.info(f"Using Gemini model: {gemini_model_name}")
+        logger.info(f"Using Gemini model from MODEL_NAME: {env_model_name}")
         try:
-            # Keep top_k for Gemini as it supports it
             llm_instance = ChatGoogleGenerativeAI(
-                model=gemini_model_name,
+                model=env_model_name, # Directly use MODEL_NAME
                 google_api_key=google_api_key,
                 temperature=float(os.getenv("TEMPERATURE", DEFAULT_TEMPERATURE)),
                 max_output_tokens=int(os.getenv("MAX_TOKENS", DEFAULT_MAX_TOKENS)),
                 top_p=float(os.getenv("TOP_P", DEFAULT_TOP_P)),
-                top_k=int(os.getenv("TOP_K", 40)) # Pass default TOP_K if env var not set
+                top_k=int(os.getenv("TOP_K", 40)) # Keep TOP_K for Gemini
             )
             logger.info("Google Gemini model loaded successfully.")
             return llm_instance
@@ -131,26 +135,29 @@ def load_llm():
             logger.error(f"Failed to load Google Gemini model: {e}", exc_info=True)
             raise
 
-    # 3. Claude Check (Explicit Hint OR Only Anthropic Key Set)
+    # 3. Claude Check (Requires Key AND MODEL_NAME)
+    # Use if explicit provider hint OR only Anthropic key is set
     elif anthropic_api_key and (llm_provider == 'anthropic' or not (google_api_key or open_router_api_key)):
+        if not env_model_name:
+             error_msg = "ANTHROPIC_API_KEY is set, but MODEL_NAME environment variable is missing. Cannot load Claude LLM without a specified model name."
+             logger.error(error_msg)
+             raise ValueError(error_msg)
         if ChatAnthropic is None:
-            error_msg = "ANTHROPIC_API_KEY is set, but langchain-anthropic is not installed. Please install it."
+            error_msg = "ANTHROPIC_API_KEY is set, but langchain-anthropic is not installed..." # Truncated
             logger.error(error_msg)
             raise ImportError(error_msg)
 
-        claude_model_name = model_name if model_name else DEFAULT_CLAUDE_MODEL
         if not (llm_provider == 'anthropic'):
             logger.info(f"Only ANTHROPIC_API_KEY found. Implicitly selecting Anthropic Claude.")
-        logger.info(f"Using Claude model: {claude_model_name}")
+        logger.info(f"Using Claude model from MODEL_NAME: {env_model_name}")
         try:
-            # Keep top_k for Claude as it supports it
             llm_instance = ChatAnthropic(
-                model=claude_model_name,
+                model=env_model_name, # Directly use MODEL_NAME
                 anthropic_api_key=anthropic_api_key,
                 temperature=float(os.getenv("TEMPERATURE", DEFAULT_TEMPERATURE)),
                 max_tokens=int(os.getenv("MAX_TOKENS", DEFAULT_MAX_TOKENS)),
                 top_p=float(os.getenv("TOP_P", DEFAULT_TOP_P)),
-                top_k=int(os.getenv("TOP_K", 40)) # Pass default TOP_K if env var not set
+                top_k=int(os.getenv("TOP_K", 40)) # Keep TOP_K for Claude
             )
             logger.info("Anthropic Claude model loaded successfully.")
             return llm_instance
@@ -158,12 +165,13 @@ def load_llm():
             logger.error(f"Failed to load Anthropic Claude model: {e}", exc_info=True)
             raise
 
-    # 4. LlamaCpp Check (Explicit Hint OR No API Keys Set)
+    # 4. LlamaCpp Check (Requires MODEL_PATH)
+    # Use if explicit provider hint OR no API keys set
     elif llm_provider == 'local' or not (google_api_key or anthropic_api_key or open_router_api_key):
         logger.info("No API keys specified or 'local' provider requested. Attempting to load local LlamaCpp model...")
         model_path_str = os.getenv("MODEL_PATH")
         if not model_path_str:
-            error_msg = "LLM_PROVIDER is 'local' or no API keys provided, but MODEL_PATH environment variable is not set. Cannot load LLM."
+            error_msg = "LLM_PROVIDER is 'local' or no API keys provided, but MODEL_PATH environment variable is not set. Cannot load local LLM."
             logger.error(error_msg)
             raise ValueError(error_msg)
 
@@ -175,7 +183,6 @@ def load_llm():
 
         logger.info(f"Loading local LlamaCpp model: {model_path}")
         try:
-            # Keep top_k for LlamaCpp as it supports it
             llm_instance = LlamaCpp(
                 model_path=str(model_path),
                 n_ctx=int(os.getenv("N_CTX", DEFAULT_N_CTX)),
@@ -184,7 +191,7 @@ def load_llm():
                 temperature=float(os.getenv("TEMPERATURE", DEFAULT_TEMPERATURE)),
                 max_tokens=int(os.getenv("MAX_TOKENS", DEFAULT_MAX_TOKENS)),
                 top_p=float(os.getenv("TOP_P", DEFAULT_TOP_P)),
-                top_k=int(os.getenv("TOP_K", 40)), # Pass default TOP_K if env var not set
+                top_k=int(os.getenv("TOP_K", 40)), # Keep TOP_K for LlamaCpp
                 verbose=os.getenv("VERBOSE", str(DEFAULT_VERBOSE)).lower() == 'true',
             )
             logger.info("LlamaCpp base instance ready.")
@@ -193,13 +200,17 @@ def load_llm():
             logger.error(f"Failed to load the LlamaCpp LLM: {e}", exc_info=True)
             raise
 
-    # 5. Error: Ambiguous Configuration (Multiple Keys Set without Explicit Hint)
+    # 5. Error: Ambiguous or Incomplete Configuration
     else:
-         error_msg = "Could not determine which LLM to load. Multiple API keys (GOOGLE_API_KEY, ANTHROPIC_API_KEY, OPEN_ROUTER_API_KEY) may be set without an explicit provider selection via LLM_PROVIDER or a specific MODEL_NAME format."
+         # This case now primarily catches situations where multiple API keys are set
+         # without an explicit LLM_PROVIDER hint, OR if an API key is set but MODEL_NAME is missing.
+         error_msg = "Could not determine which LLM to load. Check API keys (GOOGLE_API_KEY, ANTHROPIC_API_KEY, OPEN_ROUTER_API_KEY) and ensure only one provider is implicitly or explicitly selected. If using an API provider, ensure MODEL_NAME environment variable is also set."
          logger.error(error_msg)
          if google_api_key: logger.error(" - GOOGLE_API_KEY is set.")
          if anthropic_api_key: logger.error(" - ANTHROPIC_API_KEY is set.")
          if open_router_api_key: logger.error(" - OPEN_ROUTER_API_KEY is set.")
+         if not env_model_name and (google_api_key or anthropic_api_key or open_router_api_key):
+             logger.error(" - MODEL_NAME is MISSING but an API key is set.")
          raise ValueError(error_msg)
 
 # --- Cleanup Function (Optional) --- #
