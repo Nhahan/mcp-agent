@@ -1,11 +1,19 @@
-from langchain_community.cache import InMemoryCache
 import asyncio
 import logging
 import json
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 from langchain_core.globals import set_llm_cache
+from langchain_community.cache import InMemoryCache
+import uuid # For generating unique conversation IDs
 import argparse
+
+# --- FastAPI Imports ---
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+import uvicorn
+# --- End FastAPI Imports ---
 
 from core.llm_loader import load_llm
 from agent.graph import build_rewoo_graph
@@ -54,127 +62,244 @@ def load_mcp_servers_from_config(config_path: Path = Path("mcp.json")) -> Dict[s
         logger.error(f"Unexpected error loading MCP config {config_path}: {e}", exc_info=True)
         return {}
 
-async def main(visualize: bool = False):
-    logger.info("Starting ReWOO Agent...")
+# --- FastAPI App Setup ---
+app = FastAPI(
+    title="MCP Agent API",
+    description="API for interacting with the ReWOO LangGraph agent.",
+    version="0.1.0"
+)
 
-    # 1. Load LLM
+# --- Global Variables for Agent and Client (Load once) ---
+llm = None
+mcp_client = None
+compiled_agent_graph = None
+agent_config = None
+conversation_histories: Dict[str, List[Dict[str, Any]]] = {} # Store conversation history in memory
+
+# --- Pydantic Models ---
+class ChatRequest(BaseModel):
+    message: str
+    conversation_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    conversation_id: str
+    error: Optional[str] = None
+
+# --- API Endpoints ---
+@app.on_event("startup")
+async def startup_event():
+    """Load LLM, MCP Client, and build graph on startup."""
+    global llm, mcp_client, compiled_agent_graph, agent_config
+
+    logger.info("API Startup: Loading LLM...")
     try:
-        logger.info("Loading LLM...")
         llm = load_llm()
-        logger.info("LLM loaded successfully.")
+        logger.info("API Startup: LLM loaded successfully.")
     except Exception as e:
-        logger.error(f"Failed to load LLM: {e}", exc_info=True)
-        return
+        logger.error(f"API Startup Error: Failed to load LLM: {e}", exc_info=True)
+        raise RuntimeError("Failed to load LLM during startup.") from e
 
-    # 2. Initialize MCP Client using mcp.json
-    logger.info("Loading MCP server configurations from mcp.json...")
+    logger.info("API Startup: Loading MCP server configurations...")
     mcp_servers_config_dict = load_mcp_servers_from_config()
     if not mcp_servers_config_dict:
-        logger.warning("No enabled and valid MCP server configurations found in mcp.json. MCP Client will have no tools.")
-        # Assign an empty list if no config is found, so the client can still initialize
+        logger.warning("API Startup: No enabled MCP servers found. Client will have no tools.")
         mcp_servers_config_dict = {}
 
+    logger.info("API Startup: Initializing MultiServerMCPClient...")
     try:
-        logger.info(f"Initializing MultiServerMCPClient with server configs: {mcp_servers_config_dict}")
-        # Use async with for automatic resource management (including process termination)
-        async with MultiServerMCPClient(mcp_servers_config_dict) as mcp_client:
-            available_tools_raw = mcp_client.get_tools()
-            tool_names = [tool.name for tool in available_tools_raw]
-            logger.info(f"MCP Client initialized. Discovered tools: {tool_names}")
+        # Note: We manage the client lifecycle manually here instead of using 'async with'
+        # because it needs to persist across requests. We'll close it on shutdown.
+        mcp_client = MultiServerMCPClient(mcp_servers_config_dict)
+        await mcp_client.start_all_servers() # Start servers manually
+        available_tools_raw = mcp_client.get_tools()
+        tool_names = [tool.name for tool in available_tools_raw]
+        logger.info(f"API Startup: MCP Client initialized. Tools: {tool_names}")
+    except Exception as e:
+        logger.error(f"API Startup Error: Failed to initialize MCP Client: {e}", exc_info=True)
+        raise RuntimeError("Failed to initialize MCP Client during startup.") from e
 
-            # 3. Build the agent graph/executor using the initialized tools
-            try:
-                logger.info("Building agent graph...")
-                compiled_app, base_graph_config = build_rewoo_graph(llm, mcp_client)
+    logger.info("API Startup: Building agent graph...")
+    try:
+        compiled_agent_graph, base_graph_config = build_rewoo_graph(llm, mcp_client)
+        agent_config = {"configurable": base_graph_config} # Store the base config
+        logger.info(f"API Startup: Agent graph built. Config keys: {list(agent_config['configurable'].keys())}")
+    except Exception as e:
+        logger.error(f"API Startup Error: Failed to build agent graph: {e}", exc_info=True)
+        if mcp_client:
+            await mcp_client.shutdown() # Ensure client is shut down if graph fails
+        raise RuntimeError("Failed to build agent graph during startup.") from e
 
-            except Exception as e:
-                logger.error(f"Failed to build agent graph: {e}", exc_info=True)
-                return # Exit if graph building fails
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Shutdown MCP client gracefully."""
+    global mcp_client
+    logger.info("API Shutdown: Shutting down MCP Client...")
+    if mcp_client:
+        await mcp_client.shutdown()
+        logger.info("API Shutdown: MCP Client shutdown complete.")
 
-            # 4. Start interaction loop or process a single query
-            query = """Generate a highly detailed and technically accurate recipe for a **'Strawberry Swirl Chocolate Milk Cake'**, aiming for the quality expected from an expert baker, according to the following stringent requirements:
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """Endpoint to handle chat interactions with the agent."""
+    global compiled_agent_graph, agent_config, conversation_histories
 
-**Content Requirements:**
-* The recipe must describe a moist chocolate cake batter explicitly using **chocolate milk** as a primary liquid ingredient (instead of regular milk). Ensure this ingredient is clearly listed and used in the instructions.
-* It must detail the preparation of a **sweetened fresh strawberry puree** and the technique for **swirling** it into the batter before baking to create a visible marbled effect.
-* It is crucial that the instructions for the **cake batter** and the **strawberry puree swirl** are presented in two **completely separate sections**, each under its own specific H2 heading ('## Cake Instructions' and '## Puree Instructions') and containing its own numbered steps.
-* All measurements must be provided in **US customary units** (cups, tsp, tbsp, °F).
-* The recipe must conclude with a **'Notes'** section containing at least two **highly specific and practical** baking tips directly relevant to potential challenges or enhancements for this particular 'Strawberry Swirl Chocolate Milk Cake' (e.g., ensuring swirl visibility is maintained during baking, how the properties of chocolate milk might affect the batter, tips for achieving maximum moistness).
+    if not compiled_agent_graph or not agent_config:
+        raise HTTPException(status_code=503, detail="Agent is not ready. Please try again later.")
 
-**Formatting Requirements:**
-* Pay close attention to the following Markdown formatting rules, ensuring the output strictly adheres to them for the document intended for `/Users/sunningkim/Developer/recipe.md`.
-* The main title must be a level 1 heading (`#`).
-* Section headings ('Ingredients', 'Cake Instructions', 'Puree Instructions', 'Notes') must be level 2 headings (`##`).
-* The list of ingredients must use bullet points (`-`). Within each bullet point, the primary ingredient name *must* be formatted in **bold** text, followed by a colon, and then the quantity (Example: `- **All-purpose flour**: 2 cups`). Ensure this format is followed exactly for all ingredients.
-* All procedural steps within the 'Cake Instructions' and 'Puree Instructions' sections must be presented as numbered lists (`1.`).
+    conversation_id = request.conversation_id
+    user_message = request.message
 
-**Final Action Sequence:**
-After generating the content that meticulously follows all content and formatting requirements, hypothetically write this precise Markdown content to the file path `/Users/sunningkim/Developer/recipe.md`, confirm successful creation, and then read the exactly formatted Markdown content back to me."""
+    # Manage conversation history
+    if conversation_id and conversation_id in conversation_histories:
+        history = conversation_histories[conversation_id]
+        logger.info(f"Continuing conversation: {conversation_id}")
+    else:
+        conversation_id = str(uuid.uuid4())
+        history = []
+        conversation_histories[conversation_id] = history
+        logger.info(f"Starting new conversation: {conversation_id}")
 
-            logger.info(f"Starting agent execution with query: '{query}'")
-            try:
-                # Define the initial state according to ReWOOState TypedDict
-                initial_state = {
-                    "original_query": query,
-                    "plan": [], # Initialize as empty list instead of None
-                    "current_step_index": 0,
-                    "current_tool_call": None,
-                    "prepared_tool_input": None,
-                    "evidence": {}, # Initialize evidence as an empty dict
-                    "final_answer": None,
-                    "error_message": None,
-                    "max_retries": 2, # Default max retries
-                    "current_retry": 0,
-                    "workflow_status": None, # Initial status
-                    "next_node": None
-                }
-                logger.info(f"Initial state for agent: {initial_state}")
+    # Append user message to history (LangChain expects specific format, adjust if needed)
+    # Assuming ReWOOState uses a 'messages' list like [{role: 'user', content: '...'}, {role: 'assistant', content: '...'}]
+    # For ReWOO, we might just pass the latest query? Let's adapt the state based on ReWOOState.
+    # ReWOOState expects 'original_query'. We'll use the latest user message as the query.
+    # If we need multi-turn ReWOO, the state/prompts might need adjustment.
+    # For now, treat each call as a new ReWOO execution with the given message.
 
-                # Create the config dictionary required by the nodes
-                # The base_graph_config already contains llm, tools_str, tools, tool_names
-                config = {"configurable": base_graph_config}
-                # Log config keys only, excluding potentially large values like tools_str or tool objects
-                logger.info(f"Config for agent execution: Configurable keys = {list(config['configurable'].keys())}")
+    initial_state = {
+        "original_query": user_message,
+        "plan": [],
+        "current_step_index": 0,
+        "current_tool_call": None,
+        "prepared_tool_input": None,
+        "evidence": {},
+        "final_answer": None,
+        "error_message": None,
+        "max_retries": 2,
+        "current_retry": 0,
+        "workflow_status": None,
+        "next_node": None
+    }
+    logger.info(f"Executing agent for conversation {conversation_id} with query: '{user_message}'")
 
-                # Use the compiled_app object for streaming with the correct initial state and config
-                async for event in compiled_app.astream_events(
-                    initial_state,
-                    config=config,
-                    version="v1",
-                ):
-                    kind = event['event']
-                    if kind == "on_chat_model_stream":
-                        content = event["data"]["chunk"].content
-                        if content:
-                            pass # We are logging steps, not streaming output directly for now
-                    elif kind == "on_tool_start":
-                        tool_name = event['name']
-                        tool_input = event['data'].get('input')
-                        logger.info(f"\n\nStarting tool: {tool_name} with inputs: {tool_input}")
-                    elif kind == "on_tool_end":
-                        tool_name = event['name']
-                        tool_output = event['data'].get('output')
-                        logger.info(f"Tool {tool_name} finished.")
-                        logger.info(f"Tool output was: {tool_output}")
-                        logger.info("-" * 40)
-                logger.info("Agent execution stream finished.")
-            except Exception as e:
-                logger.error(f"Error during agent execution: {e}", exc_info=True)
+    final_state = None
+    error_message = None
+    try:
+        # Stream the results and collect the final state
+        async for event in compiled_agent_graph.astream_events(
+            initial_state,
+            config=agent_config,
+            version="v1",
+        ):
+            # You can add logic here to handle intermediate events if needed
+            # For example, logging tool calls, etc.
+             kind = event['event']
+             if kind == "on_chat_model_stream":
+                 content = event["data"]["chunk"].content
+                 # if content: print(content, end="|") # Optional: stream intermediate LLM tokens
+             elif kind == "on_tool_start":
+                 logger.debug(f"Tool Start: {event['name']} Input: {event['data'].get('input')}")
+             elif kind == "on_tool_end":
+                 logger.debug(f"Tool End: {event['name']} Output: {event['data'].get('output')}")
+
+            # The final state is typically available when the stream ends
+            # Check if the event contains the final state (might need specific handling based on LangGraph version/setup)
+            # A simple approach: Get the state from the last event or after the loop.
+            # For now, let's get the final output after the loop finishes.
+
+        # After the stream finishes, get the final state
+        final_state_result = await compiled_agent_graph.ainvoke(initial_state, config=agent_config)
+        final_answer = final_state_result.get("final_answer")
+        error_message = final_state_result.get("error_message")
+
+        if error_message:
+             logger.error(f"Agent execution failed for conversation {conversation_id}: {error_message}")
+             return ChatResponse(response="", conversation_id=conversation_id, error=f"Agent error: {error_message}")
+        elif final_answer:
+             logger.info(f"Agent execution successful for conversation {conversation_id}. Response generated.")
+             # Optional: Append assistant response to history if maintaining multi-turn state
+             # conversation_histories[conversation_id].append({"role": "assistant", "content": final_answer})
+             return ChatResponse(response=final_answer, conversation_id=conversation_id)
+        else:
+             logger.error(f"Agent execution finished for conversation {conversation_id} but no final answer was generated.")
+             return ChatResponse(response="", conversation_id=conversation_id, error="Agent finished without generating a final answer.")
 
     except Exception as e:
-        logger.error(f"Failed to initialize or use MultiServerMCPClient: {e}", exc_info=True)
-        return # Exit if client fails
+        logger.error(f"Error during agent execution for conversation {conversation_id}: {e}", exc_info=True)
+        # Return an HTTP exception or a JSON response with error
+        # raise HTTPException(status_code=500, detail=f"Agent execution failed: {e}")
+        return ChatResponse(response="", conversation_id=conversation_id, error=f"Internal server error: {e}")
 
-    logger.info("Agent main function finished.")
 
+# --- Visualization Logic (Moved outside main execution flow) ---
+async def generate_graph_visualization():
+    """Generates and saves the graph visualization."""
+    # Need LLM and MCP client temporarily just to build the graph structure
+    temp_llm = None
+    temp_mcp_client = None
+    try:
+        logger.info("Visualization: Loading LLM...")
+        temp_llm = load_llm()
+        logger.info("Visualization: LLM loaded.")
+
+        logger.info("Visualization: Loading MCP config...")
+        mcp_conf = load_mcp_servers_from_config()
+        logger.info("Visualization: Initializing temporary MCP Client...")
+        async with MultiServerMCPClient(mcp_conf) as temp_mcp_client:
+            logger.info("Visualization: Building graph structure...")
+            graph, _ = build_rewoo_graph(temp_llm, temp_mcp_client) # We only need the graph object
+
+            logger.info("Attempting to generate graph visualization...")
+            try:
+                # Check if pygraphviz is available and draw
+                from PIL import Image
+                import io
+                png_bytes = graph.get_graph().draw_png()
+                img = Image.open(io.BytesIO(png_bytes))
+                img.save("graph_visualization.png")
+                logger.info("Graph visualization saved as graph_visualization.png")
+            except ImportError:
+                logger.error("Failed to generate visualization: `pygraphviz` not installed. Please install it (`pip install pygraphviz`).")
+            except Exception as e:
+                 # Catching graphviz execution errors specifically if possible
+                if "failed to execute PosixPath" in str(e) or "Graphviz's executables not found" in str(e):
+                     logger.error("Failed to generate visualization: Graphviz executables not found. Make sure Graphviz is installed and in your system's PATH (e.g., `brew install graphviz` or `sudo apt-get install graphviz`).")
+                else:
+                     logger.error(f"An unexpected error occurred during graph visualization: {e}", exc_info=True)
+
+    except Exception as e:
+        logger.error(f"Failed during visualization setup: {e}", exc_info=True)
+    finally:
+        # No explicit cleanup needed for temp client due to 'async with'
+         logger.info("Visualization process finished.")
+
+
+# --- Main Execution ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the ReWOO Agent with optional graph visualization.")
+    parser = argparse.ArgumentParser(description="Run the ReWOO Agent API or generate graph visualization.")
     parser.add_argument(
         "--visualize",
         action="store_true",
         help="Generate a visualization of the LangGraph graph and save it as graph_visualization.png, then exit."
     )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="Host address to run the API server on."
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Port number to run the API server on."
+    )
     args = parser.parse_args()
 
-    # Pass the visualize flag to the main function
-    asyncio.run(main(visualize=args.visualize))
+    if args.visualize:
+        asyncio.run(generate_graph_visualization())
+    else:
+        # Run the FastAPI server
+        logger.info(f"Starting FastAPI server on {args.host}:{args.port}")
+        uvicorn.run(app, host=args.host, port=args.port)
