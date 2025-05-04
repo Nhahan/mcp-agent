@@ -92,7 +92,7 @@ async def main(visualize: bool = False):
                 return # Exit if graph building fails
 
             # 4. Start interaction loop or process a single query
-            query = """User Sequential Thinking mcp. Generate a highly detailed and technically accurate recipe for a **'Strawberry Swirl Chocolate Milk Cake'**, aiming for the quality expected from an expert baker, according to the following stringent requirements:
+            query = """Generate a highly detailed and technically accurate recipe for a **'Strawberry Swirl Chocolate Milk Cake'**, aiming for the quality expected from an expert baker, according to the following stringent requirements:
 
 **Content Requirements:**
 * The recipe must describe a moist chocolate cake batter explicitly using **chocolate milk** as a primary liquid ingredient (instead of regular milk). Ensure this ingredient is clearly listed and used in the instructions.
