@@ -8,23 +8,19 @@ from langchain_community.llms import LlamaCpp
 try:
     from langchain_google_genai import ChatGoogleGenerativeAI
 except ImportError:
-    ChatGoogleGenerativeAI = None # Handle optional import
+    ChatGoogleGenerativeAI = None
 try:
     from langchain_anthropic import ChatAnthropic
 except ImportError:
-    ChatAnthropic = None # Handle optional import
+    ChatAnthropic = None
 try:
-    # Use the community OpenAI integration which is more up-to-date
     from langchain_openai import ChatOpenAI
 except ImportError:
-    ChatOpenAI = None # Handle optional import for OpenRouter/OpenAI
+    ChatOpenAI = None
 
-# --- Logging Setup --- #
-logger = logging.getLogger(__name__) # Use __name__ for logger name
+logger = logging.getLogger(__name__)
 if not logger.handlers:
-    # Configure root logger if no handlers are attached to this specific logger yet
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - [%(name)s:%(lineno)d] - %(message)s')
-# --- End Logging Setup --- #
 
 load_dotenv()
 
@@ -33,17 +29,10 @@ DEFAULT_N_CTX = 8192
 DEFAULT_N_GPU_LAYERS = -1
 DEFAULT_N_BATCH = 512
 
-# Default parameters for API models (and LlamaCpp where applicable)
 DEFAULT_TEMPERATURE = 0.2
-DEFAULT_MAX_TOKENS = 8192 # Increased default for API models
+DEFAULT_MAX_TOKENS = 8192
 DEFAULT_TOP_P = 0.95
-# DEFAULT_TOP_K = 40 # Removed as often not supported
-DEFAULT_VERBOSE = False # LlamaCpp specific, keep default False
-
-# Default model names are removed as MODEL_NAME is now mandatory for APIs
-# DEFAULT_GEMINI_MODEL = "gemini-1.5-pro-latest"
-# DEFAULT_CLAUDE_MODEL = "claude-3-5-sonnet-20240620"
-# DEFAULT_OPEN_ROUTER_MODEL = "qwen/qwen3-14b:free"
+DEFAULT_VERBOSE = False
 
 # --- LLM Singleton Loader --- #
 llm_instance = None
