@@ -167,14 +167,25 @@ async def run_agent_query(request: Request, chat_request: ChatRequest):
         "workflow_status": None,
         "next_node": None
     }
-    config = {"configurable": base_graph_config}
+    # config = {"configurable": base_graph_config} # Original line
+
+    # Create the config dictionary for astream_events.
+    # recursion_limit should be a top-level key in the config dict passed to stream/invoke methods.
+    # base_graph_config (which holds "configurable") is for node-level configurations.
+    
+    # Start with a copy of base_graph_config if it might contain other top-level Pregel options
+    # For this specific case, we know base_graph_config is primarily for "configurable" node inputs.
+    config_for_stream = {
+        "recursion_limit": 30, # Increase limit
+        "configurable": base_graph_config.get("configurable", {}).copy() # Keep existing configurable items
+    }
     
     final_answer_collected = None
     full_event_log = []
 
     try:
-        logger.info(f"Invoking agent with query: '{query}'")
-        async for event in compiled_app.astream_events(initial_state, config=config, version="v1"):
+        logger.info(f"Invoking agent with query: '{query}' and effective recursion_limit: {config_for_stream.get('recursion_limit')}")
+        async for event in compiled_app.astream_events(initial_state, config=config_for_stream, version="v1"):
             full_event_log.append(event) # For debugging
             kind = event['event']
             name = event.get('name', '')
