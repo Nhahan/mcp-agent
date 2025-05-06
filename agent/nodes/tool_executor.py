@@ -113,11 +113,13 @@ async def tool_execution_node(state: ReWOOState, node_config: Dict[str, Any]) ->
             next_node = END # Halt on tool execution errors
             # Skip the successful execution logs below
         else:
-            # Store the raw result (likely string or dict) as evidence
-            logger.debug(f"(Step {step_number}) Raw tool result type: {type(tool_result)}, value: {tool_result}") # Log raw result before str()
-            output_evidence = str(tool_result) # Convert result to string for consistency
+            # --- REMOVE specific sequentialthinking handling ---
+            # Store the raw tool result object (could be dict, str, list, etc.)
+            logger.debug(f"(Step {step_number}) Raw tool result type: {type(tool_result)}, value: {str(tool_result)[:500]}...") # Log type and part of value
+            output_evidence = tool_result # Store the raw object, not str(tool_result)
+            # ---------------------------------------------------
+            
             logger.info(f"(Step {step_number}) Tool '{tool_name}' executed successfully.")
-            logger.debug(f"(Step {step_number}) Raw tool result as string: {output_evidence[:500]}...") # Log after str()
             # Keep success status and node
             next_status = "routing_complete"
             next_node = "evidence_processor"
@@ -130,7 +132,7 @@ async def tool_execution_node(state: ReWOOState, node_config: Dict[str, Any]) ->
         next_status = "failed"
         next_node = END # Halt on tool execution errors
 
-    # Store the evidence (output or error message string) in the dictionary
+    # Store the raw evidence object (or error message string) in the dictionary
     logger.debug(f"Before update - current_evidence_dict type: {type(current_evidence_dict)}, value: {current_evidence_dict}")
     logger.debug(f"Before update - evidence_var type: {type(evidence_var)}, value: {evidence_var}")
     logger.debug(f"Before update - output_evidence type: {type(output_evidence)}, value: {str(output_evidence)[:100]}...")
@@ -140,6 +142,7 @@ async def tool_execution_node(state: ReWOOState, node_config: Dict[str, Any]) ->
 
     next_step_index = current_step_index + 1
 
+    # Restore original return logic
     return {
         "evidence": current_evidence_dict,
         "workflow_status": next_status,
