@@ -1,19 +1,16 @@
+from langchain_community.cache import InMemoryCache
 import asyncio
 import logging
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, AsyncGenerator
 from langchain_core.globals import set_llm_cache
-from langchain_community.cache import InMemoryCache
-import uuid # For generating unique conversation IDs
 import argparse
+from contextlib import asynccontextmanager
 
-# --- FastAPI Imports ---
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uvicorn
-# --- End FastAPI Imports ---
 
 from core.llm_loader import load_llm
 from agent.graph import build_rewoo_graph
@@ -62,113 +59,102 @@ def load_mcp_servers_from_config(config_path: Path = Path("mcp.json")) -> Dict[s
         logger.error(f"Unexpected error loading MCP config {config_path}: {e}", exc_info=True)
         return {}
 
-# --- FastAPI App Setup ---
-app = FastAPI(
-    title="MCP Agent API",
-    description="API for interacting with the ReWOO LangGraph agent.",
-    version="0.1.0"
-)
-
-# --- Global Variables for Agent and Client (Load once) ---
-llm = None
-mcp_client = None
-compiled_agent_graph = None
-agent_config = None
-conversation_histories: Dict[str, List[Dict[str, Any]]] = {} # Store conversation history in memory
-
-# --- Pydantic Models ---
+# Pydantic model for chat requests
 class ChatRequest(BaseModel):
     message: str
-    conversation_id: Optional[str] = None
+    conversation_id: str | None = None # Placeholder for future stateful conversations
 
 class ChatResponse(BaseModel):
-    response: str
+    response: Any
     conversation_id: str
-    error: Optional[str] = None
 
-# --- API Endpoints ---
-@app.on_event("startup")
-async def startup_event():
-    """Load LLM, MCP Client, and build graph on startup."""
-    global llm, mcp_client, compiled_agent_graph, agent_config
+# Lifespan manager for FastAPI
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    logger.info("API Startup: Lifespan event triggered.")
 
-    logger.info("API Startup: Loading LLM...")
+    # 1. Load LLM
     try:
+        logger.info("API Startup: Loading LLM...")
         llm = load_llm()
+        app.state.llm = llm
         logger.info("API Startup: LLM loaded successfully.")
     except Exception as e:
         logger.error(f"API Startup Error: Failed to load LLM: {e}", exc_info=True)
         raise RuntimeError("Failed to load LLM during startup.") from e
 
+    # 2. Initialize MCP Client
     logger.info("API Startup: Loading MCP server configurations...")
     mcp_servers_config_dict = load_mcp_servers_from_config()
     if not mcp_servers_config_dict:
-        logger.warning("API Startup: No enabled MCP servers found. Client will have no tools.")
+        logger.warning("API Startup: No enabled and valid MCP server configurations found. MCP Client will have no tools.")
         mcp_servers_config_dict = {}
 
-    logger.info("API Startup: Initializing MultiServerMCPClient...")
+    # The MultiServerMCPClient will be initialized and its servers started
+    # when entering the 'async with' block.
     try:
-        # Note: We manage the client lifecycle manually here instead of using 'async with'
-        # because it needs to persist across requests. We'll close it on shutdown.
-        mcp_client = MultiServerMCPClient(mcp_servers_config_dict)
-        await mcp_client.start_all_servers() # Start servers manually
+        logger.info(f"API Startup: Initializing MultiServerMCPClient context...")
+        mcp_client_instance = MultiServerMCPClient(mcp_servers_config_dict)
+        app.state.mcp_client_manager = mcp_client_instance # Store the manager instance
+        
+        # Enter the context, which starts the servers
+        mcp_client = await app.state.mcp_client_manager.__aenter__()
+        app.state.mcp_client = mcp_client # Store the active client
+
         available_tools_raw = mcp_client.get_tools()
         tool_names = [tool.name for tool in available_tools_raw]
-        logger.info(f"API Startup: MCP Client initialized. Tools: {tool_names}")
+        logger.info(f"API Startup: MCP Client active. Discovered tools: {tool_names}")
     except Exception as e:
-        logger.error(f"API Startup Error: Failed to initialize MCP Client: {e}", exc_info=True)
-        raise RuntimeError("Failed to initialize MCP Client during startup.") from e
+        logger.error(f"API Startup Error: Failed to initialize or start MCP Client: {e}", exc_info=True)
+        # Ensure aexit is called if aenter succeeded partially or if an error occurs after aenter
+        if hasattr(app.state, 'mcp_client_manager') and app.state.mcp_client_manager:
+            try:
+                await app.state.mcp_client_manager.__aexit__(type(e), e, e.__traceback__)
+            except Exception as ae:
+                logger.error(f"API Startup Error: Error during MCP client manager cleanup: {ae}", exc_info=True)
+        raise RuntimeError("Failed to initialize or start MCP Client during startup.") from e
 
-    logger.info("API Startup: Building agent graph...")
+    # 3. Build the agent graph
     try:
-        compiled_agent_graph, base_graph_config = build_rewoo_graph(llm, mcp_client)
-        agent_config = {"configurable": base_graph_config} # Store the base config
-        logger.info(f"API Startup: Agent graph built. Config keys: {list(agent_config['configurable'].keys())}")
+        logger.info("API Startup: Building agent graph...")
+        compiled_app_graph, base_graph_config = build_rewoo_graph(app.state.llm, app.state.mcp_client)
+        app.state.compiled_app_graph = compiled_app_graph
+        app.state.base_graph_config = base_graph_config
+        logger.info("API Startup: Agent graph built successfully.")
     except Exception as e:
         logger.error(f"API Startup Error: Failed to build agent graph: {e}", exc_info=True)
-        if mcp_client:
-            await mcp_client.shutdown() # Ensure client is shut down if graph fails
+        if hasattr(app.state, 'mcp_client_manager') and app.state.mcp_client_manager:
+             await app.state.mcp_client_manager.__aexit__(type(e), e, e.__traceback__)
         raise RuntimeError("Failed to build agent graph during startup.") from e
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Shutdown MCP client gracefully."""
-    global mcp_client
-    logger.info("API Shutdown: Shutting down MCP Client...")
-    if mcp_client:
-        await mcp_client.shutdown()
-        logger.info("API Shutdown: MCP Client shutdown complete.")
+    logger.info("API Startup complete. Application is ready.")
+    yield  # Application is now running
+
+    # Shutdown phase
+    logger.info("API Shutdown: Lifespan event triggered for shutdown.")
+    if hasattr(app.state, 'mcp_client_manager') and app.state.mcp_client_manager:
+        try:
+            logger.info("API Shutdown: Closing MCP Client...")
+            # __aexit__ handles server shutdown
+            await app.state.mcp_client_manager.__aexit__(None, None, None)
+            logger.info("API Shutdown: MCP Client closed successfully.")
+        except Exception as e:
+            logger.error(f"API Shutdown Error: Error closing MCP Client: {e}", exc_info=True)
+    logger.info("API Shutdown complete.")
+
+
+app = FastAPI(lifespan=lifespan)
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat_endpoint(request: ChatRequest):
-    """Endpoint to handle chat interactions with the agent."""
-    global compiled_agent_graph, agent_config, conversation_histories
+async def run_agent_query(request: Request, chat_request: ChatRequest):
+    logger.info(f"Received chat request: {chat_request.message[:100]}...") # Log first 100 chars
+    
+    compiled_app = request.app.state.compiled_app_graph
+    base_graph_config = request.app.state.base_graph_config
 
-    if not compiled_agent_graph or not agent_config:
-        raise HTTPException(status_code=503, detail="Agent is not ready. Please try again later.")
-
-    conversation_id = request.conversation_id
-    user_message = request.message
-
-    # Manage conversation history
-    if conversation_id and conversation_id in conversation_histories:
-        history = conversation_histories[conversation_id]
-        logger.info(f"Continuing conversation: {conversation_id}")
-    else:
-        conversation_id = str(uuid.uuid4())
-        history = []
-        conversation_histories[conversation_id] = history
-        logger.info(f"Starting new conversation: {conversation_id}")
-
-    # Append user message to history (LangChain expects specific format, adjust if needed)
-    # Assuming ReWOOState uses a 'messages' list like [{role: 'user', content: '...'}, {role: 'assistant', content: '...'}]
-    # For ReWOO, we might just pass the latest query? Let's adapt the state based on ReWOOState.
-    # ReWOOState expects 'original_query'. We'll use the latest user message as the query.
-    # If we need multi-turn ReWOO, the state/prompts might need adjustment.
-    # For now, treat each call as a new ReWOO execution with the given message.
-
+    query = chat_request.message
     initial_state = {
-        "original_query": user_message,
+        "original_query": query,
         "plan": [],
         "current_step_index": 0,
         "current_tool_call": None,
@@ -181,125 +167,106 @@ async def chat_endpoint(request: ChatRequest):
         "workflow_status": None,
         "next_node": None
     }
-    logger.info(f"Executing agent for conversation {conversation_id} with query: '{user_message}'")
+    config = {"configurable": base_graph_config}
+    
+    final_answer_collected = None
+    full_event_log = []
 
-    final_state = None
-    error_message = None
     try:
-        # Stream the results and collect the final state
-        async for event in compiled_agent_graph.astream_events(
-            initial_state,
-            config=agent_config,
-            version="v1",
-        ):
-            # You can add logic here to handle intermediate events if needed
-            # For example, logging tool calls, etc.
-             kind = event['event']
-             if kind == "on_chat_model_stream":
-                 content = event["data"]["chunk"].content
-                 # if content: print(content, end="|") # Optional: stream intermediate LLM tokens
-             elif kind == "on_tool_start":
-                 logger.debug(f"Tool Start: {event['name']} Input: {event['data'].get('input')}")
-             elif kind == "on_tool_end":
-                 logger.debug(f"Tool End: {event['name']} Output: {event['data'].get('output')}")
+        logger.info(f"Invoking agent with query: '{query}'")
+        async for event in compiled_app.astream_events(initial_state, config=config, version="v1"):
+            full_event_log.append(event) # For debugging
+            kind = event['event']
+            name = event.get('name', '')
+            # logger.debug(f"Event: {kind}, Name: {name}, Data: {event['data']}")
 
-            # The final state is typically available when the stream ends
-            # Check if the event contains the final state (might need specific handling based on LangGraph version/setup)
-            # A simple approach: Get the state from the last event or after the loop.
-            # For now, let's get the final output after the loop finishes.
+            if kind == "on_chat_model_stream":
+                content = event["data"]["chunk"].content
+                if content:
+                    # Process streamed content if needed, e.g., for real-time response
+                    pass
+            elif kind == "on_tool_start":
+                logger.info(f"Tool Started: {event['name']} with input {event['data'].get('input')}")
+            elif kind == "on_tool_end":
+                logger.info(f"Tool Ended: {event['name']}")
+                # logger.info(f"Tool Output: {event['data'].get('output')}")
 
-        # After the stream finishes, get the final state
-        final_state_result = await compiled_agent_graph.ainvoke(initial_state, config=agent_config)
-        final_answer = final_state_result.get("final_answer")
-        error_message = final_state_result.get("error_message")
+            # Check for the final answer or if the graph run has ended
+            # The structure of the final event might vary depending on how the graph is defined.
+            # Assuming 'generate_final_answer' node output is the final result.
+            if kind == "on_chain_end" and name == "generate_final_answer": # Check if it's the end of the specific node
+                 output = event['data'].get('output')
+                 if output and isinstance(output, dict) and "final_answer" in output:
+                    final_answer_collected = output["final_answer"]
+                    logger.info(f"Final answer collected from 'generate_final_answer' node: {final_answer_collected}")
+                    break # Exit loop once final answer is explicitly collected
 
-        if error_message:
-             logger.error(f"Agent execution failed for conversation {conversation_id}: {error_message}")
-             return ChatResponse(response="", conversation_id=conversation_id, error=f"Agent error: {error_message}")
-        elif final_answer:
-             logger.info(f"Agent execution successful for conversation {conversation_id}. Response generated.")
-             # Optional: Append assistant response to history if maintaining multi-turn state
-             # conversation_histories[conversation_id].append({"role": "assistant", "content": final_answer})
-             return ChatResponse(response=final_answer, conversation_id=conversation_id)
-        else:
-             logger.error(f"Agent execution finished for conversation {conversation_id} but no final answer was generated.")
-             return ChatResponse(response="", conversation_id=conversation_id, error="Agent finished without generating a final answer.")
+        # If not collected by specific node check, try to get it from the last state of the graph stream
+        if final_answer_collected is None and full_event_log:
+            last_event = full_event_log[-1]
+            if last_event['event'] == 'on_graph_end' or last_event['event'] == 'on_chain_end': # Broader check
+                output_data = last_event['data'].get('output', {})
+                if isinstance(output_data, dict):
+                    final_answer_collected = output_data.get('final_answer') # Attempt to get from ReWOOState structure
+                    if final_answer_collected:
+                         logger.info(f"Final answer collected from graph end event: {final_answer_collected}")
+
+
+        if final_answer_collected is None:
+            logger.warning("Final answer was not explicitly collected. This might indicate an issue or an unexpected graph flow.")
+            # Fallback: could inspect the last known state from events if necessary
+            final_answer_collected = "Agent finished processing, but no explicit final answer was captured."
+
+
+        # conversation_id for now is just a pass-through if provided, or a new one could be generated
+        # For stateless ReWOO per call, conversation_id might not be strictly necessary for context yet.
+        current_conversation_id = chat_request.conversation_id or "conv_" + asyncio.Lock()._get_loop().time().hex()
+
+        return ChatResponse(response=final_answer_collected, conversation_id=current_conversation_id)
 
     except Exception as e:
-        logger.error(f"Error during agent execution for conversation {conversation_id}: {e}", exc_info=True)
-        # Return an HTTP exception or a JSON response with error
-        # raise HTTPException(status_code=500, detail=f"Agent execution failed: {e}")
-        return ChatResponse(response="", conversation_id=conversation_id, error=f"Internal server error: {e}")
+        logger.error(f"Error processing chat request: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
-# --- Visualization Logic (Moved outside main execution flow) ---
-async def generate_graph_visualization():
-    """Generates and saves the graph visualization."""
-    # Need LLM and MCP client temporarily just to build the graph structure
-    temp_llm = None
-    temp_mcp_client = None
+async def visualize_graph_main():
+    """Separate main function for visualization to avoid FastAPI app conflicts."""
+    logger.info("Starting ReWOO Agent for visualization...")
     try:
-        logger.info("Visualization: Loading LLM...")
-        temp_llm = load_llm()
-        logger.info("Visualization: LLM loaded.")
-
-        logger.info("Visualization: Loading MCP config...")
-        mcp_conf = load_mcp_servers_from_config()
-        logger.info("Visualization: Initializing temporary MCP Client...")
-        async with MultiServerMCPClient(mcp_conf) as temp_mcp_client:
-            logger.info("Visualization: Building graph structure...")
-            graph, _ = build_rewoo_graph(temp_llm, temp_mcp_client) # We only need the graph object
-
-            logger.info("Attempting to generate graph visualization...")
-            try:
-                # Check if pygraphviz is available and draw
-                from PIL import Image
-                import io
-                png_bytes = graph.get_graph().draw_png()
-                img = Image.open(io.BytesIO(png_bytes))
-                img.save("graph_visualization.png")
-                logger.info("Graph visualization saved as graph_visualization.png")
-            except ImportError:
-                logger.error("Failed to generate visualization: `pygraphviz` not installed. Please install it (`pip install pygraphviz`).")
-            except Exception as e:
-                 # Catching graphviz execution errors specifically if possible
-                if "failed to execute PosixPath" in str(e) or "Graphviz's executables not found" in str(e):
-                     logger.error("Failed to generate visualization: Graphviz executables not found. Make sure Graphviz is installed and in your system's PATH (e.g., `brew install graphviz` or `sudo apt-get install graphviz`).")
-                else:
-                     logger.error(f"An unexpected error occurred during graph visualization: {e}", exc_info=True)
-
+        llm = load_llm()
     except Exception as e:
-        logger.error(f"Failed during visualization setup: {e}", exc_info=True)
-    finally:
-        # No explicit cleanup needed for temp client due to 'async with'
-         logger.info("Visualization process finished.")
+        logger.error(f"Failed to load LLM for visualization: {e}", exc_info=True)
+        return
 
+    mcp_servers_config_dict = load_mcp_servers_from_config()
+    if not mcp_servers_config_dict:
+        mcp_servers_config_dict = {}
+    
+    try:
+        async with MultiServerMCPClient(mcp_servers_config_dict) as mcp_client:
+            logger.info("Building agent graph for visualization...")
+            # Pass mcp_client directly as it's now the active client from the context manager
+            compiled_app_graph, _ = build_rewoo_graph(llm, mcp_client, visualize=True)
+            logger.info("Graph visualization generated as graph_visualization.png.")
+    except ImportError as e:
+        logger.error(f"Visualization failed: {e}. Make sure pygraphviz and graphviz are installed.")
+    except Exception as e:
+        logger.error(f"Failed during visualization: {e}", exc_info=True)
 
-# --- Main Execution ---
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the ReWOO Agent API or generate graph visualization.")
+    parser = argparse.ArgumentParser(description="Run the ReWOO Agent FastAPI server or visualize the graph.")
     parser.add_argument(
         "--visualize",
         action="store_true",
         help="Generate a visualization of the LangGraph graph and save it as graph_visualization.png, then exit."
     )
-    parser.add_argument(
-        "--host",
-        type=str,
-        default="127.0.0.1",
-        help="Host address to run the API server on."
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        help="Port number to run the API server on."
-    )
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Host for the FastAPI server.")
+    parser.add_argument("--port", type=int, default=8000, help="Port for the FastAPI server.")
+
     args = parser.parse_args()
 
     if args.visualize:
-        asyncio.run(generate_graph_visualization())
+        asyncio.run(visualize_graph_main())
     else:
-        # Run the FastAPI server
         logger.info(f"Starting FastAPI server on {args.host}:{args.port}")
         uvicorn.run(app, host=args.host, port=args.port)
