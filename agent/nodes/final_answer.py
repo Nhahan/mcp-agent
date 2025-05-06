@@ -29,7 +29,6 @@ async def final_answer_node(state: ReWOOState, node_config: Dict[str, Any]) -> D
             "error_message": "Final Answer Node Error: LLM not configured.",
             "workflow_status": "failed",
             "evidence": state.get("evidence", {}), # Preserve evidence
-            "next_node": END
         }
 
     # Check for errors from previous steps before proceeding
@@ -81,6 +80,8 @@ async def final_answer_node(state: ReWOOState, node_config: Dict[str, Any]) -> D
     while current_retries <= max_retries:
         logger.info(f"Final Answer generation attempt {current_retries + 1}/{max_retries + 1}")
         try:
+            # Log the final prompt before invoking LLM
+            logger.info(f"Final prompt sent to LLM:\n{prompt}")
             # Invoke LLM
             response = await llm.ainvoke(prompt)
             response_content = response.content if hasattr(response, 'content') else str(response)
@@ -96,7 +97,6 @@ async def final_answer_node(state: ReWOOState, node_config: Dict[str, Any]) -> D
                 "workflow_status": "finished",
                 "error_message": None,
                 "evidence": evidence_dict, # Preserve evidence dictionary
-                "next_node": END
             }
         except Exception as e:
             logger.error(f"Error during final answer generation attempt {current_retries + 1}", exc_info=True)
@@ -112,5 +112,4 @@ async def final_answer_node(state: ReWOOState, node_config: Dict[str, Any]) -> D
         "error_message": error_msg,
         "workflow_status": "failed",
         "evidence": evidence_dict, # Preserve evidence dictionary
-        "next_node": END
     } 
