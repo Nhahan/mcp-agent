@@ -2,34 +2,10 @@ from typing import List, Dict, Any
 import logging
 from langsmith import traceable
 from langchain_core.runnables import RunnableConfig
-import json
-import yaml # Import yaml
 from ..state import ReWOOState
 from ..prompts.plan_prompts import PLANNER_PROMPT_TEMPLATE, PLANNER_REFINE_PROMPT_TEMPLATE
 
 
-# --- Placeholder for PlanValidator (Keep as is for now) --- #
-class PlanValidator:
-    def validate(self, plan_dicts: List[Dict[str, Any]]) -> tuple[bool, list]:
-        # Basic placeholder validation
-        if not isinstance(plan_dicts, list):
-            return False, [(-1, "Plan is not a list")]
-        if not plan_dicts:
-             return False, [(-1, "Plan cannot be empty")]
-        errors = []
-        for i, step in enumerate(plan_dicts):
-            if not isinstance(step, dict):
-                errors.append((i, f"Step {i+1} is not a dictionary"))
-                continue
-            if "thought" not in step or not step["thought"]:
-                errors.append((i, f"Step {i+1} is missing a 'thought'"))
-            if "expected_outcome" not in step or not step["expected_outcome"]:
-                errors.append((i, f"Step {i+1} is missing an 'expected_outcome'"))
-            if "tool_call" not in step or not isinstance(step.get("tool_call"), dict):
-                errors.append((i, f"Step {i+1} has invalid tool_call structure"))
-            # Add more checks (tool_call format, etc.) if needed
-        return not errors, errors
-# --- End Placeholder for PlanValidator --- #
 
 from langgraph.graph import END
 
@@ -103,18 +79,24 @@ async def planning_node(state: ReWOOState, node_config: Dict[str, Any]) -> Dict[
                  previous_plan_str = json.dumps(previous_plan_pydantic, indent=2) if isinstance(previous_plan_pydantic, dict) else str(previous_plan_pydantic)
                  logger.warning(f"Could not use model_dump_json on previous plan, using json.dumps. Type was: {type(previous_plan_pydantic)}")
                  
+            # For refinement, error_history is derived from last_error
+            error_history_for_prompt = f"Previous Error: {last_error}"
             prompt_args = {
                 "query": query,
                 "tool_descriptions": filtered_tools_str,
-                "previous_plan": previous_plan_str, # Pass the possibly raw previous plan
-                "validation_errors": last_error
+                "raw_plan_output": previous_plan_str, # PLANNER_REFINE_PROMPT_TEMPLATE expects raw_plan_output
+                "error_message": last_error, # And error_message for the specific error
+                "error_history": error_history_for_prompt # And a general error_history
             }
         else:
             logger.info("Generating initial plan using filtered tools.")
             prompt_template = PLANNER_PROMPT_TEMPLATE
+            # For initial plan, error_history is typically empty or not applicable
+            error_history_for_prompt = state.get("error_history_str", "N/A") # Get from state or use default
             prompt_args = {
                 "query": query,
-                "tool_descriptions": filtered_tools_str # USE FILTERED STRING
+                "tool_descriptions": filtered_tools_str, # USE FILTERED STRING
+                "error_history": error_history_for_prompt # Add error_history for initial prompt too
             }
 
         # --- Define Chain --- #
