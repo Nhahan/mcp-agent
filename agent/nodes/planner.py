@@ -2,7 +2,6 @@ import logging
 import json
 from typing import Dict, Any
 from langsmith import traceable
-from langchain_core.runnables import RunnableConfig
 from ..state import ReWOOState
 from ..prompts.plan_prompts import PLANNER_PROMPT_TEMPLATE, PLANNER_REFINE_PROMPT_TEMPLATE
 from langgraph.graph import END
