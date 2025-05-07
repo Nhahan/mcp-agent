@@ -176,7 +176,7 @@ async def run_agent_query(request: Request, chat_request: ChatRequest):
     # Start with a copy of base_graph_config if it might contain other top-level Pregel options
     # For this specific case, we know base_graph_config is primarily for "configurable" node inputs.
     config_for_stream = {
-        "recursion_limit": 30, # Increase limit
+        "recursion_limit": 50, # Increase limit to 50
         "configurable": base_graph_config.get("configurable", {}).copy() # Keep existing configurable items
     }
     
