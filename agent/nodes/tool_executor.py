@@ -92,9 +92,37 @@ async def tool_execution_node(state: ReWOOState, node_config: Dict[str, Any]) ->
     next_status = "routing_complete"
     next_node = "evidence_processor"
     error_message = None
+    
+    # Initialize state fields for evidence_processor
+    current_tool_invocation_inputs_for_state: Optional[Dict[str, Any]] = None
+    use_input_as_evidence_for_state: Optional[str] = None
 
     try:
         logger.info(f"(Step {step_number}) Executing tool: {tool_name} with input: {prepared_input}")
+
+        # 1. Store all inputs that will be passed to the tool for potential use by evidence_processor
+        # prepared_input already holds the arguments for the tool.
+        # If prepared_input is a single value (not a dict), we might wrap it or handle it.
+        # Assuming prepared_input is a dict of arguments or the direct input if tool takes one arg.
+        if isinstance(prepared_input, dict):
+            current_tool_invocation_inputs_for_state = prepared_input.copy()
+        elif prepared_input is not None: # If it's a single argument, not a dict
+            # This case needs careful consideration based on how tools are typically invoked.
+            # For now, if it's not a dict, we might not be able to select a *specific* input key.
+            # Let's assume for now that if use_input_as_evidence is used, prepared_input must be a dict.
+            # Or, we could store it as {'input': prepared_input} if there's only one arg. Let's stick to dict for now.
+            logger.warning(f"Tool input is not a dictionary ({type(prepared_input)}). Specific input key selection for evidence might not work as expected.")
+            current_tool_invocation_inputs_for_state = {"input": prepared_input} # Generic key for single arg
+        else:
+            current_tool_invocation_inputs_for_state = {}
+
+        # 2. Check if the current_tool_call_info (from planner) specifies an input key to be used as evidence
+        # This assumes planner_node can add an 'evidence_input_key' to current_tool_call_info
+        if current_tool_call_info:
+            evidence_input_key_from_plan = current_tool_call_info.get("evidence_input_key")
+            if evidence_input_key_from_plan and isinstance(evidence_input_key_from_plan, str):
+                use_input_as_evidence_for_state = evidence_input_key_from_plan
+                logger.info(f"Planner specified to use input key '{use_input_as_evidence_for_state}' as evidence for tool {tool_name}.")
 
         # Invoke the tool with the prepared input (which might be {})
         # Pass the node_config dictionary to ainvoke
@@ -148,5 +176,7 @@ async def tool_execution_node(state: ReWOOState, node_config: Dict[str, Any]) ->
         "workflow_status": next_status,
         "error_message": error_message,
         "next_node": next_node,
-        "current_step_index": next_step_index
+        "current_step_index": next_step_index,
+        "current_tool_invocation_inputs": current_tool_invocation_inputs_for_state,
+        "use_input_as_evidence": use_input_as_evidence_for_state
     } 

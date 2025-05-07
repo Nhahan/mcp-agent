@@ -224,14 +224,22 @@ async def plan_parser_node(state: ReWOOState, config: RunnableConfig, node_confi
                       parsed_args = step.tool_call.arguments
                       args_json_str = json.dumps(parsed_args) # Serialize for tuple format
                       plan_tuples.append((step.plan, step.tool_call.evidence_variable, step.tool_call.tool_name, args_json_str))
-                      step_dict["tool_call"] = {
+                      
+                      # Prepare the tool_call dictionary for all_parsed_steps
+                      tool_call_dict_for_steps = {
                            "evidence_variable": step.tool_call.evidence_variable,
                            "tool_name": step.tool_call.tool_name,
                            "arguments": parsed_args # Keep as dict
                       }
+                      # Add evidence_input_key if it exists in the Pydantic model (Planner should ideally set this)
+                      if step.tool_call.evidence_input_key:
+                          tool_call_dict_for_steps["evidence_input_key"] = step.tool_call.evidence_input_key
+                      
+                      step_dict["tool_call"] = tool_call_dict_for_steps
+                      
                  all_parsed_steps_list.append(step_dict)
 
-            logger.info("Successfully prepared plan_pydantic, plan_tuples, and all_parsed_steps.")
+            logger.info("Successfully prepared plan_pydantic, plan_tuples, and all_parsed_steps.") # Revert log message
             has_tool_calls = any(step.tool_call for step in plan_pydantic.steps)
             logger.info(f"Plan contains {len(plan_tuples)} executable tool calls.")
             # Route to the plan validator node (which checks tool names etc.)

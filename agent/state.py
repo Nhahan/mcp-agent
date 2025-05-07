@@ -26,6 +26,7 @@ class ToolCallPydantic(BaseModel):
     evidence_variable: str = Field(..., description="The variable name assigned to the tool output (e.g., '#E1').")
     tool_name: str = Field(..., description="The exact name of the tool to call.")
     arguments: Dict[str, Any] = Field(default_factory=dict, description="The arguments for the tool call as a JSON object.")
+    evidence_input_key: Optional[str] = Field(None, description="If specified, use this input argument's value as evidence instead of the tool's direct output.")
 
     # Forbid extra fields in tool calls
     model_config = ConfigDict(extra='forbid')
@@ -104,6 +105,8 @@ class ReWOOState(TypedDict):
     current_tool_call: Optional[Dict[str, Any]]
     prepared_tool_input: Optional[Any]
     evidence: EvidenceDict
+    current_tool_invocation_inputs: Optional[Dict[str, Any]] # Inputs for the current tool call
+    use_input_as_evidence: Optional[str] # Key of the input to use as evidence
     
     # Output and control flow state
     final_answer: Optional[str]
