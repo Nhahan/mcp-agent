@@ -1,12 +1,10 @@
-from typing import List, Dict, Any
 import logging
+import json
+from typing import Dict, Any
 from langsmith import traceable
 from langchain_core.runnables import RunnableConfig
 from ..state import ReWOOState
 from ..prompts.plan_prompts import PLANNER_PROMPT_TEMPLATE, PLANNER_REFINE_PROMPT_TEMPLATE
-
-
-
 from langgraph.graph import END
 
 logger = logging.getLogger(__name__)
@@ -48,14 +46,11 @@ async def planning_node(state: ReWOOState, node_config: Dict[str, Any]) -> Dict[
         # Optionally handle this case - maybe skip planning tools? For now, pass empty string.
         filtered_tools_str = "No tools available for planning."
 
-    # === Log the actual tools string being used by the planner ===
     logger.debug(f"Planner using the following tool descriptions:\n---\n{filtered_tools_str}\n---")
-    # ============================================================
 
     query = state["original_query"]
     last_error = state.get('error_message')
     previous_plan_pydantic = state.get('plan_pydantic')
-    raw_llm_response_for_log = ""
 
     # Check if LLM is None before proceeding
     if not llm:
@@ -63,12 +58,6 @@ async def planning_node(state: ReWOOState, node_config: Dict[str, Any]) -> Dict[
         return {"error_message": "LLM missing in config", "workflow_status": "failed", "current_retry": current_retry, "next_node": END}
 
     try:
-        # --- Initialize Parsers --- #
-        
-            
-
-        # --- Prepare Prompt --- #
-        # Re-enable refinement logic
         if current_retry > 0 and previous_plan_pydantic is not None and last_error is not None:
             logger.info("Refining previous plan due to errors.")
             prompt_template = PLANNER_REFINE_PROMPT_TEMPLATE
@@ -99,9 +88,6 @@ async def planning_node(state: ReWOOState, node_config: Dict[str, Any]) -> Dict[
                 "error_history": error_history_for_prompt # Add error_history for initial prompt too
             }
 
-        # --- Define Chain --- #
-        plan_chain = prompt_template | llm
-
         # --- Invoke Chain --- #        
         logger.debug(f"Prompt arguments sent to LLM: {prompt_args}") # Log prompt args
         # Get raw response first for logging
@@ -125,8 +111,6 @@ async def planning_node(state: ReWOOState, node_config: Dict[str, Any]) -> Dict[
          error_msg = f"Planning failed: LLM Error - {e}"
          current_retry += 1
     except Exception as e:
-        # Handle other exceptions (e.g., network issues during LLM call)
-        # Log the raw response content if available
         if 'raw_llm_response_content' in locals():
             logger.error(f"Error during planning node attempt {current_retry + 1}. Raw LLM response was:\n{raw_llm_response_content}", exc_info=True)
         else:
