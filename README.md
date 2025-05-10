@@ -185,10 +185,3 @@ Use an HTTP client (like `curl` or Python's `requests`) to send POST requests to
     *   **State:** `agent.state.ReWOOState`.
 5.  **agent.nodes:** Implementation of the actual logic for each node.
 6.  **agent.prompts:** Prompt templates used for LLM calls.
-
-## Future Improvements
-
-*   Improve user input handling (interactive input or argument parsing instead of hardcoded query).
-*   Test and add examples for integrating various MCP tool servers.
-*   Enhance detailed error handling and logging.
-*   Refine state management and evidence processing logic.
