@@ -136,52 +136,6 @@ This agent executes the ReWOO workflow using the following LangGraph nodes:
 
 ## Usage
 
-**1. Run the API Server:**
-
 ```bash
 python main.py
 ```
-*   This command starts the FastAPI server, typically available at `http://127.0.0.1:8000`.
-*   The server loads the LLM, MCP tools, and builds the agent graph upon startup.
-*   Use `--host <ip>` and `--port <number>` arguments to change the address and port.
-
-**2. Interact via the `/chat` Endpoint:**
-
-Use an HTTP client (like `curl` or Python's `requests`) to send POST requests to the `/chat` endpoint.
-
-*   **Start a new conversation:**
-    ```bash
-    curl -X POST http://127.0.0.1:8000/chat \
-    -H "Content-Type: application/json" \
-    -d '{"message": "Your query for the agent here..."}'
-    ```
-    *   The response will be a JSON object containing the agent's `response` and a unique `conversation_id`.
-
-*   **Continue an existing conversation:**
-    ```bash
-    curl -X POST http://127.0.0.1:8000/chat \
-    -H "Content-Type: application/json" \
-    -d '{"message": "Your follow-up message...", "conversation_id": "paste_the_id_from_previous_response"}'
-    ```
-    *   Include the `conversation_id` received from the previous response to maintain context (Note: current implementation treats each request as a new ReWOO cycle based on the message).
-
-**3. Visualize the graph:**
-
-*   To generate a visualization of the agent's LangGraph structure and save it as `graph_visualization.png` (without starting the API server), use:
-    ```bash
-    python main.py --visualize
-    ```
-*   **Note:** Visualization requires `pygraphviz` and `graphviz` to be installed.
-
-## Architecture Overview
-
-![diagram](./images/diagram.png)
-
-1.  **main.py:** Agent execution entry point. Loads LLM, initializes MCP client, builds and runs the graph.
-2.  **core.llm_loader:** Loads and manages LLM instances (OpenRouter, Gemini, Claude, LlamaCpp) based on environment variables.
-3.  **langchain_mcp_adapters.client:** Communicates with MCP servers using `mcp.json` settings and loads available tools.
-4.  **agent.graph:** Defines the ReWOO workflow using LangGraph.
-    *   **Nodes:** `tool_filter`, `planner`, `plan_parser`, `plan_validator`, `tool_selector`, `tool_input_preparer`, `tool_executor`, `evidence_processor`, `generate_final_answer`.
-    *   **State:** `agent.state.ReWOOState`.
-5.  **agent.nodes:** Implementation of the actual logic for each node.
-6.  **agent.prompts:** Prompt templates used for LLM calls.
