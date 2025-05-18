@@ -118,21 +118,20 @@ This agent executes the ReWOO workflow using the following LangGraph nodes:
 
 5.  **Configure MCP Server:**
     *   Set the information for the tool servers the agent will use in the `mcp.json` file. Specify the name, transport method (`transport`), command (`command`), arguments (`args`) or URL (`url`) for each server.
-    *   Example:
-        ```json
-        {
-          "servers": {
-            "taskmaster-ai": {
-              "description": "Manages tasks for software development.",
-              "transport": "stdio",
-              "command": "node",
-              "args": ["/path/to/task-master-ai/dist/mcp-server.js"],
-              "enabled": true
+      *   Example:
+          ```json
+          {
+            "servers": {
+              "sequential-thinking": {
+                "command": "npx",
+                "args": [
+                  "-y",
+                  "@modelcontextprotocol/server-sequential-thinking"
+                ]
+              }
             }
-            // Add other server configurations
           }
-        }
-        ```
+          ```
 
 ## Usage
 
